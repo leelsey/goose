@@ -1,0 +1,2 @@
+go test fuzz v1
+string("{\"messages\":[{}],\"stream\":false,\"options\":{\"num_prediCt\":-1}}")

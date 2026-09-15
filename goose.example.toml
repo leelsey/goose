@@ -1,0 +1,123 @@
+# goose configuration. Copy to .goose.toml or ~/.config/goose/config.toml.
+# Root keys belong above the first table header.
+
+formats = ["openai", "openai-responses", "anthropic", "google", "ollama"]
+
+[server]
+host = "127.0.0.1"
+port = 11234
+# api_key_env = "GOOSE_PROXY_KEY"   # required to bind anything but loopback
+# cors = false
+# strict = false                    # refuse a translation that lost content
+
+# Without these the binary serves plaintext HTTP and says so at startup.
+# tls_cert = "/etc/goose/fullchain.pem"
+# tls_key  = "/etc/goose/privkey.pem"
+
+# max_concurrent = 64               # requests in flight; over it, 503
+# max_per_minute = 600              # per caller, by credential else address
+# metrics = true                    # GET /metrics, behind the same key
+# mcp_tools = false                 # goose's own models as tools on /mcp
+# redact_upstream_errors = false    # keep a backend's error text off the reply
+
+[[provider]]
+id = "claude"
+kind = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+# model = "claude-sonnet-5"
+
+[[provider]]
+id = "gpt"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[provider]]
+id = "local"
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+
+# Azure AI Foundry. Omit api_version for the rolling v1 surface; a dated value
+# selects the deployment-scoped one.
+# [[provider]]
+# id = "azure"
+# kind = "azure"
+# api_key_env = "AZURE_OPENAI_API_KEY"
+# options = { resource = "my-resource", deployment = "gpt-4o", api_version = "2024-10-21" }
+
+# Cloudflare Workers AI.
+# [[provider]]
+# id = "workers"
+# kind = "cloudflare"
+# api_key_env = "CLOUDFLARE_API_TOKEN"
+# options = { account_id = "..." }
+
+# OpenRouter. Pin the vendors it may use, or let it choose.
+# [[provider]]
+# id = "router"
+# kind = "openrouter"
+# api_key_env = "OPENROUTER_API_KEY"
+# options = { referer = "https://leelsey.com", title = "goose", providers = "anthropic,google", allow_fallbacks = "false" }
+
+# AWS Bedrock. Credentials: options, environment, shared file, then the runtime
+# role. Set AWS_EC2_METADATA_DISABLED=true off AWS to skip the last.
+# [[provider]]
+# id = "bedrock"
+# kind = "bedrock"
+# model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+# options = { region = "us-east-1", profile = "default" }
+
+# GCP Vertex. The publisher comes from the model name; one entry per vendor.
+# [[provider]]
+# id = "vertex"
+# kind = "vertex"
+# model = "claude-sonnet-4@20250514"
+# options = { project = "my-project", region = "us-east5" }
+
+# Any server speaking the chat-completions shape. Declare its extensions.
+# [[provider]]
+# id = "gateway"
+# kind = "compatible"
+# base_url = "https://gateway.example/v1"
+# api_key_env = "GATEWAY_KEY"
+# dialect = "stream_usage,extensions"
+
+# A local agent CLI on its own subscription login. base_url is the binary path
+# when it is not on PATH.
+# [[provider]]
+# id = "claude-cli"
+# kind = "claude"
+# options = { dir = "/tmp/goose-agent", max_concurrent = "2", tools = "" }
+
+[[route]]
+name = "claude"
+models = ["claude-*"]
+chain = ["claude", "gpt:gpt-5"]
+
+[[route]]
+name = "openai"
+models = ["gpt-*", "o1*", "o3*", "o4*"]
+chain = ["gpt"]
+
+[[route]]
+name = "rest"
+chain = ["local"]
+# strict = true                       # refuse a translation that lost content
+# allow  = ["wire.no_finish_reason"]  # live with this one
+# deny   = ["drop.thinking"]          # refuse for this one
+
+# Tool servers goose dials. Their tools are advertised on the routes that ask
+# for them. A server the backend dials itself is named by the request instead.
+# [[mcp]]
+# name = "files"
+# command = "mcp-server-filesystem"
+# args = ["/srv/data"]
+
+# [[mcp]]
+# name = "remote"
+# transport = "http"
+# url = "https://tools.example/mcp"
+# headers = { Authorization = "Bearer ..." }
+
+[usage]
+# log = "usage.jsonl"
+summary = true

@@ -1,0 +1,10 @@
+Third-party notices
+===================
+
+goose links the following external packages. Everything else is the Go standard
+library.
+
+github.com/BurntSushi/toml
+  Licence: MIT
+  Used by: cmd/goose, to read the local configuration file.
+  https://github.com/BurntSushi/toml

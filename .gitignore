@@ -1,0 +1,8 @@
+/goose
+bin/
+dist/
+coverage.out
+usage.jsonl
+goose.toml
+.goose.toml
+.env
