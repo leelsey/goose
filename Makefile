@@ -1,5 +1,5 @@
 APP     := goose
-VERSION := 0.1.0
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 BUILD   := CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)'
 BIN     := bin
