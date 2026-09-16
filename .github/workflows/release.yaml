@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # GitHub accepts a tag on a commit that reached no branch, and a tag
+      # pushed alongside its commits races ci.yaml rather than waiting for it.
+      # Either way the gate may never have run on what is about to ship.
+      - name: Confirm the tagged commit is on main
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SHA" FETCH_HEAD ||
+            { echo "$SHA is not on main"; exit 1; }
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Cross-build
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make release VERSION="$TAG"
+
+      # A release whose binaries do not carry the tag is worse than no release:
+      # it cannot be told apart from a development build after the fact.
+      - name: Confirm the binaries carry the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          got=$(./dist/goose-linux-amd64 --version)
+          echo "$got"
+          case "$got" in
+            *"$TAG"*) ;;
+            *) echo "binary does not carry $TAG"; exit 1 ;;
+          esac
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          case "$TAG" in
+            *-*) pre=--prerelease ;;
+            *)   pre= ;;
+          esac
+          gh release create "$TAG" dist/* \
+            --title "goose $TAG" \
+            --generate-notes $pre
