@@ -4,9 +4,11 @@
 package agentcli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -783,5 +785,76 @@ func TestOneCallersSessionIsNotAnothersToResume(t *testing.T) {
 	}
 	if in2.Session != "sess-42" {
 		t.Fatal("the caller it was issued to must still be able to resume it")
+	}
+}
+
+// Every flag goose writes is one the binary has. A CLI is free to rename or
+// drop one between releases, and the first anyone would hear of it is a call
+// failing in production, so the binary itself is asked where there is one.
+func TestTheFlagsTheseBinariesAreGivenExist(t *testing.T) {
+	for _, tc := range []struct {
+		binary string
+		flags  []string
+	}{
+		{"claude", []string{
+			"--output-format", "--include-partial-messages", "--model", "--resume",
+			"--system-prompt-file", "--append-system-prompt", "--system-prompt",
+			"--max-turns", "--tools",
+		}},
+		{"copilot", []string{"--output-format", "--no-ask-user", "--allow-all-tools", "--model", "--resume"}},
+	} {
+		t.Run(tc.binary, func(t *testing.T) {
+			path, err := exec.LookPath(tc.binary)
+			if err != nil {
+				t.Skipf("%s is not installed here, so its own grammar cannot be asked", tc.binary)
+			}
+			for _, flag := range tc.flags {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				cmd := exec.CommandContext(ctx, path, flag)
+				cmd.Stdin = strings.NewReader("")
+				out, _ := cmd.CombinedOutput()
+				cancel()
+				// A flag that exists but was given no value says so; one that
+				// does not exist is refused as unknown.
+				for _, unknown := range []string{"unknown option", "unexpected argument", "unknown flag", "unrecognized"} {
+					if bytes.Contains(bytes.ToLower(out), []byte(unknown)) {
+						t.Errorf("%s %s: %s", tc.binary, flag, bytes.TrimSpace(out))
+					}
+				}
+			}
+		})
+	}
+}
+
+// The order matters: codex takes its own flags before the subcommand, and a
+// flag written after `resume` is read as a positional argument and refused.
+// Run against the real binary where there is one, since the grammar is its.
+func TestTheCodexArgumentsParse(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex is not installed here, so its own grammar cannot be asked")
+	}
+	for _, tc := range []struct {
+		name string
+		in   invocation
+	}{
+		{"a fresh session", invocation{Model: "gpt-5"}},
+		{"a resumed one", invocation{Model: "gpt-5", Session: "00000000-0000-0000-0000-000000000000"}},
+		{"no model", invocation{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := codexArgs(&Provider{}, tc.in)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, binary, args...)
+			cmd.Stdin = strings.NewReader("")
+			out, _ := cmd.CombinedOutput()
+			// An empty prompt stops it before it reaches the network, which is
+			// past the point where the arguments have already been read.
+			if bytes.Contains(out, []byte("unexpected argument")) ||
+				bytes.Contains(out, []byte("unrecognized subcommand")) {
+				t.Fatalf("codex %s: %s", strings.Join(args, " "), out)
+			}
+		})
 	}
 }
