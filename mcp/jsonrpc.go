@@ -7,6 +7,7 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 )
 
@@ -64,11 +65,27 @@ func (r *response) isAnswer(id string) bool {
 	if r.Method != "" || len(r.ID) == 0 {
 		return false
 	}
+	return idText(r.ID) == id
+}
+
+// idText spells a JSON-RPC id the one way. A server is free to send back as a
+// number what goose sent as text, and fmt would write a large one in exponent
+// form, which matches nothing.
+func idText(raw json.RawMessage) string {
 	var got any
-	if json.Unmarshal(r.ID, &got) != nil {
-		return false
+	if json.Unmarshal(raw, &got) != nil {
+		return ""
 	}
-	return fmt.Sprint(got) == id
+	switch v := got.(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func newRequest(id string, method string, params any) ([]byte, error) {

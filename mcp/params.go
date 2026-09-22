@@ -19,8 +19,10 @@ func paramHeaders(schema, args json.RawMessage) (map[string]string, error) {
 	}
 	var values map[string]json.RawMessage
 	if len(args) > 0 {
-		if json.Unmarshal(args, &values) != nil {
-			return nil, nil
+		if err := json.Unmarshal(args, &values); err != nil {
+			// The mirror check reads these. Answering "nothing to check"
+			// for arguments nobody could read would skip it instead.
+			return nil, fmt.Errorf("mcp: the arguments are not an object: %w", err)
 		}
 	}
 	out := map[string]string{}

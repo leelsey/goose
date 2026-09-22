@@ -34,6 +34,8 @@ func (l *local) Raw(string) json.RawMessage { return nil }
 
 func (l *local) Refused() []string { return nil }
 
+func (l *local) Truncated() bool { return false }
+
 func (l *local) Tools(context.Context) ([]llm.Tool, error) { return l.Cached(), nil }
 
 func (l *local) Call(ctx context.Context, name string, args json.RawMessage) (*Result, error) {
@@ -74,6 +76,14 @@ func (m *Manager) Serve(name string, tools ...Tool) error {
 		src.calls[def.Name] = t.Call
 	}
 	m.mu.Lock()
+	// Checked again under the lock: two calls racing on the same name both
+	// passed the first check while neither had appended yet.
+	for _, existing := range m.sources {
+		if existing.Name() == name {
+			m.mu.Unlock()
+			return fmt.Errorf("mcp: %q is already the name of a tool source", name)
+		}
+	}
 	m.sources = append(m.sources, src)
 	m.mu.Unlock()
 	m.reindex()

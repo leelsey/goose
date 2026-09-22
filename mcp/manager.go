@@ -86,6 +86,7 @@ type source interface {
 	Cached() []llm.Tool
 	Raw(name string) json.RawMessage
 	Refused() []string
+	Truncated() bool
 	Tools(ctx context.Context) ([]llm.Tool, error)
 	Call(ctx context.Context, name string, args json.RawMessage) (*Result, error)
 	Close() error
@@ -94,7 +95,7 @@ type source interface {
 type Manager struct {
 	mu        sync.RWMutex
 	sources   []source
-	index     map[string]source
+	index     map[string]indexed
 	Separator string
 
 	stop     chan struct{}
@@ -105,8 +106,16 @@ type Manager struct {
 	tools   string
 }
 
+// indexed is a tool as the index offers it: the source that serves it, and the
+// name that source knows it by, which differs from the offered name only where
+// two sources claimed the same one.
+type indexed struct {
+	src  source
+	tool string
+}
+
 func NewManager() *Manager {
-	return &Manager{index: map[string]source{}, Separator: "__", stop: make(chan struct{})}
+	return &Manager{index: map[string]indexed{}, Separator: "__", stop: make(chan struct{})}
 }
 
 func (m *Manager) Watch(ctx context.Context, every time.Duration, log func(error)) {
@@ -147,6 +156,15 @@ func (m *Manager) Add(ctx context.Context, cfg ServerConfig, client *http.Client
 		return err
 	}
 	m.mu.Lock()
+	// Checked again under the lock: two Adds racing on the same name both
+	// passed the first check while neither had connected yet.
+	for _, existing := range m.sources {
+		if existing.Name() == cfg.Name {
+			m.mu.Unlock()
+			_ = c.Close()
+			return fmt.Errorf("mcp: %q is already the name of a tool source", cfg.Name)
+		}
+	}
 	m.sources = append(m.sources, c)
 	m.mu.Unlock()
 	m.reindex()
@@ -175,18 +193,39 @@ func (m *Manager) rebuild() (changed bool) {
 	defer m.mu.Unlock()
 	counts := map[string]int{}
 	for _, c := range m.sources {
-		for _, t := range c.Cached() {
-			counts[t.Name]++
+		for _, name := range offered(c) {
+			counts[name]++
 		}
 	}
-	m.index = map[string]source{}
+	known := make(map[string]bool, len(m.sources))
 	for _, c := range m.sources {
-		for _, t := range c.Cached() {
-			name := t.Name
-			if counts[t.Name] > 1 {
-				name = c.Name() + m.Separator + t.Name
+		known[c.Name()] = true
+	}
+	m.index = map[string]indexed{}
+	for _, c := range m.sources {
+		for _, tool := range offered(c) {
+			name := tool
+			if counts[tool] > 1 || squats(tool, c.Name(), m.Separator, known) {
+				name = c.Name() + m.Separator + tool
 			}
-			m.index[name] = c
+			// A tool whose own name is spelled like another's qualified one
+			// would otherwise take that name from it, and which of them wins
+			// would come down to the order they were configured in. Neither is
+			// dropped: the one that arrives second is qualified again, so both
+			// stay callable and the name says which server it came from. The
+			// clash can be with a name the same server already holds. The bound
+			// is belt and braces — every round adds a prefix, so it ends on its
+			// own unless a caller has emptied both the name and the separator.
+			for tries := 0; tries <= len(m.index); tries++ {
+				if _, clash := m.index[name]; !clash {
+					break
+				}
+				name = c.Name() + m.Separator + name
+			}
+			if _, clash := m.index[name]; clash {
+				continue
+			}
+			m.index[name] = indexed{src: c, tool: tool}
 		}
 	}
 	if mark := fingerprint(m.index); mark != m.tools {
@@ -196,6 +235,35 @@ func (m *Manager) rebuild() (changed bool) {
 	return false
 }
 
+// squats reports a name that reads as another server's qualified one. Nothing
+// stops a server calling its tool "github__search", and left alone that name
+// would sit exactly where the github server's own tool belongs. A server's own
+// qualified spelling is its to use.
+func squats(tool, server, separator string, known map[string]bool) bool {
+	if separator == "" {
+		return false
+	}
+	head, _, ok := strings.Cut(tool, separator)
+	return ok && head != server && known[head]
+}
+
+// offered names what a source serves, each once. A server is free to list one
+// name twice; the second copy is the same tool, and giving it a name of its own
+// would cost a name per copy.
+func offered(c source) []string {
+	cached := c.Cached()
+	seen := make(map[string]bool, len(cached))
+	out := make([]string, 0, len(cached))
+	for _, t := range cached {
+		if seen[t.Name] {
+			continue
+		}
+		seen[t.Name] = true
+		out = append(out, t.Name)
+	}
+	return out
+}
+
 func (m *Manager) Tools() []llm.Tool { return m.list(false) }
 
 func (m *Manager) Proxied() []llm.Tool { return m.list(true) }
@@ -203,18 +271,29 @@ func (m *Manager) Proxied() []llm.Tool { return m.list(true) }
 func (m *Manager) list(serversOnly bool) []llm.Tool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	// Each source is asked for its catalogue once. Asking per entry walks the
+	// whole of it for every tool in it, which is quadratic in what a server
+	// chose to send, under the lock a refresh also wants.
+	byName := make(map[source]map[string]llm.Tool, len(m.sources))
 	var out []llm.Tool
-	for name, c := range m.index {
-		if _, own := c.(*local); own && serversOnly {
+	for name, e := range m.index {
+		if _, own := e.src.(*local); own && serversOnly {
 			continue
 		}
-		for _, t := range c.Cached() {
-			if name == t.Name || name == c.Name()+m.Separator+t.Name {
-				tool := t
-				tool.Name = name
-				out = append(out, tool)
-				break
+		cached, ok := byName[e.src]
+		if !ok {
+			all := e.src.Cached()
+			cached = make(map[string]llm.Tool, len(all))
+			for _, t := range all {
+				if _, seen := cached[t.Name]; !seen {
+					cached[t.Name] = t
+				}
 			}
+			byName[e.src] = cached
+		}
+		if t, found := cached[e.tool]; found {
+			t.Name = name
+			out = append(out, t)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -237,20 +316,20 @@ func (m *Manager) Refresh(ctx context.Context) error {
 
 func (m *Manager) Call(ctx context.Context, name string, args json.RawMessage) (*Result, error) {
 	m.mu.RLock()
-	c, ok := m.index[name]
+	e, ok := m.index[name]
 	m.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("mcp: no server offers a tool named %q", name)
 	}
-	target := strings.TrimPrefix(name, c.Name()+m.Separator)
-	return c.Call(ctx, target, args)
+	return e.src.Call(ctx, e.tool, args)
 }
 
 type ServerStatus struct {
-	Name    string
-	Info    ServerInfo
-	Tools   int
-	Refused []string
+	Name      string
+	Info      ServerInfo
+	Tools     int
+	Refused   []string
+	Truncated bool
 }
 
 func (m *Manager) Servers() []ServerStatus {
@@ -259,7 +338,8 @@ func (m *Manager) Servers() []ServerStatus {
 	out := make([]ServerStatus, 0, len(m.sources))
 	for _, c := range m.sources {
 		out = append(out, ServerStatus{
-			Name: c.Name(), Info: c.Info(), Tools: len(c.Cached()), Refused: c.Refused(),
+			Name: c.Name(), Info: c.Info(), Tools: len(c.Cached()),
+			Refused: c.Refused(), Truncated: c.Truncated(),
 		})
 	}
 	return out
@@ -270,7 +350,7 @@ func (m *Manager) Close() error {
 	m.mu.Lock()
 	sources := m.sources
 	m.sources = nil
-	m.index = map[string]source{}
+	m.index = map[string]indexed{}
 	m.mu.Unlock()
 	var first error
 	for _, c := range sources {

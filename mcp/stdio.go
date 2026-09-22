@@ -93,7 +93,10 @@ func (t *stdioTransport) Call(ctx context.Context, out Outbound) (*response, err
 			}
 			var resp response
 			if err := json.Unmarshal(frame, &resp); err != nil {
-				return nil, errors.New("unreadable frame: " + err.Error())
+				// Servers write to their own stdout, and a log line or a
+				// batched answer is not this call failing. Keep reading for
+				// the answer that was asked for.
+				continue
 			}
 			if resp.isAnswer(id) {
 				return &resp, nil

@@ -119,7 +119,7 @@ func (m *Manager) stream(ctx context.Context, id string, want filter, send func(
 	}
 }
 
-func fingerprint(index map[string]source) string {
+func fingerprint(index map[string]indexed) string {
 	names := make([]string, 0, len(index))
 	for name := range index {
 		names = append(names, name)

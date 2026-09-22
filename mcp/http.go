@@ -43,6 +43,7 @@ func newHTTPTransport(cfg ServerConfig, client *http.Client, frame int) (*httpTr
 	if client == nil {
 		client = http.DefaultClient
 	}
+	client = sameOriginOnly(client, cfg.URL)
 	if frame <= 0 {
 		frame = defaultHTTPFrame
 	}
@@ -254,6 +255,7 @@ func startSSE(ctx context.Context, cfg ServerConfig, client *http.Client, frame 
 	if client == nil {
 		client = http.DefaultClient
 	}
+	client = sameOriginOnly(client, cfg.URL)
 	if frame <= 0 {
 		frame = defaultHTTPFrame
 	}
@@ -274,9 +276,17 @@ func startSSE(ctx context.Context, cfg ServerConfig, client *http.Client, frame 
 		resp.Body.Close()
 		return nil, fmt.Errorf("%d %s", resp.StatusCode, serverError(body))
 	}
+	// A redirect may move the path; it may not move the origin. This request
+	// carried the operator's credentials for this server and every later post
+	// carries them too, so the origin they are sent to is the configured one.
 	streamURL := cfg.URL
 	if resp.Request != nil && resp.Request.URL != nil {
-		streamURL = resp.Request.URL.String()
+		final := resp.Request.URL.String()
+		if _, err := resolveEndpoint(cfg.URL, final); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("mcp: %s redirected off its own origin, to %s", cfg.URL, resp.Request.URL.Redacted())
+		}
+		streamURL = final
 	}
 	t := &sseTransport{
 		streamURL: streamURL, client: client, headers: cfg.Headers, frame: frame,
@@ -344,6 +354,23 @@ func (t *sseTransport) readEndpoint() error {
 	return errors.New("mcp: the stream named no endpoint")
 }
 
+// sameOriginOnly refuses a redirect that leaves the configured origin, so the
+// headers meant for one server are not handed to whoever answers next. Go strips
+// Authorization across domains by itself, but carries every other header.
+func sameOriginOnly(base *http.Client, origin string) *http.Client {
+	copied := *base
+	copied.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if _, err := resolveEndpoint(origin, req.URL.String()); err != nil {
+			return fmt.Errorf("mcp: refusing to follow %s off the origin of %s", req.URL.Redacted(), origin)
+		}
+		return nil
+	}
+	return &copied
+}
+
 func resolveEndpoint(stream, target string) (string, error) {
 	base, err := url.Parse(stream)
 	if err != nil {
@@ -354,7 +381,8 @@ func resolveEndpoint(stream, target string) (string, error) {
 		return "", err
 	}
 	resolved := base.ResolveReference(ref)
-	if resolved.Scheme != base.Scheme || !sameHost(resolved, base) {
+	upgrade := base.Scheme == "http" && resolved.Scheme == "https" && resolved.Hostname() == base.Hostname()
+	if (resolved.Scheme != base.Scheme && !upgrade) || (!upgrade && !sameHost(resolved, base)) {
 		return "", fmt.Errorf("mcp: endpoint %s is not on the same origin as %s", resolved.Redacted(), base.Redacted())
 	}
 	return resolved.String(), nil

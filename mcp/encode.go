@@ -34,6 +34,12 @@ func encodeContent(parts []llm.Part) []json.RawMessage {
 				continue
 			}
 			out = append(out, mustJSON(map[string]any{"type": "text", "text": string(v.JSON)}))
+		default:
+			// This wire has only these blocks. A part that reached here is still
+			// a part the tool produced, so what it says travels.
+			if text := describe(p); text != "" {
+				out = append(out, mustJSON(map[string]any{"type": "text", "text": text}))
+			}
 		}
 	}
 	return out
@@ -45,4 +51,20 @@ func mustJSON(v any) json.RawMessage {
 		return json.RawMessage(`{"type":"text","text":""}`)
 	}
 	return b
+}
+
+// describe says what a part is in words, for a wire with no block of its own
+// for it: its text where it has some, and otherwise what it is. Never goose's
+// own field names, which are not something a model should be reading.
+func describe(p llm.Part) string {
+	if text := llm.TextOf([]llm.Part{p}); text != "" {
+		return text
+	}
+	if v, ok := p.(*llm.ToolUse); ok {
+		if len(v.Args) > 0 {
+			return v.Name + " " + string(v.Args)
+		}
+		return v.Name
+	}
+	return string(p.Kind())
 }

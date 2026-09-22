@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/leelsey/goose/llm"
 )
@@ -69,6 +71,9 @@ type Client struct {
 	tools   []llm.Tool
 	raw     map[string]json.RawMessage
 	refused []string
+	// truncated says this server offers more than goose will hold, so the
+	// catalogue it serves is part of one.
+	truncated bool
 }
 
 type Options struct {
@@ -150,18 +155,30 @@ func (c *Client) call(ctx context.Context, method string, params map[string]any,
 		c.mu.Lock()
 		schema := c.raw[name]
 		c.mu.Unlock()
-		if headers, err := paramHeaders(inputSchema(schema), args); err == nil {
-			send.Params = headers
+		headers, err := paramHeaders(inputSchema(schema), args)
+		if err != nil {
+			return fmt.Errorf("mcp %s: %s: %w", c.name, method, err)
 		}
+		send.Params = headers
 	}
 	resp, err := c.transport.Call(ctx, send)
 	if err != nil {
 		return fmt.Errorf("mcp %s: %s: %w", c.name, method, err)
 	}
 	if resp.Error != nil {
-		return fmt.Errorf("mcp %s: %s: %w", c.name, method, resp.Error)
+		// What a server puts in a message is its own text and reaches a model's
+		// context through a tool error, so it is kept to one line and named as
+		// the server's rather than repeated as this proxy's own.
+		return fmt.Errorf("mcp %s: %s: the server answered %d: %s",
+			c.name, method, resp.Error.Code, tame(resp.Error.Message))
 	}
-	if out == nil || len(resp.Result) == 0 {
+	// JSON-RPC answers with a result or an error. Reading a frame that carries
+	// neither as success turns a tool that never ran into one that ran and said
+	// nothing, which is what the model would then be told.
+	if len(resp.Result) == 0 {
+		return fmt.Errorf("mcp %s: %s: the answer carried neither a result nor an error", c.name, method)
+	}
+	if out == nil {
 		return nil
 	}
 	if err := json.Unmarshal(resp.Result, out); err != nil {
@@ -245,11 +262,11 @@ func (c *Client) discover(ctx context.Context) error {
 		}
 		c.mu.Lock()
 		c.info = ServerInfo{
-			Name:            result.Meta.ServerInfo.Name,
-			Version:         result.Meta.ServerInfo.Version,
+			Name:            tame(result.Meta.ServerInfo.Name),
+			Version:         tame(result.Meta.ServerInfo.Version),
 			ProtocolVersion: version,
 			Capabilities:    result.Capabilities,
-			Instructions:    result.Instructions,
+			Instructions:    tame(result.Instructions),
 		}
 		c.mu.Unlock()
 		return nil
@@ -298,13 +315,19 @@ func (c *Client) initialise(ctx context.Context) error {
 	if err := c.call(ctx, "initialize", params, &result); err != nil {
 		return err
 	}
+	// The version the server picked rides every later request as a header, so it
+	// has to be something a header can carry. A revision goose has not heard of
+	// is not a reason to refuse a server that otherwise works.
+	if !headerSafe(result.ProtocolVersion) {
+		return fmt.Errorf("mcp %s: the server answered with a protocol revision a header cannot carry", c.name)
+	}
 	c.mu.Lock()
 	c.info = ServerInfo{
-		Name:            result.ServerInfo.Name,
-		Version:         result.ServerInfo.Version,
+		Name:            tame(result.ServerInfo.Name),
+		Version:         tame(result.ServerInfo.Version),
 		ProtocolVersion: result.ProtocolVersion,
 		Capabilities:    result.Capabilities,
-		Instructions:    result.Instructions,
+		Instructions:    tame(result.Instructions),
 	}
 	c.mu.Unlock()
 
@@ -317,12 +340,74 @@ func (c *Client) initialise(ctx context.Context) error {
 	})
 }
 
+// The whole catalogue is walked for every request and held for as long as the
+// server is configured, so how much of it there is cannot be the server's to
+// choose. This is far past any catalogue a model could be offered in one call.
+const (
+	maxTools     = 2048
+	maxToolPages = 100
+)
+
+// headerSafe reports a value this proxy can put in a header and read back.
+func headerSafe(version string) bool {
+	if len(version) > maxSaid {
+		return false
+	}
+	for _, r := range version {
+		if r <= 0x20 || r >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// A server chooses its own name, its version and its tool names, and goose
+// prints all three in a status table. Left alone, one of them can move the
+// cursor and rewrite the line above it.
+const maxSaid = 128
+
+func tame(s string) string {
+	if len(s) > maxSaid {
+		cut := maxSaid
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// A tool name is an identifier a model has to reproduce exactly, so one too
+// long to carry is refused rather than cut: two names cut to the same length
+// would be one name, and the one that survived would be a name its own server
+// does not answer to.
+func usableName(name string) string {
+	if len(name) > maxSaid {
+		return ""
+	}
+	// Cutting or stripping would leave a name the server does not answer to,
+	// which is worse than not offering the tool at all.
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return name
+}
+
 func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	var out []llm.Tool
 	var refused []string
 	raw := map[string]json.RawMessage{}
 	cursor := ""
-	for pages := 0; pages < 100; pages++ {
+	truncated := false
+	seen := map[string]bool{}
+	for pages := 0; pages < maxToolPages; pages++ {
 		var result struct {
 			Tools      []json.RawMessage `json:"tools"`
 			NextCursor string            `json:"nextCursor"`
@@ -344,6 +429,18 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			if json.Unmarshal(entry, &t) != nil || t.Name == "" {
 				continue
 			}
+			t.Name = usableName(t.Name)
+			// A name offered twice is one tool. Keeping both copies shows the
+			// first to the model while the second decides what goes on the
+			// wire, so the definition on display would not be the one in use.
+			if _, taken := raw[t.Name]; taken || t.Name == "" || seen[t.Name] {
+				continue
+			}
+			seen[t.Name] = true
+			if len(out) >= maxTools {
+				truncated = true
+				break
+			}
 			schema := t.InputSchema
 			if len(schema) == 0 || string(schema) == "null" {
 				schema = json.RawMessage(`{"type":"object","properties":{}}`)
@@ -360,11 +457,23 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 				OutputSchema: t.OutputSchema,
 			})
 		}
+		if truncated {
+			break
+		}
 		if result.NextCursor == "" {
 			break
 		}
+		if pages == maxToolPages-1 {
+			truncated = true
+		}
 		cursor = result.NextCursor
 	}
+	// The rest is not served, and saying so is what keeps this from being a
+	// silent truncation. Refusing the server outright would take a working one
+	// out of the proxy, and the proxy with it.
+	c.mu.Lock()
+	c.truncated = truncated
+	c.mu.Unlock()
 	c.mu.Lock()
 	c.tools, c.raw, c.refused = out, raw, refused
 	c.mu.Unlock()
@@ -387,6 +496,14 @@ func (c *Client) Refused() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.refused...)
+}
+
+// Truncated reports a catalogue longer than goose will hold, so that a status
+// table can say the list it shows is part of one.
+func (c *Client) Truncated() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.truncated
 }
 
 type Result struct {
@@ -450,6 +567,10 @@ func decodeContent(blocks []json.RawMessage) []llm.Part {
 			out = append(out, &llm.Image{MIME: block.MIMEType, Data: data})
 		case "resource":
 			if block.Resource != nil && block.Resource.Text != "" {
+				// The text is what the model reads. Sending the raw block with
+				// it would deliver the same words twice and, on a wire with no
+				// shape for a foreign block, fail the whole call under a
+				// strict policy.
 				out = append(out, &llm.Text{Text: block.Resource.Text})
 				continue
 			}

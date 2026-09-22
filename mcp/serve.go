@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -40,11 +39,14 @@ func (m *Manager) modern(ctx context.Context, req *request, agreement meta, seen
 		return answer(map[string]any{"tools": m.toolList()}), nil
 
 	case "tools/call":
+		// Arguments nobody could read are arguments the mirror check cannot
+		// vouch for, and waving them through is the one answer it must not give.
 		expected, err := paramHeaders(m.schemaOf(params.Name), params.Arguments)
-		if err == nil {
-			if bad := seen.checkParams(expected); bad != nil {
-				return nil, bad
-			}
+		if err != nil {
+			return nil, &rpcError{Code: -32602, Message: err.Error(), status: 400}
+		}
+		if bad := seen.checkParams(expected); bad != nil {
+			return nil, bad
 		}
 		result, rerr := m.callTool(ctx, params.Name, params.Arguments)
 		if rerr != nil {
@@ -153,13 +155,13 @@ func (m *Manager) capabilities(canNotify bool) map[string]any {
 
 func (m *Manager) schemaOf(name string) json.RawMessage {
 	m.mu.RLock()
-	c, ok := m.index[name]
+	e, ok := m.index[name]
 	m.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	for _, t := range c.Cached() {
-		if t.Name == name || c.Name()+m.Separator+t.Name == name {
+	for _, t := range e.src.Cached() {
+		if t.Name == e.tool {
 			return t.Schema
 		}
 	}
@@ -191,12 +193,12 @@ func (m *Manager) toolList() []map[string]any {
 
 func (m *Manager) rawTool(name string) map[string]any {
 	m.mu.RLock()
-	c, ok := m.index[name]
+	e, ok := m.index[name]
 	m.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	raw := c.Raw(strings.TrimPrefix(name, c.Name()+m.Separator))
+	raw := e.src.Raw(e.tool)
 	if len(raw) == 0 {
 		return nil
 	}
@@ -278,15 +280,27 @@ func (m *Manager) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) e
 		readErr = lines.Err()
 	}()
 
+	// unarm is written by whichever request goroutine arms the subscription and
+	// read by this one when it returns. sync.Once orders Do against Do, not
+	// against a plain read, and a read that misses it leaves the subscriber in
+	// m.streams for the life of the process.
 	var (
 		armLegacy sync.Once
+		unarmMu   sync.Mutex
 		unarm     = func() {}
 	)
-	defer func() { unarm() }()
+	defer func() {
+		unarmMu.Lock()
+		fn := unarm
+		unarmMu.Unlock()
+		fn()
+	}()
 	pushLegacy := func() {
 		armLegacy.Do(func() {
 			s := m.subscribe("", filter{Tools: true})
+			unarmMu.Lock()
 			unarm = func() { m.unsubscribe(s) }
+			unarmMu.Unlock()
 			go func() {
 				for {
 					select {
