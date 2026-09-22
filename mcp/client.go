@@ -378,20 +378,25 @@ const maxAccount = 1024
 
 func tame(s string) string { return tameTo(s, maxSaid) }
 
+// tameTo keeps what can be printed on one line and measures what is left, not
+// what arrived: a byte that is not text at all becomes a rune on the way
+// through, so a line cut before that would still be three times the ceiling.
+// C0 and DEL are not the only characters that move a cursor or make a name
+// read as something it is not, so what is kept is what Go itself will print
+// unescaped, which leaves out the C1 controls, the bidi overrides and the
+// other invisibles along with them.
 func tameTo(s string, max int) string {
-	if len(s) > max {
-		cut := max
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
+	var b strings.Builder
+	for _, r := range s {
+		if !strconv.IsPrint(r) || r == utf8.RuneError {
+			continue
 		}
-		s = s[:cut]
+		if b.Len()+utf8.RuneLen(r) > max {
+			break
+		}
+		b.WriteRune(r)
 	}
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return -1
-		}
-		return r
-	}, s)
+	return b.String()
 }
 
 // A tool name is an identifier a model has to reproduce exactly, so one too
@@ -403,9 +408,11 @@ func usableName(name string) string {
 		return ""
 	}
 	// Cutting or stripping would leave a name the server does not answer to,
-	// which is worse than not offering the tool at all.
+	// which is worse than not offering the tool at all. The rule is the one
+	// tameTo goes by: a name has to be printable as it stands, and a name
+	// carrying bytes that are not text is not a name a model could reproduce.
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f {
+		if !strconv.IsPrint(r) || r == utf8.RuneError {
 			return ""
 		}
 	}
@@ -420,8 +427,11 @@ func usableName(name string) string {
 // too long to carry is refused rather than cut, and the second return says
 // which of the two came back.
 func quoted(name string) (string, bool) {
-	if q := strconv.Quote(name); len(q) <= maxSaid {
-		return q, true
+	// The measure is the name, not the escapes it needs: one short enough to
+	// have been carried is short enough to be shown, however much of it has to
+	// be written as an escape to be shown safely.
+	if len(name) <= maxSaid {
+		return strconv.Quote(name), true
 	}
 	return fmt.Sprintf("a name of %d bytes", len(name)), false
 }
@@ -434,6 +444,28 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	truncated, full := false, false
 	seen := map[string]bool{}
 	dropped := map[string]bool{}
+	// refuse records a name goose will not carry, whatever it was about the
+	// tool that decided that: a name it cannot hold and a schema it cannot
+	// mirror are both the server's choice, and how many of either there are is
+	// no more the server's than how many tools. Held on a ceiling of its own,
+	// so a run of them cannot spend the catalogue saying so and leave no room
+	// for the tools behind it, and checked before anything is kept, so what is
+	// remembered to tell one refusal from another is bounded by that number
+	// too.
+	refuse := func(name string) {
+		if len(refused) >= maxRefused {
+			truncated = true
+			return
+		}
+		offered, exact := quoted(name)
+		if exact {
+			if dropped[offered] {
+				return
+			}
+			dropped[offered] = true
+		}
+		refused = append(refused, offered)
+	}
 	for pages := 0; pages < maxToolPages; pages++ {
 		var result struct {
 			Tools      []json.RawMessage `json:"tools"`
@@ -464,32 +496,10 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			// differently: one that cannot be carried must not stand in front
 			// of one that can just because they read alike once the characters
 			// that made it unusable are taken out.
-			// A refusal counts against the ceiling too, since how many of them
-			// there are is no more the server's to choose than how many tools.
 			if name == "" {
 				// Cutting it would leave a name the server does not answer to,
 				// so it is not offered — and saying so is the whole point.
-				// Only a name said exactly can be recognised as one already
-				// said; two merely measured are two refusals, which the
-				// ceiling below is what bounds.
-				// Held on its own, so that a run of names goose will not carry
-				// cannot spend the catalogue saying so and leave no room for
-				// the tools behind it. The rest of the list is still read, and
-				// the ceiling is checked before anything else is kept, so what
-				// is remembered to tell one refusal from another is bounded by
-				// the same number as the refusals themselves.
-				if len(refused) >= maxRefused {
-					truncated = true
-					continue
-				}
-				offered, exact := quoted(t.Name)
-				if exact {
-					if dropped[offered] {
-						continue
-					}
-					dropped[offered] = true
-				}
-				refused = append(refused, offered)
+				refuse(t.Name)
 				continue
 			}
 			if seen[name] {
@@ -507,7 +517,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			}
 			if c.mirrors {
 				if _, err := annotated(schema); err != nil {
-					refused = append(refused, t.Name)
+					refuse(t.Name)
 					continue
 				}
 			}

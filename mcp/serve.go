@@ -67,7 +67,7 @@ func (m *Manager) modern(ctx context.Context, req *request, agreement meta, seen
 		return answer(map[string]any{}), nil
 
 	default:
-		return nil, &rpcError{Code: -32601, Message: "unknown method " + req.Method, status: 404}
+		return nil, &rpcError{Code: -32601, Message: "unknown method " + tame(req.Method), status: 404}
 	}
 }
 
@@ -150,7 +150,7 @@ func (m *Manager) legacy(ctx context.Context, method string, params json.RawMess
 		return map[string]any{}, nil
 
 	default:
-		return nil, &rpcError{Code: -32601, Message: "unknown method " + method}
+		return nil, &rpcError{Code: -32601, Message: "unknown method " + tame(method)}
 	}
 }
 

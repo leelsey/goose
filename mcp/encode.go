@@ -12,15 +12,27 @@ import (
 )
 
 // A tool result holds parts, and a part can be a tool result. Nothing about a
-// structure goose did not build says that it ends, and a stack that runs out
-// is not an error a process recovers from.
-const maxNesting = 16
+// structure goose did not build says that it ends, and a stack that runs out is
+// not an error a process recovers from. Depth is not the only way one of these
+// grows: a result holding itself twice doubles at every level it is allowed, so
+// how much comes out is bounded as well as how deep it is read.
+const (
+	maxNesting = 16
+	maxBlocks  = 4096
+)
 
-func encodeContent(parts []llm.Part) []json.RawMessage { return encodeParts(parts, 0) }
+func encodeContent(parts []llm.Part) []json.RawMessage {
+	left := maxBlocks
+	return encodeParts(parts, 0, &left)
+}
 
-func encodeParts(parts []llm.Part, depth int) []json.RawMessage {
+func encodeParts(parts []llm.Part, depth int, left *int) []json.RawMessage {
 	out := make([]json.RawMessage, 0, len(parts))
 	for _, p := range parts {
+		if *left <= 0 {
+			break
+		}
+		*left--
 		switch v := p.(type) {
 		case *llm.Text:
 			out = append(out, mustJSON(map[string]any{"type": "text", "text": v.Text}))
@@ -47,7 +59,7 @@ func encodeParts(parts []llm.Part, depth int) []json.RawMessage {
 				}))
 				continue
 			}
-			out = append(out, encodeParts(v.Content, depth+1)...)
+			out = append(out, encodeParts(v.Content, depth+1, left)...)
 		case *llm.Raw:
 			if v.Vendor == "mcp" && json.Valid(v.JSON) {
 				out = append(out, v.JSON)
@@ -96,7 +108,9 @@ func describe(p llm.Part) string {
 		if len(v.Args) > 0 {
 			return v.Name + " " + string(v.Args)
 		}
-		return v.Name
+		if v.Name != "" {
+			return v.Name
+		}
 	}
 	return string(p.Kind())
 }

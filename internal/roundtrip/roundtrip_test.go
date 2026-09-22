@@ -5,7 +5,9 @@
 package roundtrip
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -86,12 +88,11 @@ func FuzzOpenAIRequestSurvivesTheProxy(f *testing.F) {
 
 func compare(t testing.TB, sent string, got []byte, reported string) {
 	t.Helper()
-	var in, out map[string]any
-	if json.Unmarshal([]byte(sent), &in) != nil || json.Unmarshal(got, &out) != nil {
+	in, okIn := foldRead([]byte(sent))
+	out, okOut := foldRead(got)
+	if !okIn || !okOut {
 		return
 	}
-	foldKeys(in)
-	foldKeys(out)
 	normalise(in)
 	normalise(out)
 
@@ -154,19 +155,24 @@ func roles(v any) []string {
 	return out
 }
 
-func foldKeys(body map[string]any) {
-	lower(body)
-	msgs, ok := body["messages"].([]any)
-	if !ok {
-		return
+// foldRead reads a request the way the decoder under test reads one: a field
+// is matched without regard to the case it was written in, and where an object
+// spells one field twice the last spelling is the one that lands. A map cannot
+// say which of two spellings came last, so the object is read in the order it
+// was written rather than folded afterwards.
+func foldRead(raw []byte) (map[string]any, bool) {
+	v, err := foldValue(json.NewDecoder(bytes.NewReader(raw)))
+	if err != nil {
+		return nil, false
 	}
-	for _, entry := range msgs {
-		if m, ok := entry.(map[string]any); ok {
-			lower(m)
-		}
-	}
+	body, ok := v.(map[string]any)
+	return body, ok
 }
 
+// lower folds an object's keys after the fact, for a body already decoded and
+// read only for shapes no wire spells twice. Where a field could be spelled
+// twice in the one object, read the body with foldRead instead: which spelling
+// landed is not something this can say.
 func lower(m map[string]any) {
 	for k, v := range m {
 		if folded := strings.ToLower(k); folded != k {
@@ -176,6 +182,47 @@ func lower(m map[string]any) {
 			delete(m, k)
 		}
 	}
+}
+
+func foldValue(dec *json.Decoder) (any, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return tok, nil
+	}
+	switch delim {
+	case '{':
+		body := map[string]any{}
+		for dec.More() {
+			key, err := dec.Token()
+			if err != nil {
+				return nil, err
+			}
+			name, _ := key.(string)
+			v, err := foldValue(dec)
+			if err != nil {
+				return nil, err
+			}
+			body[strings.ToLower(name)] = v
+		}
+		_, err := dec.Token()
+		return body, err
+	case '[':
+		list := []any{}
+		for dec.More() {
+			v, err := foldValue(dec)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, v)
+		}
+		_, err := dec.Token()
+		return list, err
+	}
+	return nil, fmt.Errorf("unexpected %v", delim)
 }
 
 func toolNames(v any) []string {
@@ -229,8 +276,10 @@ func empty(v any) bool {
 func normalise(body map[string]any) {
 	// This wire takes a stop sequence as a string or as a list of them, and a
 	// list holding the one string is that string. Reading it as the list it
-	// also means is not the request changing under the caller.
-	if only, ok := body["stop"].(string); ok {
+	// also means is not the request changing under the caller. An empty one is
+	// no stop sequence at all, and stays the empty thing it was so that the
+	// check below still passes over it.
+	if only, ok := body["stop"].(string); ok && only != "" {
 		body["stop"] = []any{only}
 	}
 	msgs, ok := body["messages"].([]any)
@@ -314,4 +363,20 @@ func post(t *testing.T, front *httptest.Server, body string) (int, string) {
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(out)
+}
+
+// The check is only worth what it reads the request as. Two spellings of one
+// field are read the way the decoder under test reads them, and a stop
+// sequence that is not one is not a change.
+func TestTheCheckReadsARequestTheWayTheDecoderDoes(t *testing.T) {
+	for _, tc := range []struct{ what, body string }{
+		{"two spellings of a field", `{"messages":[{"role":"000000","Role":"user"}]}`},
+		{"a stop sequence that is not one", `{"messages":[{"role":"user","content":"hi"}],"stop":""}`},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			front, seen := proxy(t)
+			post(t, front, tc.body)
+			compare(t, tc.body, *seen, "")
+		})
+	}
 }

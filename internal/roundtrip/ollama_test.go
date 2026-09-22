@@ -79,12 +79,11 @@ func FuzzOllamaRequestSurvivesTheProxy(f *testing.F) {
 
 func compareOllama(t testing.TB, sent string, got []byte, reported string) {
 	t.Helper()
-	var in, out map[string]any
-	if json.Unmarshal([]byte(sent), &in) != nil || json.Unmarshal(got, &out) != nil {
+	in, okIn := foldRead([]byte(sent))
+	out, okOut := foldRead(got)
+	if !okIn || !okOut {
 		return
 	}
-	foldKeys(in)
-	foldKeys(out)
 	normalise(in)
 	normalise(out)
 	fail := func(what string, want, have any) {

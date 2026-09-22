@@ -63,6 +63,9 @@ func answer(result map[string]any) map[string]any {
 }
 
 func unsupportedVersion(requested string) *rpcError {
+	// The caller chose this string, so it is said back the way anything else
+	// somebody else chose is said back.
+	requested = tame(requested)
 	data, _ := json.Marshal(map[string]any{
 		"supported": append(append([]string(nil), modernSpoken...), spoken...),
 		"requested": requested,

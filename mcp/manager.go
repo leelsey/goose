@@ -329,7 +329,13 @@ func (m *Manager) Call(ctx context.Context, name string, args json.RawMessage) (
 		said, _ := quoted(name)
 		return nil, fmt.Errorf("mcp: %w: %s", errNoSuchTool, said)
 	}
-	return e.src.Call(ctx, e.tool, args)
+	result, err := e.src.Call(ctx, e.tool, args)
+	if err == nil && result == nil {
+		// Neither a result nor an error is not an answer. Reading it as one
+		// takes the proxy down on the first thing that reaches into it.
+		return nil, fmt.Errorf("mcp %s: %s: answered with neither a result nor an error", e.src.Name(), e.tool)
+	}
+	return result, err
 }
 
 type ServerStatus struct {

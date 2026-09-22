@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2834,5 +2835,169 @@ func TestAPageOfRefusalsDoesNotEndTheCatalogue(t *testing.T) {
 	}
 	if !c.Truncated() {
 		t.Error("the refusals were cut and nothing said so")
+	}
+}
+
+// Every name goose will not carry goes through one ceiling and is said the one
+// way, whatever it was about the tool that made it unusable. A schema this
+// proxy cannot mirror is as much the server's choice as a name it cannot
+// carry, and neither is the server's to have an unbounded number of.
+func TestASchemaThatCannotBeMirroredIsRefusedThroughTheSameCeiling(t *testing.T) {
+	var entries []string
+	for i := range maxRefused + 50 {
+		name, err := json.Marshal(fmt.Sprintf("tool%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, `{"name":`+string(name)+
+			`,"inputSchema":{"type":"object","properties":{"a":{"x-mcp-header":"X-A"}}}}`)
+	}
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{Mirrors: true})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(c.Refused()); n > maxRefused {
+		t.Errorf("refused = %d, want at most %d: the count is the server's to choose", n, maxRefused)
+	}
+	if !c.Truncated() {
+		t.Error("the list was cut and nothing said so")
+	}
+	// One list, one way of saying a name, or an operator cannot tell a name
+	// from a name that has been quoted for them.
+	for _, name := range c.Refused() {
+		if !strings.HasPrefix(name, `"`) {
+			t.Errorf("refused %q is said differently from the rest of the list", name)
+			break
+		}
+	}
+}
+
+// Held to a line means measured after the characters goose will not pass on
+// have been taken out, not before: bytes that are not text at all become a
+// rune apiece on the way through.
+func TestALineIsMeasuredAfterItIsTamed(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		in   string
+		max  int
+	}{
+		{"bytes that are not text", strings.Repeat("\xff", 1<<16), maxAccount},
+		{"and the shorter ceiling", strings.Repeat("\xff", 1<<16), maxSaid},
+	} {
+		if got := tameTo(tc.in, tc.max); len(got) > tc.max {
+			t.Errorf("%s: %d bytes, want at most %d", tc.what, len(got), tc.max)
+		}
+	}
+}
+
+// A caller naming a method is somebody else choosing text goose prints, the
+// same as a server naming a tool.
+func TestAMethodNobodyServesIsSaidBackToALine(t *testing.T) {
+	m := NewManager()
+	defer m.Close()
+	front := httptest.NewServer(m.Handler())
+	defer front.Close()
+
+	name := strings.Repeat("m", 100000) + string([]byte{0x1b}) + "[2K"
+	asked, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Error *rpcError `json:"error"`
+	}
+	body := rpc(t, front, string(asked))
+	if err := json.Unmarshal([]byte(body), &reply); err != nil {
+		t.Fatalf("%v: %.200s", err, body)
+	}
+	if reply.Error == nil {
+		t.Fatalf("no error came back: %.200s", body)
+	}
+	if len(reply.Error.Message) > maxAccount {
+		t.Errorf("message = %d bytes, want at most %d", len(reply.Error.Message), maxAccount)
+	}
+	for _, r := range reply.Error.Message {
+		if !strconv.IsPrint(r) {
+			t.Fatalf("message carries %q, which rewrites the line it is printed on", r)
+		}
+	}
+}
+
+// C0 is not the only way to move a cursor, and a name that reads one way and
+// runs another is not a name goose will carry.
+func TestTheCharactersGooseWillNotPassOnAreNotOnlyTheAsciiOnes(t *testing.T) {
+	for _, r := range []rune{0x1b, 0x7f, 0x9b, 0x85, 0x202e, 0x200b} {
+		if got := tame("before" + string(r) + "after"); strings.ContainsRune(got, r) {
+			t.Errorf("tame kept %U", r)
+		}
+		if got := usableName("safe" + string(r) + "name"); got != "" {
+			t.Errorf("usableName carried %U as %q", r, got)
+		}
+	}
+	// What is left has to be the names themselves, untouched.
+	for _, name := range []string{"read_file", "파일_읽기", "lire fichier", "a b"} {
+		if got := tame(name); got != name {
+			t.Errorf("tame(%q) = %q", name, got)
+		}
+		if got := usableName(name); got != name {
+			t.Errorf("usableName(%q) = %q", name, got)
+		}
+	}
+}
+
+// A tool that answers with neither a result nor an error has not answered, and
+// reading its answer as one takes the proxy down with it.
+func TestAToolThatAnswersWithNothingIsNotAnAnswer(t *testing.T) {
+	m := NewManager()
+	defer m.Close()
+	if err := m.Serve("goose", Tool{
+		Definition: llm.Tool{Name: "hollow"},
+		Call:       func(context.Context, json.RawMessage) (*Result, error) { return nil, nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Call(context.Background(), "hollow", nil); err == nil {
+		t.Fatal("neither a result nor an error was read as an answer")
+	}
+	front := httptest.NewServer(m.Handler())
+	defer front.Close()
+	body := rpc(t, front, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hollow","arguments":{}}}`)
+	if !strings.Contains(body, `"error"`) {
+		t.Fatalf("body = %.200s", body)
+	}
+}
+
+// A part with nothing readable says which kind of block it was. A tool call
+// with no name at all is still a tool call.
+func TestANamelessToolCallStillSaysWhatItIs(t *testing.T) {
+	blocks := encodeContent([]llm.Part{&llm.ToolUse{ID: "abc"}})
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %d, want 1: the part vanished", len(blocks))
+	}
+	if got := string(blocks[0]); !strings.Contains(got, string(llm.KindToolUse)) {
+		t.Errorf("block = %s", got)
+	}
+}
+
+// Bounding how deep a result may nest does not bound how wide it may be. A
+// result holding itself twice doubles at every level it is allowed.
+func TestAResultThatHoldsItselfTwiceDoesNotDoubleAllTheWayDown(t *testing.T) {
+	loop := &llm.ToolResult{ID: "t1"}
+	loop.Content = []llm.Part{loop, loop}
+	if n := len(encodeContent([]llm.Part{loop})); n > maxBlocks {
+		t.Fatalf("blocks = %d, want at most %d", n, maxBlocks)
 	}
 }
