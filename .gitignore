@@ -6,3 +6,4 @@ usage.jsonl
 goose.toml
 .goose.toml
 .env
+.DS_Store

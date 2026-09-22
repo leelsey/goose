@@ -26,6 +26,18 @@ jobs:
       # Behind a build tag, so nothing above compiles it.
       - run: go vet -tags conformance ./internal/conformance/
 
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      # The seed corpora are replayed by `go test`; this looks for what they do
+      # not cover yet. Every target runs even when one of them fails.
+      - run: make fuzz
+
   vuln:
     runs-on: ubuntu-latest
     steps:

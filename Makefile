@@ -14,7 +14,7 @@ PLATFORMS := \
 	windows/amd64 \
 	windows/arm64
 
-.PHONY: all build clean test race cover vet vuln release $(PLATFORMS)
+.PHONY: all build clean test race cover vet vuln release fuzz conformance $(PLATFORMS)
 
 all: build
 
@@ -52,9 +52,11 @@ $(PLATFORMS): EXT  = $(if $(filter windows,$(OS)),.exe,)
 $(PLATFORMS):
 	GOOS=$(OS) GOARCH=$(ARCH) $(BUILD) -o $(DIST)/$(APP)-$(OS)-$(ARCH)$(EXT) $(CMD)
 
-# Each fuzz target for a minute, seeded from the build cache.
+# Each fuzz target for a minute, seeded from the build cache. Every target runs
+# even when one fails, and what it said is kept rather than thrown away.
 fuzz:
-	@for t in \
+	@mkdir -p $(DIST)
+	@failed="" ; for t in \
 	  "./wire FuzzDecode" \
 	  "./wire FuzzAnthropicStreamStaysWellFormed" \
 	  "./internal/wirecore FuzzScanner" \
@@ -69,14 +71,18 @@ fuzz:
 	  "./internal/roundtrip FuzzOllamaRequestSurvivesTheProxy" \
 	  "./internal/roundtrip FuzzResponsesRequestSurvivesTheProxy" \
 	  "./internal/roundtrip FuzzOpenAIAnswerSurvivesTheProxy" \
+	  "./internal/roundtrip FuzzGoogleAnswerSurvivesTheProxy" \
 	  "./internal/roundtrip FuzzOpenAIStreamSurvivesTheProxy" ; do \
 	  set -- $$t ; \
 	  printf '%-48s ' "$$2" ; \
-	  go test -run xxx -fuzz "$$2" -fuzztime 60s "$$1" >/dev/null 2>&1 \
-	    && echo ok || { echo FAIL ; exit 1 ; } ; \
-	done
+	  if go test -run xxx -fuzz "$$2" -fuzztime 60s "$$1" >"$(DIST)/fuzz-$$2.log" 2>&1 ; then \
+	    echo ok ; \
+	  else \
+	    echo "FAIL (see $(DIST)/fuzz-$$2.log)" ; failed="$$failed $$2" ; \
+	  fi ; \
+	done ; \
+	if [ -n "$$failed" ] ; then echo "failed:$$failed" ; exit 1 ; fi
 
 conformance:
 	go test -tags conformance ./internal/conformance/ -v
 
-.PHONY: fuzz conformance
