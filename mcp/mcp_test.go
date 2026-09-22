@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/leelsey/goose/llm"
 )
@@ -2365,5 +2366,56 @@ func TestAPartWithNoBlockCarriesWhatItSays(t *testing.T) {
 		if strings.Contains(joined, leak) {
 			t.Errorf("%q is goose's own field name and reached a model: %s", leak, joined)
 		}
+	}
+}
+
+// The mirror check reads the arguments. Arguments nobody could read are not
+// arguments that passed it, and what the caller is told about them is not a Go
+// type name.
+func TestArgumentsNobodyCanReadAreRefused(t *testing.T) {
+	schema := json.RawMessage(
+		`{"type":"object","properties":{"path":{"type":"string","x-mcp-header":"Path"}}}`)
+	for _, args := range []string{`[1,2,3]`, `5`, `"text"`, `{"path":`} {
+		if _, err := paramHeaders(schema, json.RawMessage(args)); err == nil {
+			t.Errorf("arguments %s were read as an object", args)
+		}
+	}
+	for _, args := range []string{``, `null`, `{}`, `{"path":"/x"}`} {
+		if _, err := paramHeaders(schema, json.RawMessage(args)); err != nil {
+			t.Errorf("arguments %s are an object goose can read: %v", args, err)
+		}
+	}
+	// A schema that asks for no mirrored header is not checked at all.
+	if _, err := paramHeaders(json.RawMessage(`{"type":"object"}`), json.RawMessage(`[1,2,3]`)); err != nil {
+		t.Errorf("a schema with nothing to mirror refused a call: %v", err)
+	}
+}
+
+// What a server says about itself is cut to a length a status table can hold,
+// and a character is not something to cut in half.
+func TestTamingCutsOnACharacter(t *testing.T) {
+	long := strings.Repeat("가", maxSaid)
+	got := tame(long)
+	if !utf8.ValidString(got) {
+		t.Fatalf("tame cut a character in half: %q", got[len(got)-8:])
+	}
+	if len(got) > maxSaid {
+		t.Fatalf("tame returned %d bytes for a %d-byte ceiling", len(got), maxSaid)
+	}
+}
+
+// A resource is content the model reads. Sending it twice, once as text and
+// once as a block no wire has a shape for, costs a strict caller the call.
+func TestAResourceTravelsOnce(t *testing.T) {
+	parts := decodeContent([]json.RawMessage{json.RawMessage(
+		`{"type":"resource","resource":{"uri":"file:///a.txt","mimeType":"text/plain","text":"THE PLAN"}}`)})
+	if len(parts) != 1 {
+		t.Fatalf("parts = %d: %+v", len(parts), parts)
+	}
+	if _, raw := parts[0].(*llm.Raw); raw {
+		t.Fatal("a block no wire has a shape for fails a strict caller outright")
+	}
+	if llm.TextOf(parts) != "THE PLAN" {
+		t.Fatalf("text = %q", llm.TextOf(parts))
 	}
 }

@@ -5,6 +5,7 @@ package goose
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -197,5 +198,58 @@ func TestAToolTheBackendNeverSawIsNotAReasonToRefuse(t *testing.T) {
 	}
 	if err := negotiate(a, llm.Capabilities{}); err != nil {
 		t.Fatalf("err = %v: this backend takes no tools, so none could be called", err)
+	}
+}
+
+// The list names as many fields as it promised room for, and says how many it
+// could not name. It never opens with a separator.
+func TestTheDroppedFieldListIsWrittenPlainly(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields []string
+	}{
+		{"one that fits exactly", []string{strings.Repeat("k", maxNamedFields)}},
+		{"one too long by a byte", []string{strings.Repeat("k", maxNamedFields+1)}},
+		{"two that sum to the width", []string{strings.Repeat("a", 255), strings.Repeat("b", 256)}},
+		{"many", func() []string {
+			var out []string
+			for i := 0; i < 200; i++ {
+				out = append(out, strings.Repeat("f", 20))
+			}
+			return out
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := named(tc.fields)
+			if strings.HasPrefix(got, ",") {
+				t.Fatalf("the list opens with a separator: %q", got[:20])
+			}
+			if !strings.Contains(got, "more") {
+				if got != strings.Join(tc.fields, ",") {
+					t.Fatalf("every field fitted, so every field is named: %q", got)
+				}
+				return
+			}
+			if len(tc.fields) == 1 && len(tc.fields[0]) <= maxNamedFields {
+				if got != tc.fields[0] {
+					t.Fatalf("a field of exactly the width was not named: %q", got)
+				}
+				return
+			}
+			head, tail, _ := strings.Cut(got, "…")
+			var shown int
+			for _, f := range strings.Split(strings.TrimSuffix(head, ","), ",") {
+				if f != "" {
+					shown++
+				}
+			}
+			var more int
+			if _, err := fmt.Sscanf(tail, " and %d more", &more); err != nil {
+				t.Fatalf("the tail does not say how many were left out: %q", got)
+			}
+			if shown+more != len(tc.fields) {
+				t.Fatalf("named %d and claimed %d more, of %d: %q", shown, more, len(tc.fields), got)
+			}
+		})
 	}
 }

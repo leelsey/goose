@@ -258,3 +258,18 @@ func TestATerminatorSplitAcrossReadsIsStillOneTerminator(t *testing.T) {
 		}
 	}
 }
+
+// The ceiling bounds what is held, so a line past it is refused within one
+// read of crossing rather than after the whole of it has been taken in.
+func TestAnOverlongLineIsRefusedWithoutHoldingItAll(t *testing.T) {
+	r := &counter{Reader: strings.NewReader(strings.Repeat("a", 4<<20) + "\n")}
+	l := NewLines(r, 1<<10)
+	for l.Scan() {
+	}
+	if !errors.Is(l.Err(), ErrLineTooLong) {
+		t.Fatalf("err = %v", l.Err())
+	}
+	if r.n > 1<<17 {
+		t.Fatalf("read %d bytes for a %d-byte ceiling", r.n, 1<<10)
+	}
+}
