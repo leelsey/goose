@@ -330,7 +330,7 @@ func (s *streamer) openMessage() {
 	})
 }
 
-// part announces a content part the first time something arrives for it.
+// announce names a content part the first time something arrives for it.
 func (s *streamer) announce(index *int, p contentPart) int {
 	if *index < 0 {
 		*index = s.parts
@@ -383,22 +383,25 @@ func (s *streamer) closeItem() {
 		parts := make([]contentPart, s.parts)
 		if s.textIndex >= 0 {
 			parts[s.textIndex] = contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}}
-			s.event("response.output_text.done", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.textIndex, "text": s.buf,
-			})
-			s.event("response.content_part.done", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.textIndex,
-				"part": parts[s.textIndex],
-			})
 		}
 		if s.refusalIndex >= 0 {
 			parts[s.refusalIndex] = contentPart{Type: "refusal", Refusal: s.refusalBuf}
-			s.event("response.refusal.done", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.refusalIndex, "refusal": s.refusalBuf,
-			})
+		}
+		// The closing events go out in the order the parts were announced in,
+		// which is the order a client is entitled to read them in.
+		for at, part := range parts {
+			switch at {
+			case s.textIndex:
+				s.event("response.output_text.done", map[string]any{
+					"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "text": s.buf,
+				})
+			case s.refusalIndex:
+				s.event("response.refusal.done", map[string]any{
+					"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "refusal": s.refusalBuf,
+				})
+			}
 			s.event("response.content_part.done", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.refusalIndex,
-				"part": parts[s.refusalIndex],
+				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "part": part,
 			})
 		}
 		it.Content = append(it.Content, parts...)

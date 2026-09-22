@@ -2353,11 +2353,11 @@ func TestAPartWithNoBlockCarriesWhatItSays(t *testing.T) {
 		&llm.Thinking{Text: "the reasoning", Signature: "sig"},
 		&llm.ToolResult{ID: "t1", IsError: true, Content: []llm.Part{&llm.Text{Text: "it blew up"}}},
 	})
-	if len(blocks) != 2 {
-		t.Fatalf("blocks = %d", len(blocks))
+	var joined string
+	for _, b := range blocks {
+		joined += string(b)
 	}
-	joined := string(blocks[0]) + string(blocks[1])
-	for _, want := range []string{"the reasoning", "it blew up"} {
+	for _, want := range []string{"the reasoning", "it blew up", `"error"`} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("%q did not survive: %s", want, joined)
 		}
@@ -2464,6 +2464,58 @@ func TestRefusalsAreBoundedToo(t *testing.T) {
 // The caller's arguments failing to be an object and the tool's own schema
 // failing to be checkable are different things, and the answer says which.
 func TestABadSchemaIsNotBlamedOnTheCaller(t *testing.T) {
+	bad := json.RawMessage(
+		`{"type":"object","properties":{"a":{"type":"string","x-mcp-header":"bad header"}}}`)
+	if _, err := paramHeaders(bad, json.RawMessage(`{"a":"x"}`)); err == nil {
+		t.Fatal("a header name this wire cannot carry is a schema goose cannot mirror")
+	} else if errors.Is(err, errNotAnObject) {
+		t.Fatalf("a schema fault was read as the caller's arguments: %v", err)
+	}
+	good := json.RawMessage(
+		`{"type":"object","properties":{"a":{"type":"string","x-mcp-header":"A"}}}`)
+	if _, err := paramHeaders(good, json.RawMessage(`[1,2]`)); !errors.Is(err, errNotAnObject) {
+		t.Fatalf("arguments that are not an object were read as something else: %v", err)
+	}
+}
+
+// tame and usableName judge a name differently, so keying one set on the wrong
+// one lets a name goose will not carry stand in front of one it will.
+func TestAnUnusableNameDoesNotBlockAUsableOne(t *testing.T) {
+	ctrl, _ := json.Marshal("read_fi" + string(rune(1)) + "le")
+	plain, _ := json.Marshal("read_file")
+	for _, order := range [][2]string{{string(ctrl), string(plain)}, {string(plain), string(ctrl)}} {
+		ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+			switch out.Method {
+			case "server/discover":
+				return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+			case "initialize":
+				return &response{Result: json.RawMessage(
+					`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+			}
+			return &response{Result: json.RawMessage(`{"tools":[` +
+				`{"name":` + order[0] + `,"inputSchema":{"type":"object"}},` +
+				`{"name":` + order[1] + `,"inputSchema":{"type":"object"}}]}`)}, nil
+		}}
+		c := newClient("srv", ft, Options{})
+		if err := c.connect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		tools, err := c.Tools(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tools) != 1 || tools[0].Name != "read_file" {
+			t.Errorf("order %v: tools = %+v, want the one goose can carry", order, tools)
+		}
+		if len(c.Refused()) != 1 {
+			t.Errorf("order %v: refused = %q, want the one it cannot", order, c.Refused())
+		}
+	}
+}
+
+// A schema goose cannot mirror is refused where whoever wrote it can see why,
+// not on every call that reaches the tool.
+func TestASchemaGooseCannotMirrorIsRefusedAtRegistration(t *testing.T) {
 	m := NewManager()
 	defer m.Close()
 	err := m.Serve("fs", Tool{
@@ -2471,17 +2523,87 @@ func TestABadSchemaIsNotBlamedOnTheCaller(t *testing.T) {
 			`{"type":"object","properties":{"a":{"type":"string","x-mcp-header":"bad header"}}}`)},
 		Call: func(context.Context, json.RawMessage) (*Result, error) { return &Result{}, nil },
 	})
-	if err != nil {
+	if err == nil {
+		t.Fatal("a tool nobody can call without a 500 was registered")
+	}
+	if !strings.Contains(err.Error(), "header name") {
+		t.Fatalf("err = %v: it does not say which annotation is wrong", err)
+	}
+}
+
+// The ceiling counts what is held, and a refusal is held too. Distinct names
+// exercise it where identical ones are stopped by the duplicate set first.
+func TestTheCeilingCountsRefusalsAsWellAsTools(t *testing.T) {
+	var entries []string
+	for i := 0; i < maxTools+500; i++ {
+		name, _ := json.Marshal(fmt.Sprintf("bad%d%sname", i, string(rune(1))))
+		entries = append(entries, `{"name":`+string(name)+`,"inputSchema":{"type":"object"}}`)
+	}
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+	}}
+	c := newClient("loud", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := paramHeaders(m.schemaOf("read"), json.RawMessage(`{"a":"x"}`)); err == nil {
-		t.Fatal("a header name this wire cannot carry is a schema goose cannot mirror")
-	} else if errors.Is(err, errNotAnObject) {
-		t.Fatalf("a schema fault was read as the caller's arguments: %v", err)
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := paramHeaders(json.RawMessage(
-		`{"type":"object","properties":{"a":{"type":"string","x-mcp-header":"A"}}}`),
-		json.RawMessage(`[1,2]`)); !errors.Is(err, errNotAnObject) {
-		t.Fatalf("arguments that are not an object were read as something else: %v", err)
+	if n := len(c.Refused()); n > maxTools {
+		t.Fatalf("held %d distinct refusals for a ceiling of %d", n, maxTools)
+	}
+	if !c.Truncated() {
+		t.Error("the rest was dropped and nothing said so")
+	}
+}
+
+// A tool server saying "no such method" does not mean this proxy has none, and
+// which server and which call failed is goose's own to report.
+func TestAToolServersCodeIsNotRelayedAsGooses(t *testing.T) {
+	m := NewManager()
+	defer m.Close()
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"up"}}`)}, nil
+		case "tools/list":
+			return &response{Result: json.RawMessage(
+				`{"tools":[{"name":"read","inputSchema":{"type":"object"}}]}`)}, nil
+		}
+		return &response{Error: &rpcError{Code: -32601, Message: "this server has no such tool"}}, nil
+	}}
+	c := newClient("up", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.sources = []source{c}
+	m.mu.Unlock()
+	m.reindex()
+
+	_, rpcErr := m.callTool(context.Background(), "read", json.RawMessage(`{}`))
+	if rpcErr == nil {
+		t.Fatal("a call the server refused was reported as served")
+	}
+	if rpcErr.Code == -32601 {
+		t.Errorf("code = %d: the server's own code was handed to the caller as this proxy's", rpcErr.Code)
+	}
+	for _, want := range []string{"up", "tools/call"} {
+		if !strings.Contains(rpcErr.Message, want) {
+			t.Errorf("message = %q: it does not say %q failed", rpcErr.Message, want)
+		}
 	}
 }

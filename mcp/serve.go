@@ -225,13 +225,11 @@ func (m *Manager) rawTool(name string) map[string]any {
 func (m *Manager) callTool(ctx context.Context, name string, args json.RawMessage) (map[string]any, *rpcError) {
 	result, err := m.Call(ctx, name, args)
 	if err != nil {
-		// A server's own words were already kept to a line where they arrived;
-		// repeating the whole chain here would put them back over it.
-		var upstream *rpcError
-		if errors.As(err, &upstream) {
-			return nil, &rpcError{Code: upstream.Code, Message: tame(upstream.Message)}
-		}
-		return nil, &rpcError{Code: -32602, Message: tame(err.Error())}
+		// A server's own words were kept to a line where they arrived, so what
+		// is added here is goose's own account of which server and which call
+		// failed. The code stays goose's: a tool server saying "no such
+		// method" does not mean this proxy has none.
+		return nil, &rpcError{Code: -32602, Message: err.Error()}
 	}
 	out := map[string]any{
 		"content": encodeContent(result.Content),

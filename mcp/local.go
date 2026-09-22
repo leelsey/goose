@@ -68,6 +68,14 @@ func (m *Manager) Serve(name string, tools ...Tool) error {
 		case src.calls[t.Definition.Name] != nil:
 			return fmt.Errorf("mcp %s: tool %q is defined twice", name, t.Definition.Name)
 		}
+		// A schema goose cannot mirror is refused here, where whoever wrote it
+		// can see why, rather than on every call that reaches it. A remote
+		// server's tools are held to the same rule when they are listed.
+		if len(t.Definition.Schema) > 0 {
+			if _, err := annotated(t.Definition.Schema); err != nil {
+				return fmt.Errorf("mcp %s: tool %q: %w", name, t.Definition.Name, err)
+			}
+		}
 		def := t.Definition
 		if len(def.Schema) == 0 {
 			def.Schema = json.RawMessage(`{"type":"object","properties":{}}`)

@@ -559,3 +559,34 @@ func lastMessageParts(t *testing.T, body string) []string {
 	}
 	return out
 }
+
+// A client reads the closing events in the order the parts were announced in.
+func TestTheClosingEventsFollowThePartOrder(t *testing.T) {
+	frames := []*llm.Frame{
+		{Delta: []llm.Part{&llm.Refusal{Text: "no"}}},
+		{Delta: []llm.Part{&llm.Text{Text: "but"}}},
+		{Stop: llm.StopEnd, TurnEnd: true},
+	}
+	s := llm.StaticStream(llm.StreamMeta{Model: "m"}, frames)
+	w := &wire.BufferWriter{}
+	if _, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, w); err != nil {
+		t.Fatal(err)
+	}
+	var order []float64
+	for _, line := range strings.Split(w.Body.String(), "\n") {
+		raw, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		var ev map[string]any
+		if json.Unmarshal([]byte(raw), &ev) != nil || ev["type"] != "response.content_part.done" {
+			continue
+		}
+		order = append(order, ev["content_index"].(float64))
+	}
+	for i := 1; i < len(order); i++ {
+		if order[i] < order[i-1] {
+			t.Fatalf("the closing events run %v, which is not the order the parts were announced in", order)
+		}
+	}
+}

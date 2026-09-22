@@ -409,6 +409,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	cursor := ""
 	truncated := false
 	seen := map[string]bool{}
+	dropped := map[string]bool{}
 	for pages := 0; pages < maxToolPages; pages++ {
 		var result struct {
 			Tools      []json.RawMessage `json:"tools"`
@@ -431,30 +432,38 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			if json.Unmarshal(entry, &t) != nil || t.Name == "" {
 				continue
 			}
-			offered := tame(t.Name)
+			offered, name := tame(t.Name), usableName(t.Name)
 			// A name offered twice is one tool. Keeping both copies shows the
 			// first to the model while the second decides what goes on the
 			// wire, so the definition on display would not be the one in use.
-			// A refusal counts for this too: how many of them there are is no
-			// more the server's to choose than how many tools there are.
-			if offered == "" || seen[offered] {
+			// The two sets are kept apart because the two names are judged
+			// differently: one that cannot be carried must not stand in front
+			// of one that can just because they read alike once tamed.
+			// A refusal counts against the ceiling too, since how many of them
+			// there are is no more the server's to choose than how many tools.
+			if name == "" {
+				// Cutting it would leave a name the server does not answer to,
+				// so it is not offered — and saying so is the whole point.
+				if offered == "" || dropped[offered] {
+					continue
+				}
+				dropped[offered] = true
+				if len(out)+len(refused) >= maxTools {
+					truncated = true
+					break
+				}
+				refused = append(refused, offered)
 				continue
 			}
-			seen[offered] = true
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
 			if len(out)+len(refused) >= maxTools {
 				truncated = true
 				break
 			}
-			t.Name = usableName(t.Name)
-			if t.Name == "" {
-				// Cutting it would leave a name the server does not answer to,
-				// so it is not offered — and saying so is the whole point.
-				refused = append(refused, offered)
-				continue
-			}
-			if _, taken := raw[t.Name]; taken {
-				continue
-			}
+			t.Name = name
 			schema := t.InputSchema
 			if len(schema) == 0 || string(schema) == "null" {
 				schema = json.RawMessage(`{"type":"object","properties":{}}`)
