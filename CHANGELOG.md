@@ -1,5 +1,191 @@
 # Changelog
 
+## Unreleased
+
+A second audit, this time of the code rather than the README's claims about it.
+Everything below was found by reading the source and confirmed against it before
+it was touched; a handful of reported problems turned out not to be problems and
+were left alone.
+
+### Fixed
+- A route chain stopped at the first link that failed for a reason the next one
+  might not have shared: a revoked key, a model that backend does not serve, a
+  region that refused. It now walks on for those and stops only where walking on
+  would change nothing — a malformed request, a capability none of them has, a
+  caller that has gone, or the attempt deadline having passed.
+- The shipped binary set no `llm.Limits` at all, so an upstream call had no
+  deadline and its body no ceiling: one stalled backend held a request, its
+  connection and its concurrency slot until the client gave up. Both now have
+  defaults, settable with `server.attempt_timeout` and `server.max_response_mb`.
+- Rate limiting and request logging sat inside the API-key check, so the flood
+  and the credential stuffing they exist to shed and to record passed through
+  untouched. The log is now outermost and the limiter outside the key check,
+  while the concurrency gate stays inside it.
+- A streamed answer restated by the Claude CLI's closing line was delivered
+  twice. Only what the deltas could not carry is taken from it now.
+- Streamed tool calls whose fragments carried no index were split into separate,
+  malformed calls on four client wires. The merging rule now lives in one place.
+- Bedrock advertised prompt caching and never sent a cache point, so every call
+  was billed at full price with nothing said. It now sends them, for the models
+  that serve them.
+- `llm.Stream` was read by its consumer and closed by its supervisor with
+  nothing between them: closing one mid-frame raced the accounting and could
+  corrupt the row that was billed. A consumer that abandons the stream now ends
+  it rather than leaving the body open and the call unbilled.
+- A multi-turn stream cut off after its first turn was reported as complete.
+- An MCP tool whose own name read like another server's qualified one was called
+  in its place, and a server could take a name that way on purpose.
+- `AWS_EC2_METADATA_DISABLED` was ignored whenever a container credential was
+  configured, so a task whose role failed fell through to the node's.
+- A credential refresh held its lock across the network exchange, so every
+  waiting request ignored its own deadline and the refreshes ran one after
+  another. They now share one exchange and wait on their own contexts.
+- A child process that ignored SIGINT held shutdown open for ever, and a
+  process group was signalled by a pid that may since have been reused.
+- A backend that answered 200 and then failed on its first event crashed the
+  connection serving the Google wire, so the client was left with no reply at
+  all. The same shape reached it through a caller hanging up early.
+- The proxy's own attempt deadline was reported to a client still on the line as
+  though that client had hung up — 499 on a streamed call where an unstreamed
+  one said 504 — and the ledger could not tell the two apart either. Once a
+  backend had answered its headers and then gone quiet, neither shape was named
+  at all: the wall read as the backend failing, 502, and counted a fault against
+  a backend that had none. A context error is now the proxy's wall or the
+  caller's departure wherever it lands, on every provider.
+- A caller that went away — hung up or out of its own time — counted as a
+  failure against the backend it left, so a client that abandons requests could
+  open the breaker on a backend that had answered nothing wrong. The probe slot
+  such a call was holding goes back either way, or the one probe a backend gets
+  after its cooldown would take it out of the chain for good.
+- An MCP server offering both a name and its own qualified spelling of another
+  had one of the two silently dropped, and nothing could call it again. A server
+  listing one name many times now costs one entry rather than a name per copy,
+  which it built under the lock every refresh takes.
+- Vertex read its catalogue from the project-scoped path, which serves no
+  listing: every Vertex backend read as unready however healthy it was. Model
+  Garden answers that instead.
+- Vertex in the `global` region built a hostname nobody answers, a provider
+  given neither model nor publisher picked one silently, and a model written the
+  way Vertex writes it — `google/gemini-...` — had its slash escaped into the
+  model id, naming a model that does not exist.
+- Health checks and model lists went out unsigned, so every backend that mints a
+  token instead of holding a key — Azure with Entra, all three Vertex surfaces —
+  read as unreachable however healthy it was.
+- Passthrough sent a bearer token and the caller's query to backends that take
+  neither: Azure's own `api-key` header and pinned `api-version` were dropped,
+  and a minted token was never asked for at all.
+- Azure's Responses API was addressed under `/deployments/`, where it does not
+  live. It is addressed by naming the deployment in the body instead, which the
+  dated surface now does — it serves one deployment either way.
+- A Gemini tuned model was addressed under `/models/`, which is not the
+  collection it is served from.
+- Cloudflare read its catalogue from an endpoint Workers AI does not serve, so
+  its models were missing from `/v1/models` and readiness never turned green. It
+  now reads the account's own, whose refusals arrive as 200 with the reason in
+  the body, and follows the host's paging rather than assuming the page size it
+  asked for was honoured.
+- Smaller: the breaker's probe was kept for good by a provider that answered
+  with neither stream nor error; an attempt already sent went unbilled if the
+  caller left during a backoff; a truncated AWS event stream read as a clean
+  end; a route could not say `strict = false`; a candidate index the upstream
+  chose was an unbounded key while a turn ran; a client-chosen model name was an
+  unbounded metrics label, an unbounded route-matching cost, and an unbounded
+  ledger entry.
+- `goose.example.toml` was missing twenty of the keys the code reads, and an
+  unknown key is fatal, so those were keys nobody could use. A test now holds it
+  to what the config structs declare.
+
+- `server.redact_upstream_errors` reached the unstreamed reply and nothing else.
+  A backend that failed after the stream had started wrote its own sentence —
+  the operator's organisation, its billing contact — straight into the body,
+  and the code it chose survived redaction on both shapes. `WithRedactedErrors`
+  keeps it out of the ledger, and the binary's one key now sets both, which it
+  had not been setting at all.
+- A caller that asked a tool server for none of its tools got all of them: an
+  empty allow list read as no list at all, through the wire, through the
+  request's own copy, and out to the backend. An approval mode goose did not
+  recognise read as "no approval needed", a policy naming both `always` and
+  `never` kept the permissive half, and `never` exempting nothing exempted
+  everything. All four now fail closed.
+- An event past the frame ceiling was handed over as a whole one and the error
+  raised afterwards, so an upstream could choose where a frame ended and
+  therefore what it said. Reading also carried on past the ceiling.
+- A tool server could take a name reading as another server's qualified one
+  while nothing collided, and the model was offered it as that server's. A
+  server could also report a name, a version or a tool name that moved the
+  operator's cursor, answer with neither a result nor an error and have a tool
+  that never ran read as one that ran and said nothing, offer one name twice so
+  that the definition on display was not the one used on the wire, and pick a
+  protocol revision that no header could carry. How long a catalogue is is no
+  longer the server's to choose either, and listing it no longer costs the
+  square of its length under the lock every refresh wants.
+- A system turn that was not at the front was reported folded and left where it
+  was, which fails a caller who refuses that loss only after the backend has
+  answered and billed. The fold also swallowed the cache breakpoint it
+  absorbed, and the input ceiling weighed neither the caller's extras nor its
+  tool servers, so a megabyte of either walked past a four-kilobyte wall.
+- Losing every cache breakpoint was quieter than losing one of them, and
+  dropping every tool definition was quieter than dropping every tool server.
+- A call nobody counted booked as a call that cost nothing whenever the backend
+  happened to mention how long it took. The same row was missing from the
+  discarded attempts, which are sent and may well be billed, and a streamed
+  call's copy of the bill left out what the ledger recorded.
+- An upstream's error message was thrown away whole when any sibling field had
+  a shape goose did not expect — `{"error":{"message":"…"},"status":429}` left
+  the client with nothing but the status line.
+- A redacted thinking block was base64 on one backend and raw bytes on another,
+  so passing one through the other corrupted it beyond recovery.
+- The Responses wire left out fields its own schema requires — `annotations`,
+  `summary`, `call_id`, `refusal` — which a strict client refuses to parse.
+- Smaller: a reasoning count larger than the completion it sits inside went
+  unflagged; a total assembled from a priced turn and an unpriced one read as
+  fully priced; two prices in two currencies compared by number; two copies of
+  one usage could overwrite each other's notes; a refusal became ordinary text
+  and an image lost its media type, both without a word; a tool call whose
+  arguments did not survive travelled as a call with none; `Frame.Empty` did not
+  count an id, a model or a session, so three providers each patched around it
+  differently; a line of exactly the ceiling was refused for its newline; a
+  server's stray stdout line killed the call it interrupted; and an MCP resource
+  arrived with its uri and media type stripped off.
+
+### Added
+
+- `server.attempt_timeout` and `server.max_response_mb` bound one attempt and
+  the body it may read back. `make fuzz` runs every target, reports the ones
+  that failed, and runs in CI.
+
+### Changed
+
+- `route.Rule` and `route.Decision` gained `PolicySet`, which tells a loss policy
+  that was chosen from one that was left alone. A `Rule` built without it keeps
+  taking the table's default, as before.
+- `agentcli` gates itself at four concurrent invocations by default, since each
+  one forks a whole agent CLI. `max_concurrent = 0` takes that default and a
+  negative one removes the gate.
+- `cloudflare.New` returns `*cloudflare.Provider` rather than `*openai.Provider`,
+  so it can read the catalogue from where Cloudflare keeps it. The type embeds
+  the old one, so everything it served still works through it.
+- `llm.Stream` gained `Redact` and `Unredacted`, which let a proxy replace what
+  a backend said on the way to a caller while the operator's record keeps it,
+  and `Settle`, which fixes what a stream reports it cost to the row that was
+  booked. Its bookkeeping is behind a mutex, so closing a stream that is being
+  read no longer races the row it is about to bill.
+- `goose.WithRedactedErrors` is new, and `Client.Models` and `Client.Ready` ask
+  every backend at once and turn a provider that panics into an error rather
+  than taking the process with it.
+- `llm.Limits` resolve field by field rather than whole, so a call that pins one
+  of them no longer drops the rest.
+- `usage.Memory` keeps its last ten thousand rows rather than all of them, and
+  `usage.Multi` writes to its sinks at once and survives one that panics.
+- `llm.DropRefusal` is a diagnostic code again, `llm.AnomalyOutputUnknown` is
+  new, and `mcp.ServerStatus` gained `Truncated`.
+- `agentcli.DefaultMaxConcurrent` and `route.Rule.PolicySet` are new. A route's
+  `strict` is a three-state now, so `strict = false` is an opt-out rather than
+  a setting nobody can tell from silence.
+- `llm.MCPServer`'s tool and approval lists tell an empty list from an absent
+  one: naming nothing is a setting, and it is kept through a clone and out to
+  every wire.
+
 ## v0.1.0
 
 First tagged release. Everything below was found by auditing the claims in the

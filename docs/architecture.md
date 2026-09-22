@@ -149,10 +149,11 @@ goose/usage      sinks and aggregation (memory, JSONL, func)
 goose/mcp        tool servers: stdio, SSE, streamable HTTP, both protocol eras;
                  the protocol served back over HTTP and over a pipe, with
                  goose's own tools on it
-goose/httpx      the proxy: mux, SSE/NDJSON writer, auth, CORS, health, models, passthrough
+goose/httpx      the proxy: mux, SSE/NDJSON writer, auth, rate limiting, the
+                 concurrency gate, CORS, health, models, metrics, passthrough
 goose/internal/httpcore  the retry loop, the client whose timeout does not kill a stream
 goose/internal/* scanners, frame folding, subprocess lifetime, cloud auth, the AWS
-                 event stream, globs, retry
+                 event stream, globs
 cmd/goose        the binary: flags, config files, environment, signals, stderr
 ```
 

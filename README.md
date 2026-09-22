@@ -163,12 +163,22 @@ summary = true
 
 [`goose.example.toml`](goose.example.toml) is the same file with every key annotated.
 
+A chain walks on when a link fails for a reason the next one might not share: a refused or expired
+credential, a model that backend does not serve, a rate limit, an outage. It stops where walking on
+would change nothing — a request no backend can read, a capability none of them has, a caller that
+has gone, or its own attempt deadline having passed, since the caller has already waited that whole
+budget and the next link would be given its own. Bear in
+mind that a key which has been revoked on the first link is a reason to reach the second, so a chain
+is also a way to keep spending after a backend has started refusing.
+
 A provider takes `headers = { ... }` for a gateway in front of it that wants one; the credential is
 set after them, so a header named there cannot replace it.
 
 `server.metrics` serves `GET /metrics` for a scraper; `server.max_concurrent` and
-`server.max_per_minute` bound what one caller can take, because a single shared key otherwise does
-not. `server.tls_cert` and `server.tls_key` serve HTTPS: off loopback a plaintext listener hands
+`server.max_per_minute` bound what callers can take. The allowance is keyed on what a caller has
+proved rather than on what it claims, since a caller writes its own headers: with `server.api_key`
+set, everyone holding it shares one allowance, and everyone who does not share the allowance of the
+connection they arrived on; with no key set, each upstream credential carries its own. `server.tls_cert` and `server.tls_key` serve HTTPS: off loopback a plaintext listener hands
 every credential to anything on the path, and the binary says so at startup.
 
 `goose -v` logs one line per request with what it cost and what the translation lost.
@@ -318,7 +328,8 @@ The point of it is that nothing goes missing between the two ends.
   because an error it cannot read is an error it cannot act on.
 - **An upstream's words are read, not relayed.** A backend's error body is parsed into the message,
   type and code the client's own format expects, whatever shape the vendor wrapped it in; the raw
-  body reaches the operator's ledger and log and stops there. `redact_upstream_errors` replaces the
+  body reaches the operator's ledger and log and stops there. `redact_upstream_errors` keeps it out of
+the ledger as well, for a refusal that quotes the request back, and replaces the
   vendor's sentence with a generic one for the kind of failure, for a proxy shared with people who do
   not hold the account.
 - **A request nothing can serve is refused before it is sent.** Capabilities are consulted, not just
@@ -327,7 +338,8 @@ The point of it is that nothing goes missing between the two ends.
   and hands on to the next link of the chain. What a backend merely will not honour is removed from
   that attempt and reported instead: a system prompt with no channel of its own is folded into the
   conversation, a thinking signature another vendor cannot verify is stripped, cache breakpoints past
-  the backend's budget are dropped, a sampling control or a tool's strictness the backend has no field
+  the backend's budget are dropped — on Bedrock, where only some models serve prompt caching at all,
+  a breakpoint for one of the others is dropped whole and reported — a sampling control or a tool's strictness the backend has no field
   for is named, a tool result's failure flag that has no field to travel in is named, and an unknown
   request field that would be refused is not sent. A control two vendors spell differently — one tool
   call at a time, which one puts beside the tools and the other inside the tool choice — is one
