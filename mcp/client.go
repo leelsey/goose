@@ -431,7 +431,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	var refused []string
 	raw := map[string]json.RawMessage{}
 	cursor := ""
-	truncated := false
+	truncated, full := false, false
 	seen := map[string]bool{}
 	dropped := map[string]bool{}
 	for pages := 0; pages < maxToolPages; pages++ {
@@ -472,19 +472,22 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 				// Only a name said exactly can be recognised as one already
 				// said; two merely measured are two refusals, which the
 				// ceiling below is what bounds.
+				// Held on its own, so that a run of names goose will not carry
+				// cannot spend the catalogue saying so and leave no room for
+				// the tools behind it. The rest of the list is still read, and
+				// the ceiling is checked before anything else is kept, so what
+				// is remembered to tell one refusal from another is bounded by
+				// the same number as the refusals themselves.
+				if len(refused) >= maxRefused {
+					truncated = true
+					continue
+				}
 				offered, exact := quoted(t.Name)
 				if exact {
 					if dropped[offered] {
 						continue
 					}
 					dropped[offered] = true
-				}
-				// Held on its own, so that a run of names goose will not carry
-				// cannot spend the catalogue saying so and leave no room for
-				// the tools behind it. The rest of the list is still read.
-				if len(refused) >= maxRefused {
-					truncated = true
-					continue
 				}
 				refused = append(refused, offered)
 				continue
@@ -494,7 +497,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			}
 			seen[name] = true
 			if len(out) >= maxTools {
-				truncated = true
+				truncated, full = true, true
 				break
 			}
 			t.Name = name
@@ -514,7 +517,10 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 				OutputSchema: t.OutputSchema,
 			})
 		}
-		if truncated {
+		// Only the tools being full ends the walk. Running out of room to say
+		// what was refused is not the end of the catalogue, and the pages
+		// behind it are still read.
+		if full {
 			break
 		}
 		if result.NextCursor == "" {

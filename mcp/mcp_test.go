@@ -2793,3 +2793,46 @@ func TestARunOfRefusalsLeavesRoomForTheToolsBehindThem(t *testing.T) {
 		t.Error("the list was cut and nothing said so")
 	}
 }
+
+// The catalogue is paged, and a page full of names goose will not carry is not
+// the end of it. The tools on the pages behind that one are still tools.
+func TestAPageOfRefusalsDoesNotEndTheCatalogue(t *testing.T) {
+	var first []string
+	for i := range maxRefused + 10 {
+		name, err := json.Marshal(fmt.Sprintf("bad%d%s", i, string(rune(1))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		first = append(first, `{"name":`+string(name)+`,"inputSchema":{"type":"object"}}`)
+	}
+	pages := 0
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		if pages++; pages == 1 {
+			return &response{Result: json.RawMessage(
+				`{"tools":[` + strings.Join(first, ",") + `],"nextCursor":"2"}`)}, nil
+		}
+		return &response{Result: json.RawMessage(
+			`{"tools":[{"name":"read_file","inputSchema":{"type":"object"}}]}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "read_file" {
+		t.Fatalf("tools = %d after %d pages: a page of refused names ended the catalogue", len(tools), pages)
+	}
+	if !c.Truncated() {
+		t.Error("the refusals were cut and nothing said so")
+	}
+}
