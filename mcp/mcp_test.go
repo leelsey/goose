@@ -3317,16 +3317,6 @@ func TestWhatIsNotServedDoesNotTakeTheRoomOfWhatIs(t *testing.T) {
 			t.Error("a catalogue goose held whole was reported as part of one")
 		}
 	})
-
-	t.Run("a schema nobody could mirror is refused wherever it came from", func(t *testing.T) {
-		c, tools := serve(t, []string{entry("reads", unfit), entry("writes", plain)}, false)
-		if len(tools) != 1 || tools[0].Name != "writes" {
-			t.Fatalf("tools = %+v: a tool that can never be called was offered to a model", tools)
-		}
-		if len(c.Refused()) != 1 {
-			t.Errorf("refused = %q, want the one goose will not serve", c.Refused())
-		}
-	})
 }
 
 // A catalogue may say one tool more than once. Saying two thousand of them over
@@ -3380,9 +3370,22 @@ func TestTheRestDidNotFitIsSaidOnlyWhenSomethingDidNot(t *testing.T) {
 	}
 
 	t.Run("a part that says nothing is not something that did not fit", func(t *testing.T) {
-		parts := append(text(maxBlocks-1), &llm.ToolResult{ID: "t"})
-		if blocks := encodeContent(parts); said(blocks) {
-			t.Errorf("blocks = %d and the last says the rest did not fit, but nothing was left out", len(blocks))
+		for _, tc := range []struct {
+			what  string
+			after llm.Part
+			room  int
+		}{
+			{"with room to spare", &llm.ToolResult{ID: "t"}, maxBlocks - 1},
+			{"at the exact ceiling", &llm.ToolResult{ID: "t"}, maxBlocks},
+			{"and holding parts that say nothing either", &llm.ToolResult{
+				ID: "t", Content: []llm.Part{&llm.ToolResult{ID: "inner"}},
+			}, maxBlocks},
+		} {
+			blocks := encodeContent(append(text(tc.room), tc.after))
+			if said(blocks) {
+				t.Errorf("%s: blocks = %d and the last says the rest did not fit, "+
+					"but nothing was left out", tc.what, len(blocks))
+			}
 		}
 	})
 
@@ -3427,5 +3430,140 @@ func TestWhatAServerSaysWhileItWorksIsHeldToALine(t *testing.T) {
 		if !strconv.IsPrint(r) {
 			t.Fatalf("message carries %q, which rewrites the line it is printed on", r)
 		}
+	}
+}
+
+// What will not be carried is not worth building. A result with far more in it
+// than fits costs what fits, not what was offered.
+func TestPartsPastTheCeilingAreNotBuiltOnlyToBeDropped(t *testing.T) {
+	made := func(n int) []llm.Part {
+		parts := make([]llm.Part, 0, n)
+		for i := range n {
+			parts = append(parts, &llm.Text{Text: fmt.Sprintf("part %d", i)})
+		}
+		return parts
+	}
+	fits, spills := made(maxBlocks), made(50*maxBlocks)
+	held := testing.AllocsPerRun(2, func() { _ = encodeContent(fits) })
+	over := testing.AllocsPerRun(2, func() { _ = encodeContent(spills) })
+	if over > 2*held {
+		t.Errorf("%.0f allocations for what would not fit against %.0f for what does: "+
+			"a part past the ceiling was built and then thrown away", over, held)
+	}
+}
+
+// A tool this proxy will mirror for is checked for whether it can be mirrored.
+// One it will not mirror for is called as it arrives, so a schema goose could
+// not have mirrored anyway is no reason not to offer it.
+func TestAToolIsJudgedByWhatWillBeAskedOfIt(t *testing.T) {
+	entries := []string{
+		`{"name":"reads","inputSchema":{"type":"object","properties":{"a":{"x-mcp-header":"X-A"}}}}`,
+		`{"name":"writes","inputSchema":{"type":"object"}}`,
+	}
+	for _, tc := range []struct {
+		what    string
+		mirrors bool
+		want    []string
+	}{
+		{"a transport goose mirrors over", true, []string{"writes"}},
+		{"and one it does not", false, []string{"reads", "writes"}},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+				switch out.Method {
+				case "server/discover":
+					return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+				case "initialize":
+					return &response{Result: json.RawMessage(
+						`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+				}
+				return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+			}}
+			c := newClient("srv", ft, Options{Mirrors: tc.mirrors})
+			if err := c.connect(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			tools, err := c.Tools(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, tool := range tools {
+				got = append(got, tool.Name)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("tools = %q, want %q", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("tools = %q, want %q", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// How many entries a catalogue has is bounded, and so is how large they are:
+// a server that sends two thousand tools can send them as a gigabyte.
+func TestACatalogueIsBoundedByWhatItWeighsAsWellAsWhatItCounts(t *testing.T) {
+	fat := strings.Repeat("d", 1<<20)
+	pages := 0
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		var entries []string
+		for i := range 16 {
+			entry, err := json.Marshal(map[string]any{
+				"name":        fmt.Sprintf("page%d-tool%d", pages, i),
+				"description": fat,
+				"inputSchema": map[string]any{"type": "object"},
+			})
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, string(entry))
+		}
+		pages++
+		return &response{Result: json.RawMessage(
+			`{"tools":[` + strings.Join(entries, ",") + `],"nextCursor":"more"}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var weight int
+	for _, tool := range tools {
+		weight += len(tool.Description) + len(tool.Schema)
+	}
+	if weight > maxWeight {
+		t.Errorf("held %d bytes of catalogue, want at most %d", weight, maxWeight)
+	}
+	if !c.Truncated() {
+		t.Error("the catalogue was cut and nothing said so")
+	}
+}
+
+// Taking out what cannot be printed must not run the words together.
+func TestAReportThatCameInLinesIsStillReadable(t *testing.T) {
+	message, err := json.Marshal("indexing\nfile 412 of 9000\telapsed 3m12s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, ok := readProgress(json.RawMessage(
+		`{"progressToken":"1","progress":1,"message":`+string(message)+`}`), "1")
+	if !ok {
+		t.Fatal("the report was not read")
+	}
+	if want := "indexing file 412 of 9000 elapsed 3m12s"; p.Message != want {
+		t.Errorf("message = %q, want %q", p.Message, want)
 	}
 }

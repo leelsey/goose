@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"unicode"
 )
 
 func text(v any) string { return fmt.Sprint(v) }
@@ -65,8 +67,16 @@ func readProgress(params json.RawMessage, token string) (Progress, bool) {
 		return Progress{}, false
 	}
 	// A server chooses these words while a tool of its own runs, and they reach
-	// whoever asked to watch. They are its text like any other.
-	return Progress{Done: body.Progress, Total: body.Total, Message: tame(body.Message)}, true
+	// whoever asked to watch. They are its text like any other — but a report
+	// written in lines should not come out as one run-together word, so what
+	// held it apart becomes a space rather than nothing.
+	spaced := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return ' '
+		}
+		return r
+	}, body.Message)
+	return Progress{Done: body.Progress, Total: body.Total, Message: tame(spaced)}, true
 }
 
 func requestToken(params json.RawMessage) any {

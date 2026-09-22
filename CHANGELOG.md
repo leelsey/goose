@@ -147,6 +147,36 @@ were left alone.
   differently; a line of exactly the ceiling was refused for its newline; a
   server's stray stdout line killed the call it interrupted; and an MCP resource
   arrived with its uri and media type stripped off.
+- An MCP server chooses its own name, its version, its tool names and the words
+  it fails with, and goose prints all of them. None of them was held to a line,
+  so one of them could move the cursor and rewrite what was printed above it, or
+  simply be four megabytes long. Every line somebody else chose is now held to
+  one: what a failed call said, the tool name a caller asked for, the method it
+  named, the revision it asked to speak, the header names a tool's own schema
+  carries, and what a server says while its tool runs. What is kept is what Go
+  itself prints unescaped, which leaves out the C1 controls, the bidi overrides
+  and the other invisibles as well as the ASCII ones.
+- A tool name goose will not carry is reported as the name it was rather than as
+  what is left once the characters that made it unusable are taken out — which
+  was another tool's name, and one that was being served.
+- A catalogue is read and held on ceilings that a server cannot spend against
+  itself: how many tools, how many names goose will not carry, how many entries
+  are read and how much they weigh are bounded separately. A run of unusable
+  names at the front of a list no longer leaves no room for the tools behind it,
+  a schema this proxy cannot mirror no longer takes the place of a tool it would
+  serve, a server repeating one page is no longer read a hundred times over
+  every thirty seconds, and two thousand tools sent as a gigabyte and a half are
+  no longer all held. A catalogue that lists each of its tools more than once is
+  still read whole and is no longer reported as one that was cut.
+- A tool result that holds itself ended the process with a stack overflow rather
+  than an error, and one that holds itself twice doubled at every level. How
+  deep one is read and how much comes out of it are both bounded now, reading
+  stops at the ceiling rather than building blocks it will throw away, and a
+  result with more in it than will fit says so rather than losing the rest
+  quietly.
+- A locally registered tool answering with neither a result nor an error was
+  read as an answer, and the first thing that reached into it took the process
+  with it.
 
 ### Added
 
@@ -156,6 +186,11 @@ were left alone.
 
 ### Changed
 
+- A tool call that ran and failed is answered `-32603` rather than `-32602`,
+  which now means only that no server offers a tool by that name.
+- `mcp.ServerStatus.Refused` names each refusal quoted, and a name too long to
+  print whole is given by its length rather than cut, since two names cut alike
+  would read as one.
 - `route.Rule` and `route.Decision` gained `PolicySet`, which tells a loss policy
   that was chosen from one that was left alone. A `Rule` built without it keeps
   taking the table's default, as before.

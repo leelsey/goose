@@ -59,7 +59,14 @@ func encodeParts(parts []llm.Part, depth int, room *budget) []json.RawMessage {
 		out = append(out, block)
 		return true
 	}
-	for _, p := range parts {
+	for i, p := range parts {
+		// Nothing past here can be carried, and building a block only to throw
+		// it away is work whoever sent this gets to choose the amount of. What
+		// is left is a loss only if any of it would have said something.
+		if room.left <= 0 {
+			room.short = room.short || says(parts[i:], depth)
+			break
+		}
 		switch v := p.(type) {
 		case *llm.Text:
 			add(mustJSON(map[string]any{"type": "text", "text": v.Text}))
@@ -90,7 +97,7 @@ func encodeParts(parts []llm.Part, depth int, room *budget) []json.RawMessage {
 			// walking it to find that out is work a structure goose did not
 			// build gets to choose the amount of.
 			if room.left <= 0 {
-				room.short = room.short || len(v.Content) > 0
+				room.short = room.short || says(v.Content, depth+1)
 				continue
 			}
 			out = append(out, encodeParts(v.Content, depth+1, room)...)
@@ -109,6 +116,26 @@ func encodeParts(parts []llm.Part, depth int, room *budget) []json.RawMessage {
 		}
 	}
 	return out
+}
+
+// says reports whether any of these parts would put a block on this wire. Only
+// a tool result can hold nothing to say, and only by holding parts that say
+// nothing themselves, so that is the one shape worth looking inside — to the
+// same depth the encoding itself would have read it.
+func says(parts []llm.Part, depth int) bool {
+	if depth > maxNesting {
+		return false
+	}
+	for _, p := range parts {
+		v, ok := p.(*llm.ToolResult)
+		if !ok {
+			return true
+		}
+		if v.IsError || says(v.Content, depth+1) {
+			return true
+		}
+	}
+	return false
 }
 
 func mustJSON(v any) json.RawMessage {

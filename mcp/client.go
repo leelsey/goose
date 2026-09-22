@@ -353,6 +353,7 @@ const (
 	maxTools     = 2048
 	maxRefused   = 256
 	maxEntries   = 4 * maxTools
+	maxWeight    = 32 << 20
 	maxToolPages = 100
 )
 
@@ -445,7 +446,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	raw := map[string]json.RawMessage{}
 	cursor := ""
 	truncated, full := false, false
-	examined := 0
+	examined, weight := 0, 0
 	seen := map[string]bool{}
 	dropped := map[string]bool{}
 	// refuse records a name goose will not carry, whatever it was about the
@@ -521,21 +522,27 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			if len(schema) == 0 || string(schema) == "null" {
 				schema = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
-			// A schema goose cannot read the mirror annotations off is a tool it
-			// can never call, whatever transport it came over: this proxy's own
-			// front door reads them on the way in. Offering it would be offering
-			// a model something that fails every time it is asked for.
-			if _, err := annotated(schema); err != nil {
-				refuse(t.Name)
-				continue
+			// Only a transport goose mirrors over will be asked to mirror, and
+			// a tool called as it arrives is callable whatever its annotations
+			// say. Judging every tool by a rule only some of them are held to
+			// takes working tools off the ones that are not.
+			if c.mirrors {
+				if _, err := annotated(schema); err != nil {
+					refuse(t.Name)
+					continue
+				}
 			}
 			// The name is held from here, and this is where there has to be room
 			// for it. A copy of a tool already held needs none, and a tool goose
 			// will not serve must not stand in the room kept for one it will.
-			if len(seen) >= maxTools {
+			// How many entries there are is the server's to choose and bounded
+			// above; how large they are is its to choose too, and two thousand
+			// tools can be sent as a gigabyte of them.
+			if len(seen) >= maxTools || weight+len(entry) > maxWeight {
 				truncated, full = true, true
 				break
 			}
+			weight += len(entry)
 			seen[name] = true
 			t.Name = name
 			raw[t.Name] = append(json.RawMessage(nil), entry...)
