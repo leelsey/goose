@@ -427,6 +427,9 @@ func TestABackendThatAnswersWithNothingIsNotASuccess(t *testing.T) {
 	if rows[0].Outcome == llm.OutcomeOK {
 		t.Errorf("a call that returned nothing was booked as one that worked: %+v", rows[0])
 	}
+	if !hasAnomaly(rows[0].Usage, llm.AnomalyNotMeasurable) {
+		t.Errorf("the row reads as having cost nothing rather than as uncounted: %+v", rows[0].Usage)
+	}
 }
 
 // Every row for an attempt that was sent says the same thing about what it

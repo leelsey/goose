@@ -450,3 +450,22 @@ func TestFieldsHeldBackAreBoundedAndTheCeilingIsSaid(t *testing.T) {
 		t.Error("fields were left behind and nothing said so")
 	}
 }
+
+// Fields waiting for a chunk to carry them and never getting one are a loss,
+// and a loss says so rather than going quietly at the end of the stream.
+func TestFieldsStillWaitingWhenTheStreamEndsAreNotLostInSilence(t *testing.T) {
+	w, diags, err := streamOf(t, wire.Options{Stream: true},
+		&llm.Frame{Delta: []llm.Part{&llm.Text{Text: "hi"}}},
+		&llm.Frame{Stop: llm.StopEnd},
+		&llm.Frame{Extra: map[string]json.RawMessage{"stranded": json.RawMessage(`1`)}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(w.Body.String(), "stranded") {
+		return
+	}
+	if !hasCode(diags, llm.DropExtraField) {
+		t.Errorf("a field waited for a chunk that never came and nothing said so:\n%s", w.Body.String())
+	}
+}

@@ -6,6 +6,7 @@ package ollamaapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -391,4 +392,60 @@ func TestANegativeCeilingIsReported(t *testing.T) {
 	if diags.Has(llm.DropExtraField) {
 		t.Fatalf("diagnostics = %+v: nothing was dropped", diags)
 	}
+}
+
+// A frame that writes no line can still carry fields this wire has no place
+// for, and they wait for the next line that can carry them. Two such frames are
+// two sets of fields, and how many wait is the upstream's to choose, so what
+// waits is bounded.
+func TestFieldsHeldBackFromQuietFramesTravelAndAreBounded(t *testing.T) {
+	t.Run("two of them both travel", func(t *testing.T) {
+		out := frames(t, NewChat(Options{}),
+			&llm.Frame{Delta: []llm.Part{&llm.Text{Text: "hi"}}},
+			&llm.Frame{Extra: map[string]json.RawMessage{"first": json.RawMessage(`1`)}},
+			&llm.Frame{Extra: map[string]json.RawMessage{"second": json.RawMessage(`2`)}},
+			&llm.Frame{Delta: []llm.Part{&llm.Text{Text: " there"}}},
+			&llm.Frame{Stop: llm.StopEnd},
+		)
+		var held int
+		for _, line := range out {
+			for _, name := range []string{"first", "second"} {
+				if _, ok := line[name]; ok {
+					held++
+				}
+			}
+		}
+		if held != 2 {
+			t.Errorf("%d of the two fields held back travelled: %v", held, out)
+		}
+	})
+
+	t.Run("and a run of them is held to a line", func(t *testing.T) {
+		const quiet = 20000
+		fs := []*llm.Frame{{Delta: []llm.Part{&llm.Text{Text: "hi"}}}}
+		for i := range quiet {
+			fs = append(fs, &llm.Frame{Extra: map[string]json.RawMessage{
+				fmt.Sprintf("field%d", i): json.RawMessage(`"some value or other"`),
+			}})
+		}
+		fs = append(fs, &llm.Frame{Stop: llm.StopEnd})
+		s := llm.StaticStream(llm.StreamMeta{Model: "m"}, fs)
+		w := &wire.BufferWriter{}
+		diags, err := NewChat(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := strings.Count(w.Body.String(), `"field`); n >= quiet {
+			t.Errorf("one line carried %d held fields: what waits is the upstream's to choose", n)
+		}
+		var said bool
+		for _, d := range diags {
+			if d.Code == llm.DropExtraField {
+				said = true
+			}
+		}
+		if !said {
+			t.Error("fields were left behind and nothing said so")
+		}
+	})
 }

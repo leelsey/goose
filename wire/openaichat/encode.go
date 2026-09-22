@@ -365,6 +365,13 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 		}
 		diags = append(diags, u.Uncarried(Name, llm.FigureCacheRead, llm.FigureCacheWrite, llm.FigureReasoning, llm.FigureTier)...)
 	}
+	if held.Waiting() {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageResponse,
+			Severity: llm.SeverityLoss, Field: "extra",
+			Detail: "fields waited for a chunk to carry them and the stream ended first",
+		})
+	}
 	if err := finish(); err != nil {
 		return diags, err
 	}

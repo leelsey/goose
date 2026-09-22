@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -91,6 +93,34 @@ func TestWhatTheHoldWeighsIsWhatItHolds(t *testing.T) {
 		}
 		if weight > maxHeld {
 			t.Fatalf("step %d: held %d bytes against a ceiling of %d", step, weight, maxHeld)
+		}
+	}
+}
+
+// What is kept when not all of it fits must be the same every time, or the
+// same answer replayed gives two different bodies.
+func TestWhatSurvivesTheCeilingIsTheSameEveryTime(t *testing.T) {
+	frame := map[string]json.RawMessage{}
+	for i := range 40 {
+		frame[fmt.Sprintf("f%02d", i)] = json.RawMessage(`"` + strings.Repeat("x", 4096) + `"`)
+	}
+	var first []string
+	for range 50 {
+		var h Held
+		if !h.Keep(frame) {
+			t.Fatal("this frame does not fit and should have said so")
+		}
+		kept := make([]string, 0, len(h.fields))
+		for k := range h.fields {
+			kept = append(kept, k)
+		}
+		sort.Strings(kept)
+		if first == nil {
+			first = kept
+			continue
+		}
+		if !slices.Equal(first, kept) {
+			t.Fatalf("one run kept %v and another kept %v", first, kept)
 		}
 	}
 }

@@ -146,6 +146,7 @@ func (c *Client) Chat(ctx context.Context, req *llm.Request, opts ...CallOption)
 			c.breaker.abandoned(target.Provider)
 			e := llm.AsError(llm.Errorf(llm.KindInternal, "provider %q returned no response and no error", target.Provider))
 			rec.Sent, rec.Outcome, rec.Err = true, outcomeFor(e), c.reason(e)
+			rec.Usage = rec.Usage.Unmeasured()
 			pend.book(rec)
 			lastErr = e
 			break

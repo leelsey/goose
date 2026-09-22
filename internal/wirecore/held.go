@@ -3,7 +3,10 @@
 
 package wirecore
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sort"
+)
 
 // A frame that puts nothing on a wire can still carry fields that wire has no
 // place for, and they wait for the next chunk that can carry them. How many
@@ -23,7 +26,16 @@ type Held struct {
 // so a frame's is never written through. It reports true the first time
 // something did not fit, so a loss is said once rather than once a frame.
 func (h *Held) Keep(extra map[string]json.RawMessage) (overfull bool) {
-	for k, v := range extra {
+	// Taken in order, so that which of them fits is the same answer twice: a
+	// map hands them over in whatever order it likes, and the same reply
+	// replayed would then come out differently.
+	names := make([]string, 0, len(extra))
+	for k := range extra {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		v := extra[k]
 		// A field sent again is the same field, and its new value weighs what
 		// it weighs: counting only the first sighting would let an upstream
 		// name a field cheaply and then fill it for nothing. One that will not
@@ -47,6 +59,10 @@ func (h *Held) Keep(extra map[string]json.RawMessage) (overfull bool) {
 	}
 	return overfull
 }
+
+// Waiting reports fields still held with no chunk left to carry them, which is
+// a loss like any other and not one to go quietly.
+func (h *Held) Waiting() bool { return len(h.fields) > 0 }
 
 // Carry merges what has waited into the fields of the chunk now being written
 // and empties the hold. The chunk's own win, since they describe it. Having
