@@ -201,7 +201,12 @@ were left alone.
 - Two consecutive frames carrying nothing but fields a wire does not model were
   one set of them by the time the next chunk could carry either, on the OpenAI
   and Ollama streams. They are all carried now, up to what one chunk will hold,
-  and the ceiling is reported rather than the rest going quietly.
+  and that ceiling is reported rather than the rest going quietly. Fields still
+  waiting when a stream ends are not reported: goose asks every OpenAI-dialect
+  backend for its usage, so one of those streams always ends with a contentless
+  chunk that a caller who did not ask for usage gets nowhere to put, and what it
+  carries is a fresh pad nobody wants that cannot be told from a vendor payload
+  somebody does.
 
 ### Added
 

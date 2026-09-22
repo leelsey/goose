@@ -388,10 +388,15 @@ func TestAnOrdinaryStreamReportsNoLoss(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
+		// This wire models eight fields of a chunk, so anything else a backend
+		// sends travels as a field goose has no place for. Here one of them
+		// does not change between chunks and one does, on every chunk including
+		// the contentless last one — the shape that decides whether the end of
+		// a stream can be read as a loss.
 		for _, b := range []string{
-			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`,
-			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
-			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","obfuscation":"aaa","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","obfuscation":"bbb","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","obfuscation":"ccc","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
 		} {
 			_, _ = w.Write([]byte(chunk(b)))
 			w.(http.Flusher).Flush()
