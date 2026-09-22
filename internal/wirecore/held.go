@@ -49,7 +49,10 @@ func (h *Held) Keep(extra map[string]json.RawMessage) (overfull bool) {
 }
 
 // Carry merges what has waited into the fields of the chunk now being written
-// and empties the hold. The chunk's own win, since they describe it.
+// and empties the hold. The chunk's own win, since they describe it. Having
+// been full is not emptied with the rest: the ceiling belongs to the stream, and
+// saying it again for every chunk that empties the hold would be the same shape
+// of loss it is there to stop, arriving as diagnostics rather than as fields.
 func (h *Held) Carry(own map[string]json.RawMessage) map[string]json.RawMessage {
 	if len(h.fields) == 0 {
 		return own
@@ -61,6 +64,6 @@ func (h *Held) Carry(own map[string]json.RawMessage) map[string]json.RawMessage 
 	for k, v := range own {
 		merged[k] = v
 	}
-	h.fields, h.weight, h.full = nil, 0, false
+	h.fields, h.weight = nil, 0
 	return merged
 }
