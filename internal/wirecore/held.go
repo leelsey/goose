@@ -24,11 +24,15 @@ type Held struct {
 // something did not fit, so a loss is said once rather than once a frame.
 func (h *Held) Keep(extra map[string]json.RawMessage) (overfull bool) {
 	for k, v := range extra {
-		if _, known := h.fields[k]; known {
-			h.fields[k] = v
-			continue
+		// A field sent again is the same field, and its new value weighs what
+		// it weighs: counting only the first sighting would let an upstream
+		// name a field cheaply and then fill it for nothing. One that will not
+		// fit leaves the value already held, which did.
+		weight := h.weight + len(k) + len(v)
+		if old, known := h.fields[k]; known {
+			weight -= len(k) + len(old)
 		}
-		if h.weight+len(k)+len(v) > maxHeld {
+		if weight > maxHeld {
 			if !h.full {
 				h.full = true
 				overfull = true
@@ -38,7 +42,7 @@ func (h *Held) Keep(extra map[string]json.RawMessage) (overfull bool) {
 		if h.fields == nil {
 			h.fields = make(map[string]json.RawMessage, len(extra))
 		}
-		h.weight += len(k) + len(v)
+		h.weight = weight
 		h.fields[k] = v
 	}
 	return overfull

@@ -333,8 +333,8 @@ func TestTheBufferCeilingIsSaidOnceAndNotOncePerDelta(t *testing.T) {
 			said++
 		}
 	}
-	if said > maxChoices {
-		t.Errorf("the ceiling was reported %d times for %d deltas past it: "+
+	if said != 1 {
+		t.Errorf("the ceiling was reported %d times for one candidate and %d deltas past it: "+
 			"the note costs more than the text it refused", said, deltas)
 	}
 }

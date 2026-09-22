@@ -393,3 +393,74 @@ func TestAnAttemptThatFailedStillLeavesARowThatSaysWhatItKnows(t *testing.T) {
 		})
 	}
 }
+
+// empty is a backend that answers Chat with neither a response nor a failure.
+type empty struct{ id string }
+
+func (e *empty) ID() string                     { return e.id }
+func (e *empty) Capabilities() llm.Capabilities { return llm.Capabilities{Streaming: true} }
+
+func (e *empty) Complete(context.Context, *llm.Attempt) (*llm.Response, error) { return nil, nil }
+
+func (e *empty) Stream(context.Context, *llm.Attempt) (*llm.Stream, error) {
+	return nil, llm.Errorf(llm.KindInternal, "not this way")
+}
+
+func (e *empty) Close(context.Context) error { return nil }
+
+// A backend that answers with nothing has not answered, whichever call it was.
+// Reading it as a success bills a row as though it worked and tells the
+// breaker this backend is healthy while the caller is handed a failure.
+func TestABackendThatAnswersWithNothingIsNotASuccess(t *testing.T) {
+	mem := usage.NewMemory()
+	c, err := New(WithProvider(&empty{id: "one"}), WithUsage(mem))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Chat(context.Background(), req()); err == nil {
+		t.Fatal("the backend did not answer")
+	}
+	rows := mem.Records()
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d", len(rows))
+	}
+	if rows[0].Outcome == llm.OutcomeOK {
+		t.Errorf("a call that returned nothing was booked as one that worked: %+v", rows[0])
+	}
+}
+
+// Every row for an attempt that was sent says the same thing about what it
+// cost: nobody counted it, which is not the same as it having cost nothing.
+func TestARowForASentAttemptSaysItWasNotCounted(t *testing.T) {
+	boom := &llm.Error{Kind: llm.KindInternal, Status: 500, Sent: true, Message: "upstream fell over"}
+	for _, tc := range []struct {
+		what   string
+		stream bool
+	}{
+		{"an unstreamed call", false},
+		{"and a streamed one", true},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			mem := usage.NewMemory()
+			c, err := New(WithProvider(&stub{id: "one", err: boom}), WithUsage(mem))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.stream {
+				_, err = c.Stream(context.Background(), req())
+			} else {
+				_, err = c.Chat(context.Background(), req())
+			}
+			if err == nil {
+				t.Fatal("the backend refused")
+			}
+			rows := mem.Records()
+			if len(rows) != 1 {
+				t.Fatalf("rows = %d", len(rows))
+			}
+			if !hasAnomaly(rows[0].Usage, llm.AnomalyNotMeasurable) {
+				t.Errorf("the row reads as having cost nothing rather than as uncounted: %+v", rows[0].Usage)
+			}
+		})
+	}
+}

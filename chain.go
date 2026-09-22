@@ -53,7 +53,7 @@ func (c *Client) prepare(
 	}
 	rejected := func(e *llm.Error) llm.Attempted {
 		rec := base
-		rec.Outcome, rec.Err = llm.OutcomeRejected, e.Message
+		rec.Outcome, rec.Err = llm.OutcomeRejected, c.reason(e)
 		rec.Started, rec.Diagnostics = c.now(), *diags
 		return rec
 	}
@@ -122,6 +122,12 @@ func (c *Client) Chat(ctx context.Context, req *llm.Request, opts ...CallOption)
 
 		if cerr != nil {
 			e := llm.AsError(cerr)
+			if resp == nil && e.Sent {
+				// The request went, so the vendor may well have billed it.
+				// Nobody counted it, which is not the same as it having cost
+				// nothing, and every row for a sent attempt says which.
+				rec.Usage = rec.Usage.Unmeasured()
+			}
 			c.fault(target.Provider, ctx.Err() != nil)
 			rec.Sent, rec.Outcome, rec.Err, rec.Status = e.Sent, outcomeFor(e), c.reason(e), e.Status
 			rec.Detail = c.detail(e)
@@ -133,14 +139,21 @@ func (c *Client) Chat(ctx context.Context, req *llm.Request, opts ...CallOption)
 			continue
 		}
 
+		if resp == nil {
+			// Nothing back is not an answer. Booking it as one bills a call
+			// that worked and tells the breaker this backend is healthy, while
+			// the caller is handed a failure.
+			c.breaker.abandoned(target.Provider)
+			e := llm.AsError(llm.Errorf(llm.KindInternal, "provider %q returned no response and no error", target.Provider))
+			rec.Sent, rec.Outcome, rec.Err = true, outcomeFor(e), c.reason(e)
+			pend.book(rec)
+			lastErr = e
+			break
+		}
+
 		c.breaker.succeeded(target.Provider)
 		rec.Sent, rec.Outcome = true, llm.OutcomeOK
 		pend.book(rec)
-
-		if resp == nil {
-			lastErr = llm.Errorf(llm.KindInternal, "provider %q returned no response and no error", target.Provider)
-			break
-		}
 		resp.Attempts = attempts
 		resp.Provider = target.Provider
 		if resp.Requested == "" {
@@ -221,10 +234,13 @@ func (c *Client) Stream(ctx context.Context, req *llm.Request, opts ...CallOptio
 			rec.Sent, rec.Outcome, rec.Err, rec.Status = e.Sent, outcomeFor(e), c.reason(e), e.Status
 			rec.Detail = c.detail(e)
 			rec.Started, rec.Elapsed, rec.Diagnostics = started, elapsed(started, c.now()), *pend.diags
-			if s != nil {
+			switch {
+			case s != nil:
 				// Read the same way a row that succeeded is read: what a
 				// backend did not count is uncounted, not nothing.
 				rec.Usage = s.Usage().Unmeasured().Unpriced(p.Capabilities().Usage.Cost)
+			case e.Sent:
+				rec.Usage = rec.Usage.Unmeasured()
 			}
 			book(rec)
 			if s != nil {

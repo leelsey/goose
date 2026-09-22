@@ -188,11 +188,14 @@ were left alone.
   routinely quotes the request back, so the passage an operator asked to keep
   out was kept out of the row that failed and written down on every row that was
   retried past.
-- An attempt that was made now always leaves a row saying what it knows: a
-  backend handing back a stream and a failure together had its usage recorded as
-  though nothing had been spent rather than as uncounted, and one answering with
-  neither a stream nor a failure left no row at all for a call the vendor may
-  have billed.
+- Every attempt that was sent now leaves a row saying the same thing about what
+  it cost: nobody counted it, which is not the same as it having cost nothing.
+  One ledger could hold a discarded retry saying the backend reported no usage
+  beside the attempt that actually failed saying it was free.
+- A backend answering with neither a response nor a failure was booked as a call
+  that worked and told the circuit breaker it was healthy, while the caller was
+  handed an error. The streamed side of the same case left no row at all, for a
+  call the vendor may well have billed.
 - A usage sink panicking took the process rather than the row whenever it was
   the only sink configured.
 - Two consecutive frames carrying nothing but fields a wire does not model were

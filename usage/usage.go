@@ -114,9 +114,6 @@ func (j *JSONL) Record(_ context.Context, r Record) error {
 
 type Multi []Sink
 
-// Record writes the row to every sink at once: a call waits for the slowest
-// ledger rather than for all of them in turn. The error reported is the first
-// in configured order, not whichever failed soonest.
 // only writes one row to one sink. A single sink is someone else's code as much
 // as several are, and a panic in it must fail the row rather than the process.
 func only(ctx context.Context, s Sink, r Record) (err error) {
@@ -128,6 +125,9 @@ func only(ctx context.Context, s Sink, r Record) (err error) {
 	return s.Record(ctx, r)
 }
 
+// Record writes the row to every sink at once: a call waits for the slowest
+// ledger rather than for all of them in turn. The error reported is the first
+// in configured order, not whichever failed soonest.
 func (m Multi) Record(ctx context.Context, r Record) error {
 	if len(m) == 1 && m[0] != nil {
 		return only(ctx, m[0], r)
