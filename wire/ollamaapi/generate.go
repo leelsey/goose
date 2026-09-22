@@ -84,6 +84,13 @@ func (g *Generate) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Dia
 		return nil, opts, diags, err
 	}
 	diags = append(diags, o.apply(req, NameGenerate)...)
+	for _, name := range wirecore.Shadowed(top["options"], modelledOptions) {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageDecode,
+			Severity: llm.SeverityLoss, Format: NameGenerate, Field: "options." + name,
+			Detail: "this option arrived spelled more than one way, and only the last of them was read",
+		})
+	}
 	if rest := wirecore.NestedExtra(top["options"], modelledOptions); rest != nil {
 		if req.Extra == nil {
 			req.Extra = map[string]json.RawMessage{}
@@ -224,7 +231,7 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 
 	stop := llm.StopNone
 	tools := 0
-	sawText := false
+	sawText, refusing := false, false
 	var streamErr error
 
 	for fr := range s.Frames() {
@@ -244,6 +251,15 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 				frame.Response += v.Text
 				emit, sawText = true, true
 			case *llm.Refusal:
+				// As in the whole-answer path, a refusal is parted from the text
+				// it follows, so both renderings read the same wherever the
+				// frame boundaries happen to fall.
+				if !refusing {
+					refusing = true
+					if sawText {
+						frame.Response += "\n\n"
+					}
+				}
 				frame.Response += v.Text
 				emit, sawText = true, true
 			case *llm.Thinking:

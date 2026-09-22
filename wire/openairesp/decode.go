@@ -4,7 +4,6 @@
 package openairesp
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"strings"
 
@@ -84,6 +83,13 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 	}
 
 	if raw, ok := top["reasoning"]; ok && string(raw) != "null" {
+		for _, name := range wirecore.Shadowed(raw, modelledReasoning) {
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageDecode,
+				Severity: llm.SeverityLoss, Format: Name, Field: "reasoning" + "." + name,
+				Detail: "this setting arrived spelled more than one way, and only the last of them was read",
+			})
+		}
 		if rest := wirecore.NestedExtra(raw, modelledReasoning); rest != nil {
 			carry(req, "reasoning", rest)
 		}
@@ -101,6 +107,13 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 	}
 
 	if raw, ok := top["text"]; ok && string(raw) != "null" {
+		for _, name := range wirecore.Shadowed(raw, modelledText) {
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageDecode,
+				Severity: llm.SeverityLoss, Format: Name, Field: "text." + name,
+				Detail: "this setting arrived spelled more than one way, and only the last of them was read",
+			})
+		}
 		if rest := wirecore.NestedExtra(raw, modelledText); rest != nil {
 			carry(req, "text", rest)
 		}
@@ -383,41 +396,10 @@ func decodeToolChoice(raw json.RawMessage) (*llm.ToolChoice, error) {
 	return &llm.ToolChoice{Mode: llm.ToolSpecific, Name: obj.Name}, nil
 }
 
-func dataURL(s string) (mime string, data []byte, ok bool) {
-	if !strings.HasPrefix(s, "data:") {
-		return "", nil, false
-	}
-	rest := s[len("data:"):]
-	i := strings.Index(rest, ",")
-	if i < 0 {
-		return "", nil, false
-	}
-	meta, payload := rest[:i], rest[i+1:]
-	if !strings.HasSuffix(meta, ";base64") {
-		return "", nil, false
-	}
-	b, err := base64.StdEncoding.DecodeString(payload)
-	if err != nil {
-		return "", nil, false
-	}
-	return strings.TrimSuffix(meta, ";base64"), b, true
-}
+func dataURL(s string) (mime string, data []byte, ok bool) { return wirecore.DataURL(s) }
 
-func bearer(h string) string {
-	const p = "Bearer "
-	if len(h) > len(p) && strings.EqualFold(h[:len(p)], p) {
-		return h[len(p):]
-	}
-	return ""
-}
+func bearer(h string) string { return wirecore.Bearer(h) }
 
 func field[T any](m map[string]json.RawMessage, key string, dst *T) error {
-	raw, ok := m[key]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	if err := json.Unmarshal(raw, dst); err != nil {
-		return llm.Errorf(llm.KindInvalidRequest, "%s: %v", key, err)
-	}
-	return nil
+	return wirecore.Field(m, key, dst)
 }

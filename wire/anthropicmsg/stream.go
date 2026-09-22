@@ -21,13 +21,13 @@ type streamer struct {
 	index    int
 	next     int
 	tools    []*llm.ToolUse
-	byIndex  map[int]*llm.ToolUse
+	merger   *wirecore.ToolMerger
 	toolSeen bool
 	err      error
 }
 
 func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Options, w wire.Writer) (llm.Diagnostics, error) {
-	st := &streamer{c: c, sse: wire.NewSSE(w), byIndex: map[int]*llm.ToolUse{}}
+	st := &streamer{c: c, sse: wire.NewSSE(w), merger: wirecore.NewToolMerger()}
 	meta := s.Meta()
 
 	h := header(meta.Session, "text/event-stream")
@@ -241,30 +241,18 @@ func (s *streamer) thinking(v *llm.Thinking) {
 
 func (s *streamer) tool(v *llm.ToolUse) {
 	s.toolSeen = true
-	key := 0
-	if v.Index != nil {
-		key = *v.Index
-	} else if v.ID == "" && len(s.tools) > 0 {
-		key = len(s.tools) - 1
-	} else {
-		key = len(s.tools)
-	}
-	t, ok := s.byIndex[key]
-	if !ok {
-		t = &llm.ToolUse{ID: v.ID, Name: v.Name}
-		s.byIndex[key] = t
-		s.tools = append(s.tools, t)
-	}
-	if v.ID != "" {
-		t.ID = v.ID
-	}
-	if v.Name != "" {
-		t.Name = v.Name
-	}
-	t.Args = append(t.Args, v.Args...)
+	s.merger.Merge(v, nil)
+	s.tools = s.merger.Tools()
 }
 
 func (s *streamer) flushTools() {
+	if s.merger.Overflowed() {
+		s.diags = append(s.diags, llm.Diagnostic{
+			Code: llm.WireBufferFull, Class: llm.ClassContent, Stage: llm.StageEncode,
+			Severity: llm.SeverityLoss, Format: Name,
+			Detail: "the tool arguments outgrew what one turn may hold, so the call is short of what was streamed",
+		})
+	}
 	for _, t := range s.tools {
 		args := wirecore.ObjectArgs(t.Args)
 		s.index = s.next
@@ -278,7 +266,7 @@ func (s *streamer) flushTools() {
 		s.closeBlock()
 	}
 	s.tools = nil
-	s.byIndex = map[int]*llm.ToolUse{}
+	s.merger.Reset()
 }
 
 func (s *streamer) textAfterTool() {

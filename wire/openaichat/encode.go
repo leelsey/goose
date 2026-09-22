@@ -258,9 +258,28 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 		return diags, err
 	}
 
-	var extra map[string]json.RawMessage
 	tier := ""
-	send := func(ch outChoice, usage *outUsage) error {
+	// An unmodelled field rides one chunk: the one its own frame produced, or
+	// the next chunk out where that frame produced none. Latching it and
+	// repeating it on every later chunk re-sends the upstream's own bytes once
+	// per delta; dropping it loses what only that frame carried.
+	var held map[string]json.RawMessage
+	send := func(ch outChoice, usage *outUsage, extra map[string]json.RawMessage) error {
+		if len(held) > 0 {
+			if extra == nil {
+				extra = held
+			} else {
+				merged := map[string]json.RawMessage{}
+				for k, v := range held {
+					merged[k] = v
+				}
+				for k, v := range extra {
+					merged[k] = v
+				}
+				extra = merged
+			}
+			held = nil
+		}
 		body := outBody{ID: id, Object: "chat.completion.chunk", Created: created, Model: model, Choices: []outChoice{ch}, Usage: usage, Tier: tier}
 		if ch.Delta == nil && ch.FinishReason == nil && usage != nil {
 			body.Choices = []outChoice{}
@@ -284,9 +303,7 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			break
 		}
 		idx := fr.ChoiceIndex()
-		if len(fr.Extra) > 0 {
-			extra = fr.Extra
-		}
+		sent := false
 		if fr.Err != nil {
 			streamErr = fr.Err
 			break
@@ -297,16 +314,18 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			if role == "" {
 				role = "assistant"
 			}
-			if err := send(outChoice{Index: idx, Delta: &outMessage{Role: role, Delta: true}}, nil); err != nil {
+			if err := send(outChoice{Index: idx, Delta: &outMessage{Role: role, Delta: true}}, nil, fr.Extra); err != nil {
 				return diags, err
 			}
+			sent = true
 		}
 		delta, d := c.delta(fr.Delta)
 		diags = append(diags, d...)
 		if delta != nil {
-			if err := send(outChoice{Index: idx, Delta: delta}, nil); err != nil {
+			if err := send(outChoice{Index: idx, Delta: delta}, nil, fr.Extra); err != nil {
 				return diags, err
 			}
+			sent = true
 		}
 		if fr.Stop != llm.StopNone {
 			reason, clean := finishReason(fr.Stop)
@@ -318,9 +337,13 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 				})
 			}
 			r := reason
-			if err := send(outChoice{Index: idx, Delta: &outMessage{Delta: true}, FinishReason: &r}, nil); err != nil {
+			if err := send(outChoice{Index: idx, Delta: &outMessage{Delta: true}, FinishReason: &r}, nil, fr.Extra); err != nil {
 				return diags, err
 			}
+			sent = true
+		}
+		if !sent && len(fr.Extra) > 0 {
+			held = fr.Extra
 		}
 	}
 
@@ -340,7 +363,7 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 	if opts.StreamUsage {
 		u := s.Usage()
 		tier = u.Tier
-		if err := send(outChoice{Index: 0}, encodeUsage(u)); err != nil {
+		if err := send(outChoice{Index: 0}, encodeUsage(u), nil); err != nil {
 			return diags, err
 		}
 		diags = append(diags, u.Uncarried(Name, llm.FigureCacheRead, llm.FigureCacheWrite, llm.FigureReasoning, llm.FigureTier)...)

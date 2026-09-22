@@ -67,3 +67,94 @@ func TestAnotherVendorOnlyToolIsStillRefused(t *testing.T) {
 		t.Fatal("a tool that exists only on one backend must be refused, not dropped")
 	}
 }
+
+// A restriction the caller asked for must never widen on the way through. The
+// empty list is the whole point: "none of this server's tools" is a setting,
+// not the absence of one.
+func TestAToolFilterSurvivesTheRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name, in string
+		want     any
+	}{
+		{"none allowed", `{"type":"mcp","server_label":"x","server_url":"https://h/","allowed_tools":[]}`, []string{}},
+		{"two allowed", `{"type":"mcp","server_label":"x","server_url":"https://h/","allowed_tools":["a","b"]}`, []string{"a", "b"}},
+		{"none allowed, read only", `{"type":"mcp","server_label":"x","server_url":"https://h/","allowed_tools":{"read_only":true,"tool_names":[]}}`, nil},
+		{"unset", `{"type":"mcp","server_label":"x","server_url":"https://h/"}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, err := DecodeMCPTool(json.RawMessage(tc.in))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := EncodeMCPTool(server)
+			got, set := out["allowed_tools"]
+			switch want := tc.want.(type) {
+			case nil:
+				if tc.name == "unset" && set {
+					t.Fatalf("allowed_tools = %v, want nothing: the caller set no filter", got)
+				}
+				if tc.name != "unset" && !set {
+					t.Fatal("the read-only filter was dropped")
+				}
+			case []string:
+				if !set {
+					t.Fatalf("allowed_tools was dropped, so %q became every tool this server serves", tc.in)
+				}
+				names, ok := got.([]string)
+				if !ok || len(names) != len(want) {
+					t.Fatalf("allowed_tools = %#v, want %#v", got, want)
+				}
+			}
+		})
+	}
+}
+
+// An approval mode goose does not recognise must not read as "no approval
+// needed": a backend that cannot wait for one refuses on exactly that signal.
+func TestAnUnknownApprovalModeIsRefused(t *testing.T) {
+	for _, word := range []string{"Always", "ALWAYS", "alway", "banana", ""} {
+		raw := `{"type":"mcp","server_label":"x","server_url":"https://h/","require_approval":"` + word + `"}`
+		server, err := DecodeMCPTool(json.RawMessage(raw))
+		if err == nil {
+			t.Errorf("require_approval %q was accepted as %q, and needs approval = %v",
+				word, server.Approval, server.NeedsApproval())
+		}
+	}
+	for _, word := range []string{"always", "never"} {
+		raw := `{"type":"mcp","server_label":"x","server_url":"https://h/","require_approval":"` + word + `"}`
+		if _, err := DecodeMCPTool(json.RawMessage(raw)); err != nil {
+			t.Errorf("require_approval %q is a mode this wire defines: %v", word, err)
+		}
+	}
+}
+
+// Taking the permissive half of a policy and dropping the other is the one
+// answer that must not be given.
+func TestAnApprovalPolicyIsNotHalfApplied(t *testing.T) {
+	both := `{"type":"mcp","server_label":"x","server_url":"https://h/",
+		"require_approval":{"always":{"tool_names":["delete_everything"]},"never":{"tool_names":["search"]}}}`
+	if server, err := DecodeMCPTool(json.RawMessage(both)); err == nil {
+		t.Fatalf("both halves were asked for and one was kept: %+v", server)
+	}
+
+	only := `{"type":"mcp","server_label":"x","server_url":"https://h/",
+		"require_approval":{"always":{"tool_names":["delete_everything"]}}}`
+	server, err := DecodeMCPTool(json.RawMessage(only))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !server.NeedsApproval() {
+		t.Fatalf("%+v: a named always list is a request for approval", server)
+	}
+
+	// "never" naming nothing exempts nothing, so everything still waits.
+	exempt := `{"type":"mcp","server_label":"x","server_url":"https://h/",
+		"require_approval":{"never":{"tool_names":[]}}}`
+	server, err = DecodeMCPTool(json.RawMessage(exempt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !server.NeedsApproval() {
+		t.Fatalf("%+v: an empty exemption list exempts nothing", server)
+	}
+}

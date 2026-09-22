@@ -135,15 +135,18 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 		return diags, err
 	}
 
-	tools := map[int]map[int]*llm.ToolUse{}
-	order := map[int][]int{}
+	tools := map[int]*wirecore.ToolMerger{}
 	stop := map[int]llm.StopReason{}
 	var candidates []int
 	seen := func(choice int) {
 		if _, ok := tools[choice]; ok {
 			return
 		}
-		tools[choice] = map[int]*llm.ToolUse{}
+		m := wirecore.NewToolMerger()
+		if len(candidates) > 0 {
+			m.Share(tools[candidates[0]])
+		}
+		tools[choice] = m
 		candidates = append(candidates, choice)
 	}
 	var block *llm.Block
@@ -179,20 +182,7 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 		var live []llm.Part
 		for _, p := range fr.Delta {
 			if t, ok := p.(*llm.ToolUse); ok {
-				key := len(order[choice])
-				if t.Index != nil {
-					key = *t.Index
-				}
-				held, open := tools[choice][key]
-				if !open {
-					held = &llm.ToolUse{ID: t.ID, Name: t.Name}
-					tools[choice][key] = held
-					order[choice] = append(order[choice], key)
-				}
-				if t.Name != "" {
-					held.Name = t.Name
-				}
-				held.Args = append(held.Args, t.Args...)
+				tools[choice].Merge(t, nil)
 				continue
 			}
 			live = append(live, p)
@@ -217,14 +207,14 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 	final := outBody{ResponseID: meta.ID, UsageMetadata: encodeUsage(s.Usage()), ModelVersion: meta.Model}
 	diags = append(diags, s.Usage().Uncarried(Name, llm.FigureCacheRead, llm.FigureReasoning)...)
 	if len(candidates) == 0 {
-		candidates = []int{0}
+		// A stream can fail, be abandoned or end without ever naming a
+		// candidate; seen() is what puts one on the list.
 		seen(0)
 	}
 	sort.Ints(candidates)
 	for _, choice := range candidates {
 		var parts []json.RawMessage
-		for _, key := range order[choice] {
-			t := tools[choice][key]
+		for _, t := range tools[choice].Tools() {
 			args := wirecore.ObjectArgs(t.Args)
 			parts = append(parts, mustJSON(map[string]any{"functionCall": map[string]any{"name": t.Name, "args": args}}))
 		}
@@ -236,6 +226,16 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			final.Candidates = append(final.Candidates, candidate{
 				Content: &content{Role: "model", Parts: list(parts)}, FinishReason: name, Index: choice,
 			})
+		}
+	}
+	for _, choice := range candidates {
+		if tools[choice].Overflowed() {
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.WireBufferFull, Class: llm.ClassContent, Stage: llm.StageEncode,
+				Severity: llm.SeverityLoss, Format: Name,
+				Detail: "the tool arguments outgrew what one turn may hold, so the call is short of what was streamed",
+			})
+			break
 		}
 	}
 	if block != nil {

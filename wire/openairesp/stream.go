@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/wire"
 )
@@ -27,6 +28,7 @@ type streamer struct {
 	outputIndex int
 	buf         string
 	refusalBuf  string
+	refusalOpen bool
 	summaryOpen bool
 
 	imageBuf    []byte
@@ -41,10 +43,10 @@ type streamer struct {
 	diags llm.Diagnostics
 	err   error
 
-	tools   []*llm.ToolUse
-	byIndex map[int]*llm.ToolUse
-	ids     int
-	extra   map[string]json.RawMessage
+	tools  []*llm.ToolUse
+	merger *wirecore.ToolMerger
+	ids    int
+	extra  map[string]json.RawMessage
 }
 
 func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Options, w wire.Writer) (llm.Diagnostics, error) {
@@ -56,7 +58,7 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 	st := &streamer{
 		sse:    wire.NewSSE(w),
 		respID: c.id(meta.ID), model: model, created: created(meta.Created), extra: meta.Extra,
-		items: []item{}, byIndex: map[int]*llm.ToolUse{},
+		items: []item{}, merger: wirecore.NewToolMerger(),
 		budget: c.opts.MaxBuffer,
 	}
 	if st.budget <= 0 {
@@ -213,30 +215,22 @@ func (s *streamer) part(p llm.Part) {
 			return
 		}
 		s.openMessage()
+		// A part is announced before anything is streamed into it, and a
+		// refusal sits beside the text rather than replacing it.
+		if !s.refusalOpen {
+			s.refusalOpen = true
+			s.event("response.content_part.added", map[string]any{
+				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1,
+				"part": contentPart{Type: "refusal"},
+			})
+		}
 		s.hold(&s.refusalBuf, v.Text)
 		s.event("response.refusal.delta", map[string]any{
 			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1, "delta": v.Text,
 		})
 	case *llm.ToolUse:
-		key := len(s.tools)
-		if v.Index != nil {
-			key = *v.Index
-		}
-		t, ok := s.byIndex[key]
-		if !ok {
-			t = &llm.ToolUse{ID: v.ID, Name: v.Name}
-			s.byIndex[key] = t
-			s.tools = append(s.tools, t)
-		}
-		if v.ID != "" {
-			t.ID = v.ID
-		}
-		if v.Name != "" {
-			t.Name = v.Name
-		}
-		if s.charge(len(v.Args)) {
-			t.Args = append(t.Args, v.Args...)
-		}
+		s.merger.Merge(v, s.charge)
+		s.tools = s.merger.Tools()
 	case *llm.Image:
 		s.image(v)
 	case *llm.ToolResult:
@@ -384,9 +378,15 @@ func (s *streamer) closeItem() {
 		if s.buf != "" {
 			it.Content = append(it.Content, contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}})
 		}
-		if s.refusalBuf != "" {
+		// The part was announced when the refusal opened, so it is closed on
+		// the way out whether or not anything fitted in it.
+		if s.refusalOpen {
 			s.event("response.refusal.done", map[string]any{
 				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1, "refusal": s.refusalBuf,
+			})
+			s.event("response.content_part.done", map[string]any{
+				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1,
+				"part": contentPart{Type: "refusal", Refusal: s.refusalBuf},
 			})
 			it.Content = append(it.Content, contentPart{Type: "refusal", Refusal: s.refusalBuf})
 		}
@@ -396,6 +396,7 @@ func (s *streamer) closeItem() {
 	s.open = ""
 	s.buf = ""
 	s.refusalBuf = ""
+	s.refusalOpen = false
 }
 
 func (s *streamer) flushTools() {
@@ -421,5 +422,5 @@ func (s *streamer) flushTools() {
 		s.event("response.output_item.done", map[string]any{"output_index": idx, "item": it})
 	}
 	s.tools = nil
-	s.byIndex = map[int]*llm.ToolUse{}
+	s.merger.Reset()
 }

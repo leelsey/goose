@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
@@ -85,8 +86,17 @@ func (c *Codec) EncodeResponse(resp *llm.Response, opts wire.Options) (*wire.Out
 func imageSource(v *llm.Image) (map[string]any, bool) {
 	switch {
 	case len(v.Data) > 0:
+		// This wire requires a media type. Where the caller's own wire had no
+		// field for one, the bytes say what they are.
+		mime := v.MIME
+		if mime == "" {
+			mime, _, _ = strings.Cut(http.DetectContentType(v.Data), ";")
+			if !strings.HasPrefix(mime, "image/") {
+				mime = "image/png"
+			}
+		}
 		return map[string]any{
-			"type": "base64", "media_type": v.MIME,
+			"type": "base64", "media_type": mime,
 			"data": base64.StdEncoding.EncodeToString(v.Data),
 		}, true
 	case v.URL != "":
@@ -104,6 +114,13 @@ func EncodeBlocks(parts []llm.Part) ([]json.RawMessage, llm.Diagnostics) {
 		case *llm.Text:
 			out = append(out, mustJSON(map[string]any{"type": "text", "text": v.Text}))
 		case *llm.Refusal:
+			// This wire has no refusal block, and a refusal read as an answer
+			// is an answer the client will act on.
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.DropRefusal, Class: llm.ClassContent, Stage: llm.StageEncode,
+				Severity: llm.SeverityLoss, Format: Name,
+				Detail: "this format has no field for a refusal, so it travelled as ordinary text",
+			})
 			out = append(out, mustJSON(map[string]any{"type": "text", "text": v.Text}))
 		case *llm.Thinking:
 			if len(v.Redacted) > 0 {
@@ -112,7 +129,14 @@ func EncodeBlocks(parts []llm.Part) ([]json.RawMessage, llm.Diagnostics) {
 			}
 			out = append(out, mustJSON(map[string]any{"type": "thinking", "thinking": v.Text, "signature": v.Signature}))
 		case *llm.ToolUse:
-			args := wirecore.ObjectArgs(v.Args)
+			args, broken := wirecore.ObjectArgsBroken(v.Args)
+			if broken {
+				diags = append(diags, llm.Diagnostic{
+					Code: llm.DropToolCall, Class: llm.ClassContent, Stage: llm.StageEncode,
+					Severity: llm.SeverityLoss, Format: Name, Field: v.Name,
+					Detail: "this call's arguments did not survive, so it travelled with none rather than with what was meant",
+				})
+			}
 			out = append(out, mustJSON(map[string]any{"type": "tool_use", "id": v.ID, "name": v.Name, "input": args}))
 		case *llm.ToolResult:
 			inner, d := EncodeBlocks(v.Content)

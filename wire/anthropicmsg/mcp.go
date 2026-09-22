@@ -105,15 +105,12 @@ func MergeMCPToolset(servers []llm.MCPServer, raw json.RawMessage) (unsent []str
 	return unsent, nil
 }
 
+// The unsent entries name one part of one tool server that this wire has no
+// field for, as "<server>: <field>", so that dropping the same field from two
+// servers is reported twice rather than once.
 func EncodeMCPServers(list []llm.MCPServer) (servers, toolsets []map[string]any, unsent []string) {
-	seen := map[string]bool{}
-	note := func(field string) {
-		if !seen[field] {
-			seen[field] = true
-			unsent = append(unsent, field)
-		}
-	}
 	for _, s := range list {
+		note := func(field string) { unsent = append(unsent, s.Name+": "+field) }
 		if s.URL == "" {
 			note("connector_id")
 			continue
@@ -130,7 +127,9 @@ func EncodeMCPServers(list []llm.MCPServer) (servers, toolsets []map[string]any,
 		switch {
 		case s.Enabled != nil && !*s.Enabled:
 			defaults["enabled"] = false
-		case len(s.AllowedTools) > 0:
+		case s.AllowedTools != nil:
+			// A list naming nothing allows nothing, so the default stays off
+			// and no tool is turned back on.
 			defaults["enabled"] = false
 			for _, name := range s.AllowedTools {
 				configs[name] = map[string]any{"enabled": true}
@@ -161,7 +160,7 @@ func EncodeMCPServers(list []llm.MCPServer) (servers, toolsets []map[string]any,
 		if s.ReadOnly {
 			note("read_only")
 		}
-		if s.Approval != llm.MCPApprovalDefault {
+		if s.Approval != llm.MCPApprovalDefault || len(s.ApprovalTools) > 0 {
 			note("require_approval")
 		}
 	}

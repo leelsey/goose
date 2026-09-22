@@ -67,21 +67,6 @@ func finishName(s llm.StopReason) (string, bool) {
 	}
 }
 
-func finishReason(s string) llm.StopReason {
-	switch s {
-	case "STOP":
-		return llm.StopEnd
-	case "MAX_TOKENS":
-		return llm.StopLength
-	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "LANGUAGE":
-		return llm.StopContentFilter
-	case "":
-		return llm.StopNone
-	default:
-		return llm.StopUnknown
-	}
-}
-
 type usageMetadata struct {
 	PromptTokenCount        int `json:"promptTokenCount,omitempty"`
 	CandidatesTokenCount    int `json:"candidatesTokenCount,omitempty"`
@@ -119,4 +104,11 @@ func DecodeUsage(m usageMetadata) llm.Usage {
 
 type idMinter = wirecore.IDMinter
 
-func newIDMinter() *idMinter { return wirecore.NewIDMinter() }
+// This wire carries no id of its own, so one is minted per name. Calls and the
+// responses answering them are numbered apart, so that the nth call and the nth
+// response of a name mint the same id and pair up again.
+type idMinters struct{ calls, results *idMinter }
+
+func newIDMinters() *idMinters {
+	return &idMinters{calls: wirecore.NewIDMinter(), results: wirecore.NewIDMinter()}
+}

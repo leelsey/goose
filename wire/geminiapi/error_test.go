@@ -109,3 +109,62 @@ func TestAStreamedFailureSpeaksThisWireToo(t *testing.T) {
 		t.Fatalf("code = %v: a failure with no upstream status still has one here", found["code"])
 	}
 }
+
+// A backend that answers 200 and then fails on its first event leaves the
+// encoder with no candidate at all, which is the shape the closing fallback
+// exists for.
+func TestAFailureBeforeTheFirstCandidateIsStillAnswered(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		frames []*llm.Frame
+		ctx    func() (context.Context, context.CancelFunc)
+	}{
+		{"error first", []*llm.Frame{{Err: llm.Errorf(llm.KindOverloaded, "busy")}}, nil},
+		{"no frames at all", nil, nil},
+		{"caller gone", []*llm.Frame{{Delta: []llm.Part{&llm.Text{Text: "x"}}}}, func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.ctx != nil {
+				var cancel context.CancelFunc
+				ctx, cancel = tc.ctx()
+				defer cancel()
+			}
+			s := llm.StaticStream(llm.StreamMeta{Model: "m"}, tc.frames)
+			w := &wire.BufferWriter{}
+			if _, err := New(Options{}).EncodeStream(ctx, s, wire.Options{Stream: true}, w); err == nil && tc.name != "no frames at all" {
+				t.Fatal("a stream that never answered must be reported")
+			}
+			if w.Body.Len() == 0 {
+				t.Fatal("the client was left with nothing on the wire")
+			}
+			// The closing body names the candidate that never arrived. Naming
+			// it twice is a second, empty candidate the client must reconcile.
+			last := ""
+			for _, line := range strings.Split(w.Body.String(), "\n") {
+				if raw, ok := strings.CutPrefix(line, "data: "); ok {
+					last = raw
+				}
+			}
+			var closing struct {
+				Candidates []struct {
+					Index int `json:"index"`
+				} `json:"candidates"`
+			}
+			if err := json.Unmarshal([]byte(last), &closing); err != nil {
+				t.Fatalf("closing frame %q: %v", last, err)
+			}
+			seen := map[int]bool{}
+			for _, c := range closing.Candidates {
+				if seen[c.Index] {
+					t.Fatalf("candidate %d is named twice: %s", c.Index, last)
+				}
+				seen[c.Index] = true
+			}
+		})
+	}
+}

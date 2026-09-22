@@ -83,7 +83,7 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 	if len(contents) == 0 {
 		return nil, opts, diags, llm.Errorf(llm.KindInvalidRequest, "contents is required")
 	}
-	mint := newIDMinter()
+	mint := newIDMinters()
 	for _, ct := range contents {
 		role := llm.RoleUser
 		switch ct.Role {
@@ -137,6 +137,13 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 		req.MaxOutputTokens, req.Seed, req.Stop = cfg.MaxOutputTokens, cfg.Seed, cfg.StopSequences
 		req.Candidates = cfg.CandidateCount
 		req.FrequencyPenalty, req.PresencePenalty = cfg.FrequencyPenalty, cfg.PresencePenalty
+		for _, name := range wirecore.Shadowed(cfgRaw, modelledConfig) {
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageDecode,
+				Severity: llm.SeverityLoss, Format: Name, Field: "generationConfig" + "." + name,
+				Detail: "this setting arrived spelled more than one way, and only the last of them was read",
+			})
+		}
 		if rest := wirecore.NestedExtra(cfgRaw, modelledConfig); rest != nil {
 			if req.Extra == nil {
 				req.Extra = map[string]json.RawMessage{}
@@ -224,10 +231,10 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 }
 
 func DecodeParts(raw []json.RawMessage) ([]llm.Part, llm.Diagnostics, error) {
-	return decodeParts(raw, newIDMinter())
+	return decodeParts(raw, newIDMinters())
 }
 
-func decodeParts(raw []json.RawMessage, mint *idMinter) ([]llm.Part, llm.Diagnostics, error) {
+func decodeParts(raw []json.RawMessage, mint *idMinters) ([]llm.Part, llm.Diagnostics, error) {
 	var diags llm.Diagnostics
 	var out []llm.Part
 	for _, item := range raw {
@@ -261,13 +268,13 @@ func decodeParts(raw []json.RawMessage, mint *idMinter) ([]llm.Part, llm.Diagnos
 		case p.FunctionCall != nil:
 			id := p.FunctionCall.ID
 			if id == "" {
-				id = mint.Next(p.FunctionCall.Name)
+				id = mint.calls.Next(p.FunctionCall.Name)
 			}
 			out = append(out, &llm.ToolUse{ID: id, Name: p.FunctionCall.Name, Args: p.FunctionCall.Args})
 		case p.FunctionResponse != nil:
 			id := p.FunctionResponse.ID
 			if id == "" {
-				id = mint.Next(p.FunctionResponse.Name)
+				id = mint.results.Next(p.FunctionResponse.Name)
 			}
 			out = append(out, &llm.ToolResult{ID: id, Name: p.FunctionResponse.Name,
 				Content: []llm.Part{&llm.Text{Text: string(p.FunctionResponse.Response)}}})
@@ -295,12 +302,5 @@ func decodeParts(raw []json.RawMessage, mint *idMinter) ([]llm.Part, llm.Diagnos
 }
 
 func field[T any](m map[string]json.RawMessage, key string, dst *T) error {
-	raw, ok := m[key]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	if err := json.Unmarshal(raw, dst); err != nil {
-		return llm.Errorf(llm.KindInvalidRequest, "%s: %v", key, err)
-	}
-	return nil
+	return wirecore.Field(m, key, dst)
 }

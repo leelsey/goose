@@ -54,28 +54,6 @@ func (c *Codec) id(id string) string {
 	}
 	return c.opts.IDPrefix + "goose"
 }
-
-func stopReason(s string) llm.StopReason {
-	switch s {
-	case "end_turn":
-		return llm.StopEnd
-	case "max_tokens":
-		return llm.StopLength
-	case "stop_sequence":
-		return llm.StopSequence
-	case "tool_use":
-		return llm.StopToolUse
-	case "pause_turn":
-		return llm.StopPause
-	case "refusal":
-		return llm.StopRefusal
-	case "":
-		return llm.StopNone
-	default:
-		return llm.StopUnknown
-	}
-}
-
 func stopName(s llm.StopReason) (string, bool) {
 	switch s {
 	case llm.StopEnd:

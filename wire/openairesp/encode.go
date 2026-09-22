@@ -54,6 +54,68 @@ type contentPart struct {
 	Annotations []string `json:"annotations,omitempty"`
 }
 
+// MarshalJSON writes what this part's own type requires. One struct serves two
+// shapes, so omitting a field because it is empty would drop one the schema
+// calls for and a strict client would refuse the answer.
+func (c contentPart) MarshalJSON() ([]byte, error) {
+	type plain contentPart
+	out := plain(c)
+	switch c.Type {
+	case "output_text":
+		if out.Annotations == nil {
+			out.Annotations = []string{}
+		}
+		return json.Marshal(struct {
+			plain
+			Text        string   `json:"text"`
+			Annotations []string `json:"annotations"`
+		}{plain: out, Text: c.Text, Annotations: out.Annotations})
+	case "refusal":
+		return json.Marshal(struct {
+			plain
+			Refusal string `json:"refusal"`
+		}{plain: out, Refusal: c.Refusal})
+	}
+	return json.Marshal(out)
+}
+
+// MarshalJSON writes what this item's own type requires, for the same reason.
+func (i item) MarshalJSON() ([]byte, error) {
+	type plain item
+	out := plain(i)
+	switch i.Type {
+	case "reasoning":
+		if out.Summary == nil {
+			out.Summary = []summaryPart{}
+		}
+		return json.Marshal(struct {
+			plain
+			Summary []summaryPart `json:"summary"`
+		}{plain: out, Summary: out.Summary})
+	case "message":
+		if out.Content == nil {
+			out.Content = []contentPart{}
+		}
+		return json.Marshal(struct {
+			plain
+			Content []contentPart `json:"content"`
+		}{plain: out, Content: out.Content})
+	case "function_call":
+		return json.Marshal(struct {
+			plain
+			CallID string `json:"call_id"`
+			Name   string `json:"name"`
+			Args   string `json:"arguments"`
+		}{plain: out, CallID: i.CallID, Name: i.Name, Args: i.Args})
+	case "image_generation_call":
+		return json.Marshal(struct {
+			plain
+			Result string `json:"result"`
+		}{plain: out, Result: i.Result})
+	}
+	return json.Marshal(out)
+}
+
 type summaryPart struct {
 	Type string `json:"type"`
 	Text string `json:"text"`

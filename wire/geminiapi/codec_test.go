@@ -68,8 +68,8 @@ func TestDecodePartsAndSystemInstruction(t *testing.T) {
 		t.Fatalf("tool call = %+v: this wire has no id, so one is minted per name", tu)
 	}
 	tr, ok := r.Messages[2].Content[0].(*llm.ToolResult)
-	if !ok || tr.ID != "call_f_1" {
-		t.Fatalf("tool result = %+v", r.Messages[2].Content[0])
+	if !ok || tr.ID != tu[0].ID {
+		t.Fatalf("tool result = %+v: a minted id is only useful if it pairs the answer with its call", r.Messages[2].Content[0])
 	}
 	if r.Candidates != 2 || *r.MaxOutputTokens != 99 || *r.Temperature != 0.3 {
 		t.Fatalf("generation config = %+v", r)
@@ -214,5 +214,37 @@ func TestAnActionThisProxyDoesNotServeIsRefused(t *testing.T) {
 		if want := action == "streamGenerateContent"; opts.Stream != want {
 			t.Errorf("%s: stream = %v", action, opts.Stream)
 		}
+	}
+}
+
+func TestRepeatedCallsOfOneNamePairWithTheirOwnResults(t *testing.T) {
+	body := `{"contents":[
+		{"role":"model","parts":[{"functionCall":{"name":"f","args":{"i":1}}},{"functionCall":{"name":"f","args":{"i":2}}}]},
+		{"role":"user","parts":[{"functionResponse":{"name":"f","response":{"r":1}}},{"functionResponse":{"name":"f","response":{"r":2}}}]}
+	]}`
+	r, _, _, err := New(Options{}).Decode(&wire.Inbound{Path: "/v1beta/models/g:generateContent", Body: []byte(body)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := llm.ToolUses(r.Messages[0].Content)
+	if len(calls) != 2 {
+		t.Fatalf("calls = %+v", calls)
+	}
+	var results []*llm.ToolResult
+	for _, p := range r.Messages[1].Content {
+		if tr, ok := p.(*llm.ToolResult); ok {
+			results = append(results, tr)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %+v", results)
+	}
+	for i := range calls {
+		if calls[i].ID != results[i].ID {
+			t.Fatalf("call %d = %q, result = %q: each answer belongs to one call", i, calls[i].ID, results[i].ID)
+		}
+	}
+	if calls[0].ID == calls[1].ID {
+		t.Fatalf("both calls minted %q: two calls are not one", calls[0].ID)
 	}
 }

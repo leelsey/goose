@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/wire"
 )
@@ -307,11 +308,20 @@ func decodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnost
 			}
 			b, _ := json.Marshal(item)
 			_ = json.Unmarshal(b, &t)
-			inner, _, d, err := decodeBlocks(t.Content)
+			inner, innerHint, d, err := decodeBlocks(t.Content)
 			if err != nil {
 				return nil, nil, diags, err
 			}
 			diags = append(diags, d...)
+			if innerHint != nil {
+				// A tool result holds its content but carries no breakpoint of
+				// its own, so what was asked for inside it cannot be kept.
+				diags = append(diags, llm.Diagnostic{
+					Code: llm.DropCacheHint, Class: llm.ClassCapability, Stage: llm.StageDecode,
+					Severity: llm.SeverityInfo, Format: Name,
+					Detail: "a breakpoint inside a tool result has nowhere to sit once the result is a part, so it was not kept",
+				})
+			}
 			parts = append(parts, &llm.ToolResult{ID: t.ID, Content: inner, IsError: t.IsError})
 		case "image":
 			img, err := decodeImage(item)
@@ -363,23 +373,10 @@ func setMeta(m map[string]string, k, v string) map[string]string {
 	return m
 }
 
-func bearer(h string) string {
-	const p = "Bearer "
-	if len(h) > len(p) && strings.EqualFold(h[:len(p)], p) {
-		return h[len(p):]
-	}
-	return ""
-}
+func bearer(h string) string { return wirecore.Bearer(h) }
 
 func field[T any](m map[string]json.RawMessage, key string, dst *T) error {
-	raw, ok := m[key]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	if err := json.Unmarshal(raw, dst); err != nil {
-		return llm.Errorf(llm.KindInvalidRequest, "%s: %v", key, err)
-	}
-	return nil
+	return wirecore.Field(m, key, dst)
 }
 
 func quoted(s string) string {

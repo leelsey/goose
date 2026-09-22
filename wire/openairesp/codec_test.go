@@ -6,6 +6,7 @@ package openairesp
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -211,6 +212,25 @@ func TestStreamClosesReasoningBeforeAMessageOpens(t *testing.T) {
 	}
 }
 
+func TestStreamJoinsAToolCallSplitAcrossIndexlessFrames(t *testing.T) {
+	evs := events(t,
+		&llm.Frame{Delta: []llm.Part{&llm.ToolUse{ID: "call_a", Name: "search"}}},
+		&llm.Frame{Delta: []llm.Part{&llm.ToolUse{Args: json.RawMessage(`{"q":"go"}`)}}},
+		&llm.Frame{Stop: llm.StopToolUse},
+		&llm.Frame{Usage: &llm.Usage{Prompt: 4, Completion: 2, Reported: true}, TurnEnd: true},
+	)
+	last := evs[len(evs)-1]
+	resp := last.body["response"].(map[string]any)
+	items := resp["output"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("output = %v: the name and the arguments belong to one call", items)
+	}
+	call := items[0].(map[string]any)
+	if call["name"] != "search" || call["arguments"] != `{"q":"go"}` {
+		t.Fatalf("call = %v", call)
+	}
+}
+
 func TestStreamTerminalEventCarriesEverything(t *testing.T) {
 	evs := events(t,
 		&llm.Frame{Delta: []llm.Part{&llm.Text{Text: "hi"}}},
@@ -325,4 +345,78 @@ func TestTheStreamedObjectIsStampedLikeTheUnaryOne(t *testing.T) {
 	if strings.Contains(w.Body.String(), `"created_at":0`) {
 		t.Fatalf("body = %s: 1970 is not when this answer was made", w.Body.String())
 	}
+}
+
+// The Responses schema makes these fields required, so a client that validates
+// what it is handed cannot parse an answer that leaves them out.
+func TestRequiredFieldsAreAlwaysWritten(t *testing.T) {
+	resp := &llm.Response{
+		ID: "r", Model: "m",
+		Choices: []llm.Choice{{Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Part{
+			&llm.Thinking{Text: ""},
+			&llm.Text{Text: "hello"},
+			&llm.Refusal{Text: ""},
+			&llm.ToolUse{Name: "f", Args: json.RawMessage(`{"a":1}`)},
+		}}, Stop: llm.StopEnd}},
+	}
+	out, _, err := New(Options{}).EncodeResponse(resp, wire.Options{})
+	if err != nil || out == nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var body struct {
+		Output []map[string]json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(out.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range body.Output {
+		var kind string
+		if err := json.Unmarshal(entry["type"], &kind); err != nil {
+			t.Fatal(err)
+		}
+		switch kind {
+		case "reasoning":
+			if _, ok := entry["summary"]; !ok {
+				t.Errorf("reasoning item has no summary: %v", keysOf(entry))
+			}
+		case "function_call":
+			for _, want := range []string{"call_id", "name", "arguments"} {
+				if _, ok := entry[want]; !ok {
+					t.Errorf("function_call has no %s: %v", want, keysOf(entry))
+				}
+			}
+		case "message":
+			var parts []map[string]json.RawMessage
+			if err := json.Unmarshal(entry["content"], &parts); err != nil {
+				t.Fatal(err)
+			}
+			for _, part := range parts {
+				var pk string
+				if err := json.Unmarshal(part["type"], &pk); err != nil {
+					t.Fatal(err)
+				}
+				switch pk {
+				case "output_text":
+					for _, want := range []string{"text", "annotations"} {
+						if _, ok := part[want]; !ok {
+							t.Errorf("output_text has no %s: %v", want, keysOf(part))
+						}
+					}
+				case "refusal":
+					if _, ok := part["refusal"]; !ok {
+						t.Errorf("refusal has no refusal: %v", keysOf(part))
+					}
+				}
+			}
+		}
+	}
+}
+
+func keysOf(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

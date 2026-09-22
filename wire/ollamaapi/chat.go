@@ -111,6 +111,13 @@ func (c *Chat) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagnos
 		return nil, opts, diags, err
 	}
 	diags = append(diags, o.apply(req, NameChat)...)
+	for _, name := range wirecore.Shadowed(top["options"], modelledOptions) {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageDecode,
+			Severity: llm.SeverityLoss, Format: NameChat, Field: "options." + name,
+			Detail: "this option arrived spelled more than one way, and only the last of them was read",
+		})
+	}
 	if rest := wirecore.NestedExtra(top["options"], modelledOptions); rest != nil {
 		if req.Extra == nil {
 			req.Extra = map[string]json.RawMessage{}
@@ -293,11 +300,31 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 	}
 
 	stop := llm.StopNone
+	sentContent, refusing := false, false
 	var pendingTools []*llm.ToolUse
-	byIndex := map[int]*llm.ToolUse{}
+	merger := wirecore.NewToolMerger()
 	var streamErr error
-	var extra map[string]json.RawMessage
-	send := func(b chatBody) error {
+	// An unmodelled field rides one chunk: the one its own frame produced, or
+	// the next chunk out where that frame produced none. Repeating it on every
+	// later chunk re-sends the upstream's bytes per delta; dropping it loses
+	// what only that frame carried.
+	var held map[string]json.RawMessage
+	send := func(b chatBody, extra map[string]json.RawMessage) error {
+		if len(held) > 0 {
+			if extra == nil {
+				extra = held
+			} else {
+				merged := map[string]json.RawMessage{}
+				for k, v := range held {
+					merged[k] = v
+				}
+				for k, v := range extra {
+					merged[k] = v
+				}
+				extra = merged
+			}
+			held = nil
+		}
 		raw, err := wire.WithExtra(mustJSON(b), extra)
 		if err != nil {
 			return err
@@ -310,9 +337,6 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 			streamErr = err
 			break
 		}
-		if len(fr.Extra) > 0 {
-			extra = fr.Extra
-		}
 		if fr.Err != nil {
 			streamErr = fr.Err
 			break
@@ -323,28 +347,27 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 			switch v := p.(type) {
 			case *llm.Text:
 				msg.Content += v.Text
+				sentContent = sentContent || v.Text != ""
 				emit = true
 			case *llm.Thinking:
 				msg.Thinking += v.Text
 				emit = emit || v.Text != ""
 			case *llm.Refusal:
+				// The whole-answer path parts a refusal from the text before it,
+				// and a reader accumulating these chunks must arrive at the same
+				// words, whether or not a frame boundary falls between them.
+				if !refusing {
+					refusing = true
+					if sentContent {
+						msg.Content += "\n\n"
+					}
+				}
 				msg.Content += v.Text
+				sentContent = sentContent || v.Text != ""
 				emit = true
 			case *llm.ToolUse:
-				key := len(pendingTools)
-				if v.Index != nil {
-					key = *v.Index
-				}
-				t, ok := byIndex[key]
-				if !ok {
-					t = &llm.ToolUse{Name: v.Name}
-					byIndex[key] = t
-					pendingTools = append(pendingTools, t)
-				}
-				if v.Name != "" {
-					t.Name = v.Name
-				}
-				t.Args = append(t.Args, v.Args...)
+				merger.Merge(v, nil)
+				pendingTools = merger.Tools()
 			case *llm.Image:
 				diags = append(diags, drop(NameChat, llm.DropImage, "an assistant image has no field on this wire"))
 			case *llm.Raw:
@@ -352,9 +375,11 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 			}
 		}
 		if emit {
-			if err := send(chatBody{Model: model, CreatedAt: stamp(c.opts.now()), Message: msg}); err != nil {
+			if err := send(chatBody{Model: model, CreatedAt: stamp(c.opts.now()), Message: msg}, fr.Extra); err != nil {
 				return diags, err
 			}
+		} else if len(fr.Extra) > 0 {
+			held = fr.Extra
 		}
 		if fr.Stop != llm.StopNone {
 			stop = fr.Stop
@@ -395,7 +420,14 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 			Severity: llm.SeverityLoss, Format: NameChat, Detail: e.Message,
 		})
 	}
-	if err := send(final); err != nil {
+	if merger.Overflowed() {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.WireBufferFull, Class: llm.ClassContent, Stage: llm.StageEncode,
+			Severity: llm.SeverityLoss, Format: NameChat,
+			Detail: "the tool arguments outgrew what one turn may hold, so the call is short of what was streamed",
+		})
+	}
+	if err := send(final, nil); err != nil {
 		return diags, err
 	}
 	diags = append(diags, s.Diagnostics()...)

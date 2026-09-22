@@ -413,3 +413,51 @@ func TestACacheBreakpointIsNotExtendedPastWhereItWasAsked(t *testing.T) {
 		t.Errorf("diagnostics = %v", diags.Codes())
 	}
 }
+
+// A redacted thinking block is opaque bytes the client hands back next turn, so
+// what comes out must be what went in whichever backend produced it.
+func TestRedactedThinkingSurvivesEveryBackend(t *testing.T) {
+	// The token is opaque: unpadded, URL-safe or not base64 at all, it must come
+	// back exactly as it went in.
+	for _, token := range []string{
+		"EroBCoYBGAIiQKx3ab9xQw==", "EroBCoYBGAIiQKx3ab9xQw", "a-b_cd==", "YWJ=", "opaque-token!",
+	} {
+		in := json.RawMessage(`[{"type":"redacted_thinking","data":"` + token + `"}]`)
+		parts, _, _, err := DecodeBlocks(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		back, _ := EncodeBlocks(parts)
+		if len(back) != 1 {
+			t.Fatalf("%q: blocks = %d", token, len(back))
+		}
+		var out struct {
+			Data string `json:"data"`
+		}
+		if err := json.Unmarshal(back[0], &out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Data != token {
+			t.Errorf("token %q came back as %q", token, out.Data)
+		}
+	}
+
+	raw := []byte("EroBCoYBGAIiQKx3ab9xQw==")
+	blocks, _ := EncodeBlocks([]llm.Part{&llm.Thinking{Redacted: raw}})
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %d", len(blocks))
+	}
+	var out struct {
+		Type string `json:"type"`
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(blocks[0], &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Type != "redacted_thinking" {
+		t.Fatalf("type = %q", out.Type)
+	}
+	if out.Data != string(raw) {
+		t.Fatalf("data = %q, want %q", out.Data, raw)
+	}
+}

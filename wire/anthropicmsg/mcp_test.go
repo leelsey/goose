@@ -5,6 +5,7 @@ package anthropicmsg
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/leelsey/goose/llm"
@@ -92,14 +93,48 @@ func TestWhatThisWireCannotSayAboutAServerIsNamed(t *testing.T) {
 	if len(servers) != 1 || len(toolsets) != 1 {
 		t.Fatalf("servers = %+v, toolsets = %+v: every server is named by exactly one toolset", servers, toolsets)
 	}
-	want := map[string]bool{"server_description": true, "headers": true, "read_only": true, "require_approval": true, "connector_id": true}
+	want := map[string]bool{
+		"docs: server_description": true,
+		"docs: headers":            true,
+		"docs: read_only":          true,
+		"docs: require_approval":   true,
+		"drive: connector_id":      true,
+	}
 	if len(unsent) != len(want) {
 		t.Fatalf("unsent = %v", unsent)
 	}
-	for _, field := range unsent {
-		if !want[field] {
+	for _, u := range unsent {
+		if !want[u] {
 			t.Fatalf("unsent = %v", unsent)
 		}
+	}
+}
+
+func TestEveryServerThisWireCannotCarryIsNamed(t *testing.T) {
+	_, _, unsent := EncodeMCPServers([]llm.MCPServer{
+		{Name: "drive", Connector: "connector_googledrive"},
+		{Name: "mail", Connector: "connector_gmail"},
+	})
+	if len(unsent) != 2 {
+		t.Fatalf("unsent = %v: two whole servers went missing, not one", unsent)
+	}
+	if unsent[0] == unsent[1] {
+		t.Fatalf("unsent = %v: the caller cannot tell which servers were dropped", unsent)
+	}
+}
+
+func TestPerToolApprovalIsNamedAsUnsent(t *testing.T) {
+	_, _, unsent := EncodeMCPServers([]llm.MCPServer{
+		{Name: "docs", URL: "https://tools.test/mcp", ApprovalTools: []string{"delete_file"}},
+	})
+	found := false
+	for _, u := range unsent {
+		if strings.HasSuffix(u, "require_approval") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unsent = %v: an approval this wire cannot ask for must not vanish quietly", unsent)
 	}
 }
 
@@ -128,5 +163,31 @@ func TestAToolsetSurvivesTheRoundTrip(t *testing.T) {
 		case (got.Enabled == nil) != (s.Enabled == nil):
 			t.Fatalf("enabled = %+v, was %+v", got, s)
 		}
+	}
+}
+
+// A list naming nothing allows nothing. Reading it as "no list" hands the model
+// every tool the server serves.
+func TestAnEmptyAllowListAllowsNothing(t *testing.T) {
+	servers, toolsets, _ := EncodeMCPServers([]llm.MCPServer{
+		{Name: "fs", URL: "https://h/", AllowedTools: []string{}},
+	})
+	if len(servers) != 1 || len(toolsets) != 1 {
+		t.Fatalf("servers = %d, toolsets = %d", len(servers), len(toolsets))
+	}
+	raw, err := json.Marshal(toolsets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Defaults struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"default_config"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Defaults.Enabled == nil || *out.Defaults.Enabled {
+		t.Fatalf("toolset = %s: an empty allow list left every tool on", raw)
 	}
 }

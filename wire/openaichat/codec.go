@@ -59,20 +59,3 @@ func finishReason(s llm.StopReason) (string, bool) {
 		return "stop", false
 	}
 }
-
-func stopReason(s string) llm.StopReason {
-	switch s {
-	case "stop":
-		return llm.StopEnd
-	case "length":
-		return llm.StopLength
-	case "tool_calls", "function_call":
-		return llm.StopToolUse
-	case "content_filter":
-		return llm.StopContentFilter
-	case "":
-		return llm.StopNone
-	default:
-		return llm.StopUnknown
-	}
-}

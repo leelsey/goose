@@ -53,14 +53,6 @@ func (c *Codec) id(id string) string {
 	}
 	return c.opts.IDPrefix + "goose"
 }
-
-func (c *Codec) now() time.Time {
-	if c.opts.Now != nil {
-		return c.opts.Now()
-	}
-	return time.Time{}
-}
-
 func status(stop llm.StopReason, failed bool) (state, incomplete string) {
 	if failed {
 		return "failed", ""

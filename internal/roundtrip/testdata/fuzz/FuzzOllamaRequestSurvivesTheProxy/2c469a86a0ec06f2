@@ -1,0 +1,2 @@
+go test fuzz v1
+string("{\"messages\":[{}],\"stream\":false,\"options\":{\"top_p\":0,\"top_P\":1}}")

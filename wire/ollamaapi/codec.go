@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/wire"
 )
@@ -87,19 +88,6 @@ func doneReason(s llm.StopReason) (string, bool) {
 	}
 }
 
-func stopReason(s string) llm.StopReason {
-	switch s {
-	case "stop":
-		return llm.StopEnd
-	case "length":
-		return llm.StopLength
-	case "":
-		return llm.StopNone
-	default:
-		return llm.StopUnknown
-	}
-}
-
 func decodeFormat(raw json.RawMessage) *llm.ResponseFormat {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
@@ -112,17 +100,6 @@ func decodeFormat(raw json.RawMessage) *llm.ResponseFormat {
 		return &llm.ResponseFormat{Type: "json_object"}
 	}
 	return &llm.ResponseFormat{Type: "json_schema", Schema: raw}
-}
-
-func encodeFormat(f *llm.ResponseFormat) json.RawMessage {
-	switch {
-	case f == nil:
-		return nil
-	case len(f.Schema) > 0:
-		return f.Schema
-	default:
-		return json.RawMessage(`"json"`)
-	}
 }
 
 func decodeImages(images []string) []llm.Part {
@@ -182,23 +159,10 @@ func stamp(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-func bearer(h string) string {
-	const p = "Bearer "
-	if len(h) > len(p) && strings.EqualFold(h[:len(p)], p) {
-		return h[len(p):]
-	}
-	return ""
-}
+func bearer(h string) string { return wirecore.Bearer(h) }
 
 func field[T any](m map[string]json.RawMessage, key string, dst *T) error {
-	raw, ok := m[key]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	if err := json.Unmarshal(raw, dst); err != nil {
-		return llm.Errorf(llm.KindInvalidRequest, "%s: %v", key, err)
-	}
-	return nil
+	return wirecore.Field(m, key, dst)
 }
 
 func drop(format, code, detail string) llm.Diagnostic {
