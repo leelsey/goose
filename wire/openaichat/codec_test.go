@@ -469,3 +469,36 @@ func TestFieldsStillWaitingWhenTheStreamEndsAreNotLostInSilence(t *testing.T) {
 		t.Errorf("a field waited for a chunk that never came and nothing said so:\n%s", w.Body.String())
 	}
 }
+
+// A field that already rode every chunk of the answer has not been lost
+// because it arrived once more after the last one. Crying loss on an ordinary
+// stream is the loudest thing this codec can say about content, and it would
+// say it about nearly every one.
+func TestAFieldThatAlreadyTravelledIsNotALoss(t *testing.T) {
+	fingerprint := map[string]json.RawMessage{"system_fingerprint": json.RawMessage(`"fp_9"`)}
+	for _, tc := range []struct {
+		what   string
+		last   map[string]json.RawMessage
+		report bool
+	}{
+		{"the usage frame repeating what every chunk carried", fingerprint, false},
+		{"and one naming something nothing carried", map[string]json.RawMessage{
+			"never_seen_before": json.RawMessage(`1`),
+		}, true},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			_, diags, err := streamOf(t, wire.Options{Stream: true},
+				&llm.Frame{Delta: []llm.Part{&llm.Text{Text: "hi"}}, Extra: fingerprint},
+				&llm.Frame{Delta: []llm.Part{&llm.Text{Text: " there"}}, Extra: fingerprint},
+				&llm.Frame{Stop: llm.StopEnd, Extra: fingerprint},
+				&llm.Frame{Extra: tc.last},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hasCode(diags, llm.DropExtraField); got != tc.report {
+				t.Errorf("reported a loss = %v, want %v", got, tc.report)
+			}
+		})
+	}
+}

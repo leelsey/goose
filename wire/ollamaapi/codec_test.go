@@ -435,8 +435,10 @@ func TestFieldsHeldBackFromQuietFramesTravelAndAreBounded(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if n := strings.Count(w.Body.String(), `"field`); n >= quiet {
-			t.Errorf("one line carried %d held fields: what waits is the upstream's to choose", n)
+		// The ceiling is on bytes, so the body is what says whether it held:
+		// twenty thousand of these fields are better than half a megabyte.
+		if n := w.Body.Len(); n > 1<<18 {
+			t.Errorf("one line came to %d bytes of held fields: what waits is the upstream's to choose", n)
 		}
 		var said bool
 		for _, d := range diags {

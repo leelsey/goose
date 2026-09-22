@@ -380,3 +380,52 @@ func TestTheCheckReadsARequestTheWayTheDecoderDoes(t *testing.T) {
 		})
 	}
 }
+
+// An ordinary streamed call through the commonest provider and wire pair says
+// nothing was lost, because nothing was.
+func TestAnOrdinaryStreamReportsNoLoss(t *testing.T) {
+	chunk := func(body string) string { return "data: " + body + "\n\n" }
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, b := range []string{
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+		} {
+			_, _ = w.Write([]byte(chunk(b)))
+			w.(http.Flusher).Flush()
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer up.Close()
+
+	p, err := openai.New(openai.Options{ID: "up", BaseURL: up.URL + "/v1", APIKey: "k", Dialect: openai.OpenAIDialect()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := goose.New(goose.WithProvider(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := httpx.New(c, httpx.Options{Codecs: []wire.Codec{openaichat.New(openaichat.Options{})}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(s.Handler())
+	defer front.Close()
+
+	resp, err := front.Client().Post(front.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if got := resp.Trailer.Get(httpx.DiagnosticsHeader); got != "" {
+		t.Errorf("an ordinary stream reported %q\n%s", got, body)
+	}
+	if got := resp.Header.Get(httpx.DiagnosticsHeader); got != "" {
+		t.Errorf("an ordinary stream reported %q\n%s", got, body)
+	}
+}
