@@ -3001,3 +3001,24 @@ func TestAResultThatHoldsItselfTwiceDoesNotDoubleAllTheWayDown(t *testing.T) {
 		t.Fatalf("blocks = %d, want at most %d", n, maxBlocks)
 	}
 }
+
+// A header name a server chose is a name goose puts on the wire and says back
+// in an error when it does not match. How long it is is no more the server's to
+// choose than how many tools it offers, and a name of four thousand bytes is
+// not a header name.
+func TestAHeaderNameIsHeldToALine(t *testing.T) {
+	named := func(header string) json.RawMessage {
+		name, err := json.Marshal(header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return json.RawMessage(`{"type":"object","properties":{"a":{"type":"string",` +
+			`"x-mcp-header":` + string(name) + `}}}`)
+	}
+	if _, err := annotated(named(strings.Repeat("a", maxSaid+1))); err == nil {
+		t.Errorf("a header name of %d bytes was accepted", maxSaid+1)
+	}
+	if _, err := annotated(named("X-Tenant")); err != nil {
+		t.Errorf("a header name that is one was refused: %v", err)
+	}
+}

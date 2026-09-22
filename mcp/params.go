@@ -128,6 +128,12 @@ func validHeaderName(name string) error {
 	if name == "" {
 		return fmt.Errorf("the name is empty")
 	}
+	// goose puts this on the wire and says it back where it does not match, so
+	// how long it is is no more the server's to choose than how many tools it
+	// offers. Nothing that is a header name comes anywhere near this.
+	if len(name) > maxSaid {
+		return fmt.Errorf("the name is %d bytes, which is not a header name", len(name))
+	}
 	const token = "!#$%&'*+-.^_`|~"
 	for i := 0; i < len(name); i++ {
 		c := name[i]
