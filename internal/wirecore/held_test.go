@@ -170,3 +170,19 @@ func TestTheMemoryOfWhatTravelledIsBounded(t *testing.T) {
 		t.Error("it answered a question it had already forgotten the answer to")
 	}
 }
+
+// What a field is called and what it says run together without something
+// between them, and a boundary that moves is a field that does not.
+func TestAFieldIsTheNameAndWhatItSaysTogether(t *testing.T) {
+	seen := map[uint64][2]string{}
+	for _, f := range [][2]string{
+		{"ab", "c"}, {"a", "bc"}, {"abc", ""}, {"", "abc"},
+		{"x_vendor", `{"id":"req_1"}`}, {"x_vendor", `{"id":"req_1","q":1}`},
+	} {
+		m := mark(f[0], json.RawMessage(f[1]))
+		if other, clash := seen[m]; clash {
+			t.Errorf("%q and %q are the same field", other, f)
+		}
+		seen[m] = f
+	}
+}

@@ -99,7 +99,10 @@ func mark(name string, value json.RawMessage) uint64 {
 	for i := range len(name) {
 		h = (h ^ uint64(name[i])) * prime
 	}
-	h = (h ^ 0) * prime
+	// A round with nothing fed into it, to put a boundary between the two:
+	// without one a field called "ab" saying "c" and one called "a" saying
+	// "bc" are the same field.
+	h *= prime
 	for i := range len(value) {
 		h = (h ^ uint64(value[i])) * prime
 	}
