@@ -3068,16 +3068,7 @@ func TestAResultWithMoreInItThanWillFitSaysSo(t *testing.T) {
 // A server that offers nothing goose can use still chooses how much of it goose
 // reads while finding that out.
 func TestWhatIsLookedAtIsBoundedEvenWhenNoneOfItIsKept(t *testing.T) {
-	var entries []string
-	for i := range 2000 {
-		name, err := json.Marshal(fmt.Sprintf("tool%d", i))
-		if err != nil {
-			t.Fatal(err)
-		}
-		entries = append(entries, `{"name":`+string(name)+
-			`,"inputSchema":{"type":"object","properties":{"a":{"x-mcp-header":"X-A"}}}}`)
-	}
-	page := `{"tools":[` + strings.Join(entries, ",") + `],"nextCursor":"more"}`
+	const perPage = 2000
 	pages := 0
 	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
 		switch out.Method {
@@ -3087,17 +3078,34 @@ func TestWhatIsLookedAtIsBoundedEvenWhenNoneOfItIsKept(t *testing.T) {
 			return &response{Result: json.RawMessage(
 				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
 		}
+		// Every page names tools no page before it named, which is what a name
+		// set grows on. A page repeating an earlier one costs nothing to hold
+		// and so is not what this bounds.
+		var entries []string
+		for i := range perPage {
+			name, err := json.Marshal(fmt.Sprintf("page%d-tool%d", pages, i))
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, `{"name":`+string(name)+
+				`,"inputSchema":{"type":"object","properties":{"a":{"x-mcp-header":"X-A"}}}}`)
+		}
 		pages++
-		return &response{Result: json.RawMessage(page)}, nil
+		return &response{Result: json.RawMessage(
+			`{"tools":[` + strings.Join(entries, ",") + `],"nextCursor":"more"}`)}, nil
 	}}
 	c := newClient("srv", ft, Options{Mirrors: true})
 	if err := c.connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Tools(context.Background()); err != nil {
+	tools, err := c.Tools(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (maxTools + maxRefused + 1999) / 2000; pages > want {
+	if len(tools) != 0 {
+		t.Fatalf("tools = %d, want none of them to be mirrorable", len(tools))
+	}
+	if want := (maxTools + perPage - 1) / perPage; pages > want {
 		t.Errorf("read %d pages of a catalogue it kept nothing from, want at most %d", pages, want)
 	}
 	if !c.Truncated() {
@@ -3188,4 +3196,40 @@ func TestWhatTheCurrentRevisionSaysBackIsHeldToALineToo(t *testing.T) {
 			t.Errorf("message = %d bytes, want at most %d", len(said), maxAccount)
 		}
 	})
+}
+
+// A server is free to list one tool twice, and the second copy is the same
+// tool: it is not another one, and it costs nothing to hold. A catalogue that
+// repeats itself is not a catalogue goose should serve half of.
+func TestACatalogueThatRepeatsItselfIsStillServedWhole(t *testing.T) {
+	var entries []string
+	for i := range maxTools {
+		name, err := json.Marshal(fmt.Sprintf("tool%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := `{"name":` + string(name) + `,"inputSchema":{"type":"object"}}`
+		entries = append(entries, entry, entry)
+	}
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != maxTools {
+		t.Fatalf("tools = %d, want %d: a copy of a tool was counted as another tool", len(tools), maxTools)
+	}
 }

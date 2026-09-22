@@ -442,7 +442,6 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	raw := map[string]json.RawMessage{}
 	cursor := ""
 	truncated, full := false, false
-	examined := 0
 	seen := map[string]bool{}
 	dropped := map[string]bool{}
 	// refuse records a name goose will not carry, whatever it was about the
@@ -480,13 +479,14 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			return nil, err
 		}
 		for _, entry := range result.Tools {
-			// Deciding about an entry costs what holding it costs, whatever is
-			// decided: the name goes in a set either way, and a schema goose
-			// will not mirror is read before it is turned down. So what bounds
-			// the reading is how many entries are looked at, not how many are
-			// kept — a server offering nothing usable chose how long that took
-			// otherwise.
-			if examined++; examined > maxTools+maxRefused {
+			// What has to be bounded is what is held, and a name is held from
+			// the moment goose decides it could carry it — whether or not the
+			// tool behind it is one it ends up serving. Counting only what is
+			// served leaves a server whose every schema is unmirrorable holding
+			// every name it can send; counting every entry instead would make a
+			// second copy of a tool cost a tool, and a server is free to list
+			// one twice.
+			if len(seen) >= maxTools {
 				truncated, full = true, true
 				break
 			}
@@ -517,10 +517,6 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 				continue
 			}
 			seen[name] = true
-			if len(out) >= maxTools {
-				truncated, full = true, true
-				break
-			}
 			t.Name = name
 			schema := t.InputSchema
 			if len(schema) == 0 || string(schema) == "null" {
