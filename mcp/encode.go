@@ -22,55 +22,85 @@ const (
 )
 
 func encodeContent(parts []llm.Part) []json.RawMessage {
-	left := maxBlocks
-	return encodeParts(parts, 0, &left)
+	// One block is held back, so that running out of room can be said in the
+	// same breath and the whole still fits.
+	room := &budget{left: maxBlocks - 1}
+	out := encodeParts(parts, 0, room)
+	if room.short {
+		out = append(out, mustJSON(map[string]any{"type": "text", "text": "the rest did not fit"}))
+	}
+	return out
 }
 
-func encodeParts(parts []llm.Part, depth int, left *int) []json.RawMessage {
+// budget is what is left to say and whether anything went unsaid. It counts
+// blocks as they come out rather than parts as they go in: one part can be an
+// error marker and everything it holds.
+type budget struct {
+	left  int
+	short bool
+}
+
+func (b *budget) take() bool {
+	if b.left <= 0 {
+		b.short = true
+		return false
+	}
+	b.left--
+	return true
+}
+
+func encodeParts(parts []llm.Part, depth int, room *budget) []json.RawMessage {
 	out := make([]json.RawMessage, 0, len(parts))
+	add := func(block json.RawMessage) bool {
+		if !room.take() {
+			return false
+		}
+		out = append(out, block)
+		return true
+	}
 	for _, p := range parts {
-		if *left <= 0 {
+		if room.left <= 0 {
+			room.short = true
 			break
 		}
-		*left--
 		switch v := p.(type) {
 		case *llm.Text:
-			out = append(out, mustJSON(map[string]any{"type": "text", "text": v.Text}))
+			add(mustJSON(map[string]any{"type": "text", "text": v.Text}))
 		case *llm.Refusal:
-			out = append(out, mustJSON(map[string]any{"type": "text", "text": v.Text}))
+			add(mustJSON(map[string]any{"type": "text", "text": v.Text}))
 		case *llm.Image:
 			kind := "image"
 			if strings.HasPrefix(v.MIME, "audio/") {
 				kind = "audio"
 			}
-			out = append(out, mustJSON(map[string]any{
+			add(mustJSON(map[string]any{
 				"type": kind, "mimeType": v.MIME,
 				"data": base64.StdEncoding.EncodeToString(v.Data),
 			}))
 		case *llm.ToolResult:
 			// Its parts are content this wire has blocks for, so they travel as
 			// themselves rather than flattened into a sentence.
-			if v.IsError {
-				out = append(out, mustJSON(map[string]any{"type": "text", "text": "error"}))
+			if v.IsError && !add(mustJSON(map[string]any{"type": "text", "text": "error"})) {
+				continue
 			}
 			if depth >= maxNesting {
-				out = append(out, mustJSON(map[string]any{
+				add(mustJSON(map[string]any{
 					"type": "text", "text": "nested too deeply to carry",
 				}))
 				continue
 			}
-			out = append(out, encodeParts(v.Content, depth+1, left)...)
+			out = append(out, encodeParts(v.Content, depth+1, room)...)
 		case *llm.Raw:
 			if v.Vendor == "mcp" && json.Valid(v.JSON) {
-				out = append(out, v.JSON)
+				add(v.JSON)
 				continue
 			}
-			out = append(out, mustJSON(map[string]any{"type": "text", "text": string(v.JSON)}))
+			add(mustJSON(map[string]any{"type": "text", "text": string(v.JSON)}))
 		default:
 			// This wire has only these blocks. A part that reached here is still
 			// a part the tool produced, so what it says travels.
 			if text := describe(p); text != "" {
-				out = append(out, mustJSON(map[string]any{"type": "text", "text": text}))
+				add(mustJSON(map[string]any{"type": "text", "text": text}))
 			}
 		}
 	}

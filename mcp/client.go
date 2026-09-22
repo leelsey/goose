@@ -427,11 +427,11 @@ func usableName(name string) string {
 // too long to carry is refused rather than cut, and the second return says
 // which of the two came back.
 func quoted(name string) (string, bool) {
-	// The measure is the name, not the escapes it needs: one short enough to
-	// have been carried is short enough to be shown, however much of it has to
-	// be written as an escape to be shown safely.
-	if len(name) <= maxSaid {
-		return strconv.Quote(name), true
+	// The measure is what it costs to say, not what the name was: a short name
+	// of nothing but escapes is four times itself written out, and a line of
+	// those is the flood this ceiling is here to stop.
+	if q := strconv.Quote(name); len(q) <= maxSaid {
+		return q, true
 	}
 	return fmt.Sprintf("a name of %d bytes", len(name)), false
 }
@@ -442,6 +442,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	raw := map[string]json.RawMessage{}
 	cursor := ""
 	truncated, full := false, false
+	examined := 0
 	seen := map[string]bool{}
 	dropped := map[string]bool{}
 	// refuse records a name goose will not carry, whatever it was about the
@@ -479,6 +480,16 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			return nil, err
 		}
 		for _, entry := range result.Tools {
+			// Deciding about an entry costs what holding it costs, whatever is
+			// decided: the name goes in a set either way, and a schema goose
+			// will not mirror is read before it is turned down. So what bounds
+			// the reading is how many entries are looked at, not how many are
+			// kept — a server offering nothing usable chose how long that took
+			// otherwise.
+			if examined++; examined > maxTools+maxRefused {
+				truncated, full = true, true
+				break
+			}
 			var t struct {
 				Name         string          `json:"name"`
 				Description  string          `json:"description"`

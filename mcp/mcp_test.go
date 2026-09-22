@@ -5,6 +5,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2896,6 +2897,8 @@ func TestALineIsMeasuredAfterItIsTamed(t *testing.T) {
 	}{
 		{"bytes that are not text", strings.Repeat("\xff", 1<<16), maxAccount},
 		{"and the shorter ceiling", strings.Repeat("\xff", 1<<16), maxSaid},
+		{"text that is wider than one byte a letter", strings.Repeat("é", 1<<16), maxSaid},
+		{"and a line of it", strings.Repeat("파", 1<<16), maxAccount},
 	} {
 		if got := tameTo(tc.in, tc.max); len(got) > tc.max {
 			t.Errorf("%s: %d bytes, want at most %d", tc.what, len(got), tc.max)
@@ -3021,4 +3024,168 @@ func TestAHeaderNameIsHeldToALine(t *testing.T) {
 	if _, err := annotated(named("X-Tenant")); err != nil {
 		t.Errorf("a header name that is one was refused: %v", err)
 	}
+}
+
+// A part may cost more to say than it cost to hold: an error marker and a note
+// that the nesting ended both come out of the one part it was.
+func TestABudgetCountsWhatComesOutNotWhatWentIn(t *testing.T) {
+	flat := make([]llm.Part, 0, 2*maxBlocks)
+	for range 2 * maxBlocks {
+		flat = append(flat, &llm.ToolResult{ID: "t", IsError: true})
+	}
+	loop := &llm.ToolResult{ID: "t1", IsError: true}
+	loop.Content = []llm.Part{loop, loop}
+	for _, tc := range []struct {
+		what  string
+		parts []llm.Part
+	}{
+		{"a run of results that each say they failed", flat},
+		{"and one that holds itself twice and says so", []llm.Part{loop}},
+	} {
+		if n := len(encodeContent(tc.parts)); n > maxBlocks {
+			t.Errorf("%s: blocks = %d, want at most %d", tc.what, n, maxBlocks)
+		}
+	}
+}
+
+// Running out of room is a loss, and a loss says so. The nesting being too
+// deep already did.
+func TestAResultWithMoreInItThanWillFitSaysSo(t *testing.T) {
+	parts := make([]llm.Part, 0, maxBlocks+10)
+	for i := range maxBlocks + 10 {
+		parts = append(parts, &llm.Text{Text: fmt.Sprintf("part %d", i)})
+	}
+	blocks := encodeContent(parts)
+	if len(blocks) > maxBlocks {
+		t.Fatalf("blocks = %d, want at most %d", len(blocks), maxBlocks)
+	}
+	if !strings.Contains(string(blocks[len(blocks)-1]), "did not fit") {
+		t.Errorf("the rest was dropped and nothing said so: last block = %s", blocks[len(blocks)-1])
+	}
+}
+
+// Deciding about an entry costs what holding it costs, whatever is decided.
+// A server that offers nothing goose can use still chooses how much of it goose
+// reads while finding that out.
+func TestWhatIsLookedAtIsBoundedEvenWhenNoneOfItIsKept(t *testing.T) {
+	var entries []string
+	for i := range 2000 {
+		name, err := json.Marshal(fmt.Sprintf("tool%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, `{"name":`+string(name)+
+			`,"inputSchema":{"type":"object","properties":{"a":{"x-mcp-header":"X-A"}}}}`)
+	}
+	page := `{"tools":[` + strings.Join(entries, ",") + `],"nextCursor":"more"}`
+	pages := 0
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		pages++
+		return &response{Result: json.RawMessage(page)}, nil
+	}}
+	c := newClient("srv", ft, Options{Mirrors: true})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := (maxTools + maxRefused + 1999) / 2000; pages > want {
+		t.Errorf("read %d pages of a catalogue it kept nothing from, want at most %d", pages, want)
+	}
+	if !c.Truncated() {
+		t.Error("the walk stopped and nothing said so")
+	}
+}
+
+// A name said back to an operator is said on one line, and what it costs to
+// say is the escapes it needs, not the bytes it was.
+func TestANameSaidBackIsItselfHeldToALine(t *testing.T) {
+	for _, name := range []string{
+		strings.Repeat(string(rune(1)), maxSaid),
+		strings.Repeat("a", 90) + strings.Repeat(string(rune(1)), 12),
+		strings.Repeat("a", maxSaid+1),
+		"read_file" + string(rune(1)),
+	} {
+		said, _ := quoted(name)
+		if len(said) > maxSaid {
+			t.Errorf("a name of %d bytes is said in %d, want at most %d", len(name), len(said), maxSaid)
+		}
+		if said == "" {
+			t.Errorf("a name of %d bytes was said as nothing", len(name))
+		}
+	}
+}
+
+// Every way a caller can name something goose does not have is a line goose
+// prints, and the revision it asks to speak is one of them.
+func TestWhatTheCurrentRevisionSaysBackIsHeldToALineToo(t *testing.T) {
+	m := NewManager()
+	defer m.Close()
+	front := httptest.NewServer(m.Handler())
+	defer front.Close()
+
+	esc := string([]byte{0x1b})
+	long := strings.Repeat("v", 100000) + esc + "[2K"
+	held := func(t *testing.T, body string) {
+		t.Helper()
+		var reply struct {
+			Error *rpcError `json:"error"`
+		}
+		got := rpc(t, front, body)
+		if err := json.Unmarshal([]byte(got), &reply); err != nil {
+			t.Fatalf("%v: %.200s", err, got)
+		}
+		if reply.Error == nil {
+			t.Fatalf("no error came back: %.200s", got)
+		}
+		if len(reply.Error.Message) > maxAccount {
+			t.Errorf("message = %d bytes, want at most %d", len(reply.Error.Message), maxAccount)
+		}
+		for _, r := range reply.Error.Message {
+			if !strconv.IsPrint(r) {
+				t.Fatalf("message carries %q: %.200q", r, reply.Error.Message)
+			}
+		}
+		if bytes.ContainsRune(reply.Error.Data, 0x1b) {
+			t.Errorf("what came alongside it carries an escape: %.200s", reply.Error.Data)
+		}
+	}
+
+	t.Run("a revision nobody speaks", func(t *testing.T) {
+		version, err := json.Marshal(long)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held(t, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{`+
+			`"io.modelcontextprotocol/protocolVersion":`+string(version)+`,`+
+			`"io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	})
+
+	// The current revision mirrors the method into a header, which no control
+	// character survives, so what is left to hold there is how long it is.
+	t.Run("a method nobody serves, asked for the current way", func(t *testing.T) {
+		name := strings.Repeat("m", 100000)
+		method, err := json.Marshal(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, out := modernPost(t, front, name, "",
+			`{"jsonrpc":"2.0","id":2,"method":`+string(method)+`,"params":{`+modernMeta()+`}}`)
+		refusal, _ := out["error"].(map[string]any)
+		if refusal == nil {
+			t.Fatalf("no error came back: %v", out)
+		}
+		said, _ := refusal["message"].(string)
+		if len(said) > maxAccount {
+			t.Errorf("message = %d bytes, want at most %d", len(said), maxAccount)
+		}
+	})
 }

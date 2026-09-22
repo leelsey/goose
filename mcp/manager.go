@@ -332,8 +332,10 @@ func (m *Manager) Call(ctx context.Context, name string, args json.RawMessage) (
 	result, err := e.src.Call(ctx, e.tool, args)
 	if err == nil && result == nil {
 		// Neither a result nor an error is not an answer. Reading it as one
-		// takes the proxy down on the first thing that reaches into it.
-		return nil, fmt.Errorf("mcp %s: %s: answered with neither a result nor an error", e.src.Name(), e.tool)
+		// takes the proxy down on the first thing that reaches into it. The
+		// name in the line is somebody else's, here as anywhere else.
+		said, _ := quoted(e.tool)
+		return nil, fmt.Errorf("mcp %s: %s: answered with neither a result nor an error", tame(e.src.Name()), said)
 	}
 	return result, err
 }
