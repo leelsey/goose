@@ -139,6 +139,8 @@ func (f *Frame) Empty() bool {
 	if f == nil {
 		return true
 	}
-	return len(f.Delta) == 0 && f.Stop == StopNone && f.Usage == nil &&
-		f.Err == nil && f.Block == nil && !f.TurnEnd && len(f.Diagnostics) == 0
+	return len(f.Delta) == 0 && f.Stop == StopNone && f.StopSequence == "" &&
+		f.Usage == nil && f.Err == nil && f.Block == nil && !f.TurnEnd &&
+		len(f.Diagnostics) == 0 && len(f.Extra) == 0 &&
+		f.ID == "" && f.Model == "" && f.Session == ""
 }

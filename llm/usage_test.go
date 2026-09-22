@@ -184,3 +184,69 @@ func TestAFigureTheWireCannotCarryIsReported(t *testing.T) {
 		t.Fatalf("uncarried = %+v: nothing was measured to lose", got)
 	}
 }
+
+// A call nobody counted is not a free call. Knowing how long it took is not
+// knowing what it cost, so metadata must not answer for the columns.
+func TestKnowingTheClockIsNotKnowingTheCount(t *testing.T) {
+	for _, u := range []Usage{
+		{Turns: 3, DurationMS: 1200},
+		{DurationMS: 1200},
+		{Turns: 1},
+	} {
+		if got := u.Unmeasured(); !hasAnomaly(got, AnomalyNotMeasurable) {
+			t.Errorf("%+v was booked as a counted call: %+v", u, got.Anomalies)
+		}
+	}
+	counted := Usage{Prompt: 11, Completion: 2, Turns: 3, DurationMS: 1200}
+	if got := counted.Unmeasured(); hasAnomaly(got, AnomalyNotMeasurable) {
+		t.Errorf("%+v was counted: %+v", counted, got.Anomalies)
+	}
+}
+
+// Reasoning is part of completion on this convention, so more of it than there
+// is completion is a breakdown that cannot be true.
+func TestAnImpossibleOutputBreakdownIsFlagged(t *testing.T) {
+	got := Usage{Prompt: 10, Completion: 5, Reasoning: 900}.settle()
+	if !hasAnomaly(got, AnomalyOutputUnknown) {
+		t.Fatalf("anomalies = %+v: reasoning is inside completion here", got.Anomalies)
+	}
+}
+
+// A total assembled from a priced turn and an unpriced one is not a priced
+// total, and saying otherwise understates the bill.
+func TestAPartlyPricedTotalSaysSo(t *testing.T) {
+	priced := Usage{Prompt: 1, Cost: &Cost{Amount: 0.01, Currency: "USD"}}
+	free := Usage{Prompt: 1}
+	got := priced.Add(free).Unpriced(true)
+	if !hasAnomaly(got, AnomalyPriceMissing) {
+		t.Fatalf("cost = %+v, anomalies = %+v: one of the two turns was never priced", got.Cost, got.Anomalies)
+	}
+}
+
+// Two prices in two currencies do not compare, so the larger number is not the
+// larger cost.
+func TestCoverDoesNotMixCurrencies(t *testing.T) {
+	usd := Usage{Prompt: 1, Cost: &Cost{Amount: 1.20, Currency: "USD"}}
+	krw := Usage{Prompt: 1, Cost: &Cost{Amount: 1600, Currency: "KRW"}}
+	got := usd.Cover(krw)
+	if got.Cost != nil && got.Cost.Currency == "KRW" && !hasAnomaly(got, AnomalyCurrencyMixed) {
+		t.Fatalf("cost = %+v with no anomaly: 1600 KRW replaced 1.20 USD by being the bigger number", got.Cost)
+	}
+}
+
+// Usage is copied by value everywhere, so two copies that each notice
+// something must not overwrite each other's note.
+func TestAnomaliesDoNotAliasAcrossCopies(t *testing.T) {
+	base := Usage{Prompt: 1}
+	for _, code := range []string{AnomalyCacheSplit, AnomalyInputUnknown, AnomalyCurrencyMixed} {
+		base = base.WithAnomaly(Anomaly{Code: code})
+	}
+	one := base.WithAnomaly(Anomaly{Code: AnomalyPriceMissing})
+	two := base.WithAnomaly(Anomaly{Code: AnomalyNotMeasurable})
+	if !hasAnomaly(one, AnomalyPriceMissing) {
+		t.Fatalf("one = %+v: the other copy took its place", one.Anomalies)
+	}
+	if !hasAnomaly(two, AnomalyNotMeasurable) {
+		t.Fatalf("two = %+v", two.Anomalies)
+	}
+}

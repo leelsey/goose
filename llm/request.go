@@ -72,12 +72,23 @@ type MCPServer struct {
 	DeferLoading  *bool
 }
 
+// cloneNames keeps an empty list distinct from an absent one. A list naming
+// nothing is a setting, and append to a nil slice would hand it back as none.
+func cloneNames(names []string) []string {
+	if names == nil {
+		return nil
+	}
+	return append([]string{}, names...)
+}
+
 func (s MCPServer) NeedsApproval() bool {
 	switch s.Approval {
 	case MCPApprovalAlways:
 		return true
 	case MCPApprovalNever:
-		return len(s.ApprovalTools) > 0
+		// A named list exempts what it names, so anything it leaves out still
+		// waits; a bare "never" names no list and exempts everything.
+		return s.ApprovalTools != nil
 	default:
 		return false
 	}
@@ -190,9 +201,9 @@ func (r *Request) Clone() *Request {
 	if r.MCPServers != nil {
 		c.MCPServers = make([]MCPServer, len(r.MCPServers))
 		for i, m := range r.MCPServers {
-			m.AllowedTools = append([]string(nil), m.AllowedTools...)
-			m.DeniedTools = append([]string(nil), m.DeniedTools...)
-			m.ApprovalTools = append([]string(nil), m.ApprovalTools...)
+			m.AllowedTools = cloneNames(m.AllowedTools)
+			m.DeniedTools = cloneNames(m.DeniedTools)
+			m.ApprovalTools = cloneNames(m.ApprovalTools)
 			m.Enabled = clonePtr(m.Enabled)
 			m.DeferLoading = clonePtr(m.DeferLoading)
 			if m.Headers != nil {

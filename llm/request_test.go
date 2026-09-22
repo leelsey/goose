@@ -71,3 +71,23 @@ func TestPartsKeepOrderAndSignatures(t *testing.T) {
 		t.Fatal("per-block signatures crossed")
 	}
 }
+
+// An empty list is a setting — "none of this server's tools" — and a clone
+// that turns it back into "no setting" widens what the caller asked for on
+// every attempt after the first.
+func TestCloneKeepsAnEmptyListDistinctFromNone(t *testing.T) {
+	req := &Request{
+		Model: "m",
+		MCPServers: []MCPServer{{
+			Name: "x", URL: "https://h/",
+			AllowedTools: []string{}, ApprovalTools: []string{}, Approval: MCPApprovalNever,
+		}},
+	}
+	got := req.Clone().MCPServers[0]
+	if got.AllowedTools == nil {
+		t.Error("allowed_tools became unset, so the clone offers every tool the server serves")
+	}
+	if got.ApprovalTools == nil || !got.NeedsApproval() {
+		t.Error("the approval list became unset, so the clone waits for nobody")
+	}
+}

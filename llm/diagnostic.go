@@ -69,6 +69,7 @@ const (
 	DropImage          = "drop.image"
 	DropCandidate      = "drop.candidate"
 	DropUnknownBlock   = "drop.unknown_block"
+	DropRefusal        = "drop.refusal"
 	DropSystemPrompt   = "drop.system_prompt"
 	DropExtraField     = "drop.extra_field"
 	DropCacheHint      = "drop.cache_hint"
@@ -107,7 +108,7 @@ const (
 func Codes() []string {
 	return []string{
 		DropThinking, DropSignature, DropToolCall, DropToolResult, DropImage,
-		DropCandidate, DropUnknownBlock, DropSystemPrompt, DropExtraField,
+		DropCandidate, DropUnknownBlock, DropRefusal, DropSystemPrompt, DropExtraField,
 		DropCacheHint, DropToolDefinition, DropMCPServer, DropMessage, DropToolError,
 		CapNoStreamUsage, CapNoSessions, CapSessionElsewhere, CapCeilingRespelt,
 		CapCacheBreakpoint, CapCandidatesOne, CapParallelTools, CapNoModelList,

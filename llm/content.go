@@ -29,7 +29,11 @@ type Text struct {
 type Thinking struct {
 	Text      string
 	Signature string
-	Redacted  []byte
+	// Redacted is the block exactly as the backend spelled it. It is opaque and
+	// a client hands it straight back, so nothing re-spells it on the way
+	// through; a backend whose own wire spells it differently converts at its
+	// own edge.
+	Redacted []byte
 }
 
 type ToolUse struct {

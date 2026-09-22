@@ -37,6 +37,7 @@ type Anomaly struct {
 
 const (
 	AnomalyInputUnknown  = "input_unknown"
+	AnomalyOutputUnknown = "output_unknown"
 	AnomalyCacheSplit    = "cache_split_unreconcilable"
 	AnomalyNotMeasurable = "backend_reports_no_usage"
 	AnomalyViewsDisagree = "views_disagree"
@@ -98,12 +99,15 @@ func (u Usage) settle() Usage {
 	if u.Prompt < u.CacheRead+u.CacheWrite {
 		u = u.WithAnomaly(Anomaly{Code: AnomalyInputUnknown})
 	}
+	if u.Reasoning > u.Completion {
+		u = u.WithAnomaly(Anomaly{Code: AnomalyOutputUnknown})
+	}
 	u.Total = u.Prompt + u.Completion
 	return u
 }
 
 func (u Usage) Unmeasured() Usage {
-	if u.Reported || !u.Empty() {
+	if u.Reported || !u.counted() {
 		return u
 	}
 	return u.WithAnomaly(Anomaly{Code: AnomalyNotMeasurable})
@@ -182,9 +186,17 @@ func (u Usage) Uncached() (int, bool) {
 	return n, true
 }
 
+// Empty reports a usage carrying nothing at all, metadata included.
 func (u Usage) Empty() bool {
+	return u.counted() && u.Turns == 0 && u.DurationMS == 0
+}
+
+// counted reports a usage nobody put a number on. How long a call took and how
+// many turns it ran are worth keeping, but neither says what it cost, so
+// neither answers for the columns that do.
+func (u Usage) counted() bool {
 	return u.Prompt == 0 && u.Completion == 0 && u.CacheRead == 0 && u.CacheWrite == 0 &&
-		u.Reasoning == 0 && u.Turns == 0 && u.DurationMS == 0 && u.Cost == nil && !u.Reported
+		u.Reasoning == 0 && u.Cost == nil && !u.Reported
 }
 
 func (u Usage) Merge(next Usage) Usage {
@@ -248,7 +260,17 @@ func (u Usage) Cover(other Usage) Usage {
 	u.Turns = max(u.Turns, other.Turns)
 	u.DurationMS = max(u.DurationMS, other.DurationMS)
 	u.Reported = u.Reported || other.Reported
-	if other.Cost != nil && (u.Cost == nil || other.Cost.Amount > u.Cost.Amount) {
+	switch {
+	case other.Cost == nil:
+	case u.Cost == nil:
+		c := *other.Cost
+		u.Cost = &c
+	case u.Cost.Currency != other.Cost.Currency && u.Cost.Currency != "" && other.Cost.Currency != "":
+		// Two prices in two currencies do not compare, so the larger number is
+		// not the larger cost and neither may stand for the other.
+		u.Anomalies = appendAnomaly(u.Anomalies,
+			Anomaly{Code: AnomalyCurrencyMixed, Detail: u.Cost.Currency + "+" + other.Cost.Currency})
+	case other.Cost.Amount > u.Cost.Amount:
 		c := *other.Cost
 		u.Cost = &c
 	}
@@ -282,12 +304,21 @@ func newest64(cur, next int64) int64 {
 }
 
 func addCost(a, b *Cost, an []Anomaly) (*Cost, []Anomaly) {
+	// One turn priced and one not is not a priced total, whichever way round
+	// they were added: the sum would read as the whole bill.
+	partial := Anomaly{
+		Code:   AnomalyPriceMissing,
+		Detail: "one of the turns in this total carried no price",
+	}
 	switch {
 	case b == nil:
+		if a != nil {
+			an = appendAnomaly(an, partial)
+		}
 		return a, an
 	case a == nil:
 		c := *b
-		return &c, an
+		return &c, appendAnomaly(an, partial)
 	case a.Currency != b.Currency && a.Currency != "" && b.Currency != "":
 		return a, appendAnomaly(an, Anomaly{Code: AnomalyCurrencyMixed, Detail: a.Currency + "+" + b.Currency})
 	default:
@@ -299,13 +330,18 @@ func addCost(a, b *Cost, an []Anomaly) (*Cost, []Anomaly) {
 	}
 }
 
+// appendAnomaly never writes into the slice it was handed. Usage is a value
+// copied all over, and two copies each noticing something would otherwise write
+// into the same spare capacity and overwrite one another.
 func appendAnomaly(list []Anomaly, a Anomaly) []Anomaly {
 	for _, x := range list {
 		if x.Code == a.Code {
 			return list
 		}
 	}
-	return append(list, a)
+	out := make([]Anomaly, len(list), len(list)+1)
+	copy(out, list)
+	return append(out, a)
 }
 
 func mergeAnomalies(a, b []Anomaly) []Anomaly {

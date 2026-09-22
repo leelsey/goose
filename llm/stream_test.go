@@ -4,7 +4,9 @@
 package llm
 
 import (
+	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -427,5 +429,199 @@ func TestEndHooksAddRatherThanReplace(t *testing.T) {
 	}
 	if len(order) != 2 {
 		t.Fatalf("order = %v: the hooks run once however the stream ends", order)
+	}
+}
+
+func TestASecondTurnCutOffIsStillReported(t *testing.T) {
+	s := frames(
+		&Frame{Delta: []Part{&Text{Text: "calling a tool"}}},
+		&Frame{Stop: StopToolUse},
+		&Frame{TurnEnd: true},
+		&Frame{Delta: []Part{&Text{Text: "half an ans"}}},
+	)
+	drain(s)
+	e := AsError(s.Err())
+	if e == nil || e.Code != WireNoFinish {
+		t.Fatalf("err = %v: a turn that finished cannot vouch for the one cut off after it", s.Err())
+	}
+}
+
+func TestAWholeMultiTurnStreamIsNotCalledTruncated(t *testing.T) {
+	s := frames(
+		&Frame{Delta: []Part{&Text{Text: "calling a tool"}}},
+		&Frame{Stop: StopToolUse},
+		&Frame{TurnEnd: true},
+		&Frame{Delta: []Part{&Text{Text: "the answer"}}},
+		&Frame{Stop: StopEnd},
+		&Frame{TurnEnd: true},
+	)
+	drain(s)
+	if s.Err() != nil {
+		t.Fatalf("err = %v: every turn said why it ended", s.Err())
+	}
+}
+
+func TestAnAbandonedStreamIsClosedAndBooked(t *testing.T) {
+	closed, ended := false, false
+	queue := []*Frame{
+		{Delta: []Part{&Text{Text: "one"}}},
+		{Delta: []Part{&Text{Text: "two"}}},
+		{Stop: StopEnd},
+	}
+	next := func() (*Frame, error) {
+		if len(queue) == 0 {
+			return nil, nil
+		}
+		f := queue[0]
+		queue = queue[1:]
+		return f, nil
+	}
+	s := NewStream(StreamMeta{Provider: "stub"}, next, func() error { closed = true; return nil })
+	s.OnEnd(func(*Stream) { ended = true })
+
+	for range s.Frames() {
+		break
+	}
+	if !closed {
+		t.Fatal("a consumer that stops reading leaves the body open unless the stream closes itself")
+	}
+	if !ended {
+		t.Fatal("nothing else will book what the call cost")
+	}
+}
+
+func TestClosingWhileReadingIsSafe(t *testing.T) {
+	for range 50 {
+		gate := make(chan struct{})
+		n := 0
+		next := func() (*Frame, error) {
+			n++
+			if n > 200 {
+				return nil, nil
+			}
+			i := n % 4
+			return &Frame{Choice: &i, Delta: []Part{&Text{Text: "x"}}}, nil
+		}
+		s := NewStream(StreamMeta{Provider: "stub"}, next, func() error { return nil })
+		s.OnEnd(func(done *Stream) {
+			_ = done.Usage()
+			_ = done.Diagnostics()
+			done.Record(Attempted{Provider: "stub"})
+		})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-gate
+			for range s.Frames() {
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-gate
+			_ = s.Close()
+		}()
+		close(gate)
+		wg.Wait()
+	}
+}
+
+func TestACandidateLeftOpenIsNotForgivenByALaterTurn(t *testing.T) {
+	one, two := 0, 1
+	s := frames(
+		&Frame{Choice: &one, Delta: []Part{&Text{Text: "first"}}},
+		&Frame{Choice: &two, Delta: []Part{&Text{Text: "second"}}},
+		&Frame{Choice: &one, Stop: StopToolUse},
+		// Candidate two never said why it stopped.
+		&Frame{TurnEnd: true},
+		&Frame{Choice: &one, Delta: []Part{&Text{Text: "the answer"}}},
+		&Frame{Choice: &one, Stop: StopEnd},
+		&Frame{TurnEnd: true},
+	)
+	drain(s)
+	e := AsError(s.Err())
+	if e == nil || e.Code != WireNoFinish {
+		t.Fatalf("err = %v: one candidate was left open, and a later whole turn does not answer for it", s.Err())
+	}
+}
+
+// The candidate index is the upstream's to choose, so it must not be a key
+// goose will hold any number of — and a turn it could not track is not one it
+// may call complete.
+func TestCandidateIndicesAreBounded(t *testing.T) {
+	var frames []*Frame
+	for i := 0; i < maxChoices+50; i++ {
+		frames = append(frames, &Frame{Choice: &[]int{i}[0], Delta: []Part{&Text{Text: "x"}}})
+	}
+	frames = append(frames, &Frame{Choice: &[]int{0}[0], Stop: StopEnd})
+	s := StaticStream(StreamMeta{Model: "m"}, frames)
+	for range s.Frames() {
+	}
+	if len(s.open) > maxChoices {
+		t.Fatalf("open holds %d candidates: the upstream names them, so it must not choose the cost", len(s.open))
+	}
+	if s.Err() == nil {
+		t.Fatal("candidates goose never tracked cannot be vouched for as complete")
+	}
+}
+
+// A frame carrying an id, a model or a session says something, and a provider
+// that drops "empty" frames must not drop those.
+func TestAFrameThatNamesSomethingIsNotEmpty(t *testing.T) {
+	for _, f := range []*Frame{
+		{ID: "resp_1"},
+		{Model: "gpt-4o"},
+		{Session: "sess_1"},
+		{Extra: map[string]json.RawMessage{"x": json.RawMessage(`1`)}},
+		{StopSequence: "STOP"},
+	} {
+		if f.Empty() {
+			t.Errorf("%+v reads as empty, and a provider filtering on that would drop it", f)
+		}
+	}
+	if !(&Frame{}).Empty() {
+		t.Error("a frame carrying nothing is empty")
+	}
+}
+
+// Redaction is for what a backend said. goose's own account of a stream that
+// stopped short is goose's, and a client needs it to tell a cut-off answer
+// from a backend that failed.
+func TestGoosesOwnAccountIsNotRedacted(t *testing.T) {
+	s := StaticStream(StreamMeta{Provider: "up", Model: "m"}, []*Frame{
+		{Delta: []Part{&Text{Text: "half"}}},
+	})
+	s.Redact(func(*Error) *Error {
+		return &Error{Kind: KindUpstream, Message: "the backend could not be reached"}
+	})
+	for range s.Frames() {
+	}
+	e := AsError(s.Err())
+	if e == nil {
+		t.Fatal("a stream that never said why it stopped is not a complete one")
+	}
+	if e.Code != WireNoFinish {
+		t.Fatalf("code = %q, want %q: the client cannot tell a cut-off answer from an outage", e.Code, WireNoFinish)
+	}
+}
+
+// A frame belongs to whoever made it. Rewriting one on the way through would
+// change what a provider reusing its own frames sends the next reader.
+func TestRedactionDoesNotRewriteTheProvidersFrame(t *testing.T) {
+	original := &Error{Kind: KindRateLimit, Provider: "up", Message: "the backend's own words"}
+	frames := []*Frame{{Err: original}}
+	s := StaticStream(StreamMeta{Provider: "up"}, frames)
+	s.Redact(func(*Error) *Error { return &Error{Kind: KindRateLimit, Message: "generic"} })
+	for f := range s.Frames() {
+		if f.Err != nil && f.Err.Message != "generic" {
+			t.Fatalf("the consumer saw %q", f.Err.Message)
+		}
+	}
+	if original.Message != "the backend's own words" {
+		t.Fatalf("the provider's own frame was rewritten: %q", original.Message)
+	}
+	if frames[0].Err != original {
+		t.Fatal("the provider's slice now holds a different error")
 	}
 }
