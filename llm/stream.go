@@ -85,9 +85,8 @@ func (s *Stream) Committed() bool {
 func (s *Stream) Prime() error {
 	s.mu.Lock()
 	if s.primed || s.done {
-		err := s.err
 		s.mu.Unlock()
-		return err
+		return s.Err()
 	}
 	s.primed = true
 	if s.next == nil {

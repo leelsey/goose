@@ -224,6 +224,11 @@ func (u Usage) Merge(next Usage) Usage {
 }
 
 func (u Usage) Add(next Usage) Usage {
+	// One turn priced and one not is not a priced total, whichever way round
+	// they were added: the sum would read as the whole bill. An accumulator
+	// nobody has added to yet is not a turn that went free, so this is asked
+	// before the two are joined and while both are still in view.
+	partlyPriced := (u.Cost == nil) != (next.Cost == nil) && !u.Empty() && !next.Empty()
 	u.Prompt += next.Prompt
 	u.Completion += next.Completion
 	u.CacheRead += next.CacheRead
@@ -233,6 +238,12 @@ func (u Usage) Add(next Usage) Usage {
 	u.Turns += next.Turns
 	u.DurationMS += next.DurationMS
 	u.Reported = u.Reported || next.Reported
+	if partlyPriced {
+		u.Anomalies = appendAnomaly(u.Anomalies, Anomaly{
+			Code:   AnomalyPriceMissing,
+			Detail: "one of the turns in this total carried no price",
+		})
+	}
 	u.Cost, u.Anomalies = addCost(u.Cost, next.Cost, u.Anomalies)
 	if next.Tier != "" {
 		u.Tier = next.Tier
@@ -304,21 +315,12 @@ func newest64(cur, next int64) int64 {
 }
 
 func addCost(a, b *Cost, an []Anomaly) (*Cost, []Anomaly) {
-	// One turn priced and one not is not a priced total, whichever way round
-	// they were added: the sum would read as the whole bill.
-	partial := Anomaly{
-		Code:   AnomalyPriceMissing,
-		Detail: "one of the turns in this total carried no price",
-	}
 	switch {
 	case b == nil:
-		if a != nil {
-			an = appendAnomaly(an, partial)
-		}
 		return a, an
 	case a == nil:
 		c := *b
-		return &c, appendAnomaly(an, partial)
+		return &c, an
 	case a.Currency != b.Currency && a.Currency != "" && b.Currency != "":
 		return a, appendAnomaly(an, Anomaly{Code: AnomalyCurrencyMixed, Detail: a.Currency + "+" + b.Currency})
 	default:

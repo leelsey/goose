@@ -238,3 +238,23 @@ func TestBothReadersAgreeOnWhatALineIs(t *testing.T) {
 		t.Errorf("the line reader refused a line of exactly the ceiling: %v", l.Err())
 	}
 }
+
+// A CR and an LF that fall either side of a read boundary are still one
+// terminator, and the line they end is still the length it always was.
+func TestATerminatorSplitAcrossReadsIsStillOneTerminator(t *testing.T) {
+	for _, size := range []int{1<<16 - 1, 1 << 16, 1<<16 + 1} {
+		body := strings.Repeat("a", size) + "\r\n"
+		l := NewLines(strings.NewReader(body), size)
+		for l.Scan() {
+		}
+		if l.Err() != nil {
+			t.Errorf("a %d-byte line was refused by a %d-byte ceiling: %v", size, size, l.Err())
+		}
+		l = NewLines(strings.NewReader(body), size-1)
+		for l.Scan() {
+		}
+		if l.Err() == nil {
+			t.Errorf("a %d-byte line passed a %d-byte ceiling", size, size-1)
+		}
+	}
+}

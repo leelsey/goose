@@ -167,10 +167,12 @@ func (c *Client) call(ctx context.Context, method string, params map[string]any,
 	}
 	if resp.Error != nil {
 		// What a server puts in a message is its own text and reaches a model's
-		// context through a tool error, so it is kept to one line and named as
-		// the server's rather than repeated as this proxy's own.
-		return fmt.Errorf("mcp %s: %s: the server answered %d: %s",
-			c.name, method, resp.Error.Code, tame(resp.Error.Message))
+		// context through a tool error, so it is kept to one line. The refusal
+		// itself still travels, because version negotiation reads the code and
+		// the data off it.
+		refusal := *resp.Error
+		refusal.Message = tame(refusal.Message)
+		return fmt.Errorf("mcp %s: %s: %w", c.name, method, &refusal)
 	}
 	// JSON-RPC answers with a result or an error. Reading a frame that carries
 	// neither as success turns a tool that never ran into one that ran and said
@@ -429,11 +431,18 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			if json.Unmarshal(entry, &t) != nil || t.Name == "" {
 				continue
 			}
+			offered := t.Name
 			t.Name = usableName(t.Name)
+			if t.Name == "" {
+				// Cutting it would leave a name the server does not answer to,
+				// so it is not offered — and saying so is the whole point.
+				refused = append(refused, tame(offered))
+				continue
+			}
 			// A name offered twice is one tool. Keeping both copies shows the
 			// first to the model while the second decides what goes on the
 			// wire, so the definition on display would not be the one in use.
-			if _, taken := raw[t.Name]; taken || t.Name == "" || seen[t.Name] {
+			if _, taken := raw[t.Name]; taken || seen[t.Name] {
 				continue
 			}
 			seen[t.Name] = true

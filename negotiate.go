@@ -343,7 +343,11 @@ const maxNamedFields = 512
 func named(fields []string) string {
 	var b strings.Builder
 	for i, f := range fields {
-		if b.Len()+len(f)+1 > maxNamedFields {
+		sep := 0
+		if i > 0 {
+			sep = 1
+		}
+		if b.Len()+sep+len(f) > maxNamedFields {
 			if i > 0 {
 				b.WriteByte(',')
 			}

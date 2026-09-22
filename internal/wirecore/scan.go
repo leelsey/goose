@@ -147,8 +147,9 @@ func (s *Scanner) readLine() ([]byte, error) {
 	for {
 		chunk, err := s.r.ReadSlice('\n')
 		// The terminator is not part of the line, so a line of exactly the
-		// ceiling is a line that fits.
-		if n := len(buf) + len(trimEOL(chunk)); n > s.maxLine {
+		// ceiling is a line that fits — including when its CR and LF fell
+		// either side of a read boundary.
+		if n := len(trimEOL(append(buf, chunk...))); n > s.maxLine {
 			return nil, fmt.Errorf("%w: %d bytes", ErrLineTooLong, n)
 		}
 		buf = append(buf, chunk...)
@@ -195,7 +196,7 @@ func (l *Lines) Scan() bool {
 			chunk, err = l.r.ReadSlice('\n')
 			// The terminator is not part of the line, the same as it is not for
 			// the event scanner beside this.
-			if n := len(buf) + len(trimEOL(chunk)); n > l.maxLine {
+			if n := len(trimEOL(append(buf, chunk...))); n > l.maxLine {
 				l.err = fmt.Errorf("%w: %d bytes", ErrLineTooLong, n)
 				l.done = true
 				return false

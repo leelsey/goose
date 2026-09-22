@@ -250,3 +250,35 @@ func TestAnomaliesDoNotAliasAcrossCopies(t *testing.T) {
 		t.Fatalf("two = %+v", two.Anomalies)
 	}
 }
+
+// Every turn priced is a priced total, however many of them there are: an
+// accumulator that has not been added to yet is not a turn that went free.
+func TestAFullyPricedTotalSaysNothing(t *testing.T) {
+	var total Usage
+	for i := 0; i < 3; i++ {
+		total = total.Add(Usage{Prompt: 1, Cost: &Cost{Amount: 1, Currency: "USD"}})
+		if hasAnomaly(total, AnomalyPriceMissing) {
+			t.Fatalf("after turn %d: %+v, cost %+v", i+1, total.Anomalies, total.Cost)
+		}
+	}
+	if total.Cost == nil || total.Cost.Amount != 3 {
+		t.Fatalf("cost = %+v", total.Cost)
+	}
+}
+
+// A turn that carried no price is one, whichever side of the sum it lands on.
+func TestAPartlyPricedTotalSaysSoEitherWayRound(t *testing.T) {
+	priced := Usage{Prompt: 1, Cost: &Cost{Amount: 1, Currency: "USD"}}
+	free := Usage{Prompt: 1}
+	for _, tc := range []struct {
+		name string
+		got  Usage
+	}{
+		{"priced then free", priced.Add(free)},
+		{"free then priced", free.Add(priced)},
+	} {
+		if !hasAnomaly(tc.got, AnomalyPriceMissing) {
+			t.Errorf("%s: %+v", tc.name, tc.got.Anomalies)
+		}
+	}
+}

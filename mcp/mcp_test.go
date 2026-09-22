@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -2272,5 +2273,97 @@ func TestAStrayLineDoesNotKillTheCallItInterrupts(t *testing.T) {
 	}
 	if len(tools) != 1 || tools[0].Name != "echo" {
 		t.Fatalf("tools = %+v", tools)
+	}
+}
+
+// A server that refuses the revision goose asked for names the ones it does
+// speak, and goose is meant to pick from them rather than fall quietly back.
+func TestAVersionRefusalIsRenegotiatedNotSwallowed(t *testing.T) {
+	var asked []string
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		asked = append(asked, out.Method)
+		if out.Method == "server/discover" {
+			return &response{Error: &rpcError{
+				Code:    codeUnsupportedVersion,
+				Message: "unsupported protocol version",
+				Data:    json.RawMessage(`{"supported":["1999-01-01"]}`),
+			}}, nil
+		}
+		return &response{Result: json.RawMessage(
+			`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	err := c.connect(context.Background())
+	if err == nil {
+		t.Fatalf("a server offering only %q was accepted, methods = %v", "1999-01-01", asked)
+	}
+	if !errors.Is(err, errIncompatible) {
+		t.Fatalf("err = %v, want the refusal to be read as one", err)
+	}
+}
+
+// A name goose will not carry is a tool the operator should hear about, not
+// one that quietly stops existing.
+func TestARefusedNameIsReported(t *testing.T) {
+	bad, _ := json.Marshal("bad" + string(rune(1)) + "name")
+	long, _ := json.Marshal(strings.Repeat("n", maxSaid+1))
+	entries := []string{
+		`{"name":"good","inputSchema":{"type":"object"}}`,
+		`{"name":` + string(bad) + `,"inputSchema":{"type":"object"}}`,
+		`{"name":` + string(long) + `,"inputSchema":{"type":"object"}}`,
+	}
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "good" {
+		t.Fatalf("tools = %+v", tools)
+	}
+	if len(c.Refused()) != 2 {
+		t.Fatalf("refused = %q: two names were not carried and nothing said so", c.Refused())
+	}
+	for _, name := range c.Refused() {
+		for _, r := range name {
+			if r < 0x20 || r == 0x7f {
+				t.Errorf("refused name %q reaches a status table with a control character in it", name)
+			}
+		}
+	}
+}
+
+// A tool result is what the tool said. A wire with no block of its own for one
+// carries what it said, not the name of its kind.
+func TestAPartWithNoBlockCarriesWhatItSays(t *testing.T) {
+	blocks := encodeContent([]llm.Part{
+		&llm.Thinking{Text: "the reasoning", Signature: "sig"},
+		&llm.ToolResult{ID: "t1", IsError: true, Content: []llm.Part{&llm.Text{Text: "it blew up"}}},
+	})
+	if len(blocks) != 2 {
+		t.Fatalf("blocks = %d", len(blocks))
+	}
+	joined := string(blocks[0]) + string(blocks[1])
+	for _, want := range []string{"the reasoning", "it blew up"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%q did not survive: %s", want, joined)
+		}
+	}
+	for _, leak := range []string{"Signature", "IsError", "llm."} {
+		if strings.Contains(joined, leak) {
+			t.Errorf("%q is goose's own field name and reached a model: %s", leak, joined)
+		}
 	}
 }

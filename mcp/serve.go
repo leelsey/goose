@@ -43,7 +43,10 @@ func (m *Manager) modern(ctx context.Context, req *request, agreement meta, seen
 		// vouch for, and waving them through is the one answer it must not give.
 		expected, err := paramHeaders(m.schemaOf(params.Name), params.Arguments)
 		if err != nil {
-			return nil, &rpcError{Code: -32602, Message: err.Error(), status: 400}
+			return nil, &rpcError{
+				Code: -32602, status: 400,
+				Message: "the arguments are not an object",
+			}
 		}
 		if bad := seen.checkParams(expected); bad != nil {
 			return nil, bad

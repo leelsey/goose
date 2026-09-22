@@ -57,14 +57,24 @@ func mustJSON(v any) json.RawMessage {
 // for it: its text where it has some, and otherwise what it is. Never goose's
 // own field names, which are not something a model should be reading.
 func describe(p llm.Part) string {
-	if text := llm.TextOf([]llm.Part{p}); text != "" {
-		return text
-	}
-	if v, ok := p.(*llm.ToolUse); ok {
+	switch v := p.(type) {
+	case *llm.Text:
+		return v.Text
+	case *llm.Thinking:
+		return v.Text
+	case *llm.Refusal:
+		return v.Text
+	case *llm.ToolUse:
 		if len(v.Args) > 0 {
 			return v.Name + " " + string(v.Args)
 		}
 		return v.Name
+	case *llm.ToolResult:
+		inner := llm.TextOf(v.Content)
+		if v.IsError {
+			return "error: " + inner
+		}
+		return inner
 	}
 	return string(p.Kind())
 }

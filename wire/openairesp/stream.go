@@ -375,9 +375,11 @@ func (s *streamer) closeItem() {
 			"part": contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}},
 		})
 		it := item{Type: "message", ID: s.itemID, Role: "assistant", Status: "completed"}
-		if s.buf != "" {
-			it.Content = append(it.Content, contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}})
-		}
+		// The text part was announced when the message opened, so it is carried
+		// whether or not anything was written into it: a client that followed
+		// the events and one that read the closing object have to agree on
+		// which part sits at which index.
+		it.Content = append(it.Content, contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}})
 		// The part was announced when the refusal opened, so it is closed on
 		// the way out whether or not anything fitted in it.
 		if s.refusalOpen {

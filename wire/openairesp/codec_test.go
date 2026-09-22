@@ -420,3 +420,59 @@ func keysOf(m map[string]json.RawMessage) []string {
 	sort.Strings(out)
 	return out
 }
+
+// Every part the stream announces is a part the closing item carries, at the
+// index the stream gave it. A client that followed the events and a client
+// that read the final object must end up with the same answer.
+func TestTheClosingItemCarriesEveryPartTheStreamAnnounced(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		frames []*llm.Frame
+	}{
+		{"refusal only", []*llm.Frame{
+			{Delta: []llm.Part{&llm.Refusal{Text: "I can't help with that."}}},
+			{Stop: llm.StopRefusal, TurnEnd: true},
+		}},
+		{"text then refusal", []*llm.Frame{
+			{Delta: []llm.Part{&llm.Text{Text: "hm"}}},
+			{Delta: []llm.Part{&llm.Refusal{Text: "no"}}},
+			{Stop: llm.StopRefusal, TurnEnd: true},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := llm.StaticStream(llm.StreamMeta{Model: "m"}, tc.frames)
+			w := &wire.BufferWriter{}
+			if _, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, w); err != nil {
+				t.Fatal(err)
+			}
+			announced := map[float64]bool{}
+			var final []map[string]any
+			for _, line := range strings.Split(w.Body.String(), "\n") {
+				raw, ok := strings.CutPrefix(line, "data: ")
+				if !ok {
+					continue
+				}
+				var ev map[string]any
+				if json.Unmarshal([]byte(raw), &ev) != nil {
+					continue
+				}
+				switch ev["type"] {
+				case "response.content_part.added":
+					announced[ev["content_index"].(float64)] = true
+				case "response.output_item.done":
+					it, _ := ev["item"].(map[string]any)
+					if it["type"] == "message" {
+						parts, _ := it["content"].([]any)
+						final = nil
+						for _, p := range parts {
+							final = append(final, p.(map[string]any))
+						}
+					}
+				}
+			}
+			if len(final) != len(announced) {
+				t.Fatalf("announced %d parts, the closing item carries %d: %v", len(announced), len(final), final)
+			}
+		})
+	}
+}
