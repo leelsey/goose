@@ -41,12 +41,19 @@ func (l *local) Tools(context.Context) ([]llm.Tool, error) { return l.Cached(), 
 func (l *local) Call(ctx context.Context, name string, args json.RawMessage) (*Result, error) {
 	fn, ok := l.calls[name]
 	if !ok {
-		return nil, fmt.Errorf("mcp: %s offers no tool named %q", l.name, name)
+		said, _ := quoted(name)
+		return nil, fmt.Errorf("mcp %s: %w: %s", l.name, errNoSuchTool, said)
 	}
 	if len(args) == 0 {
 		args = json.RawMessage(`{}`)
 	}
-	return fn(ctx, args)
+	out, err := fn(ctx, args)
+	if err != nil {
+		// A tool registered here chose these words as freely as a server over
+		// a wire chooses its own, so they arrive named the same way.
+		return nil, fmt.Errorf("mcp %s: %s: %w", l.name, name, err)
+	}
+	return out, nil
 }
 
 func (l *local) Close() error { return nil }

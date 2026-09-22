@@ -11,7 +11,14 @@ import (
 	"github.com/leelsey/goose/llm"
 )
 
-func encodeContent(parts []llm.Part) []json.RawMessage {
+// A tool result holds parts, and a part can be a tool result. Nothing about a
+// structure goose did not build says that it ends, and a stack that runs out
+// is not an error a process recovers from.
+const maxNesting = 16
+
+func encodeContent(parts []llm.Part) []json.RawMessage { return encodeParts(parts, 0) }
+
+func encodeParts(parts []llm.Part, depth int) []json.RawMessage {
 	out := make([]json.RawMessage, 0, len(parts))
 	for _, p := range parts {
 		switch v := p.(type) {
@@ -34,7 +41,13 @@ func encodeContent(parts []llm.Part) []json.RawMessage {
 			if v.IsError {
 				out = append(out, mustJSON(map[string]any{"type": "text", "text": "error"}))
 			}
-			out = append(out, encodeContent(v.Content)...)
+			if depth >= maxNesting {
+				out = append(out, mustJSON(map[string]any{
+					"type": "text", "text": "nested too deeply to carry",
+				}))
+				continue
+			}
+			out = append(out, encodeParts(v.Content, depth+1)...)
 		case *llm.Raw:
 			if v.Vendor == "mcp" && json.Valid(v.JSON) {
 				out = append(out, v.JSON)
@@ -61,24 +74,29 @@ func mustJSON(v any) json.RawMessage {
 }
 
 // describe says what a part is in words, for a wire with no block of its own
-// for it: its text where it has some, and otherwise what it is. Never goose's
-// own field names, which are not something a model should be reading.
-// describe says what a part is in words, for a wire with no block of its own
-// for it. Never goose's own names, which are not something a model should be
-// reading: a part with nothing readable in it says nothing.
+// for it: its text where it has some, and otherwise which kind of block it
+// was. Never goose's own field or type names — a kind is the same word every
+// wire here uses for that block, and is what is left to say when the part
+// carries nothing a caller could read.
 func describe(p llm.Part) string {
 	switch v := p.(type) {
 	case *llm.Text:
-		return v.Text
+		if v.Text != "" {
+			return v.Text
+		}
 	case *llm.Thinking:
-		return v.Text
+		if v.Text != "" {
+			return v.Text
+		}
 	case *llm.Refusal:
-		return v.Text
+		if v.Text != "" {
+			return v.Text
+		}
 	case *llm.ToolUse:
 		if len(v.Args) > 0 {
 			return v.Name + " " + string(v.Args)
 		}
 		return v.Name
 	}
-	return ""
+	return string(p.Kind())
 }

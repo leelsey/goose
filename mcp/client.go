@@ -345,8 +345,11 @@ func (c *Client) initialise(ctx context.Context) error {
 // The whole catalogue is walked for every request and held for as long as the
 // server is configured, so how much of it there is cannot be the server's to
 // choose. This is far past any catalogue a model could be offered in one call.
+// A name goose will not carry is held too, and on a ceiling of its own: both
+// are bounded, and neither can be spent to leave no room for the other.
 const (
 	maxTools     = 2048
+	maxRefused   = 256
 	maxToolPages = 100
 )
 
@@ -368,9 +371,16 @@ func headerSafe(version string) bool {
 // cursor and rewrite the line above it.
 const maxSaid = 128
 
-func tame(s string) string {
-	if len(s) > maxSaid {
-		cut := maxSaid
+// A line that passes somebody else's words on carries goose's own account of
+// what failed as well, so it is held to a ceiling of its own rather than the
+// one a single name or version is held to.
+const maxAccount = 1024
+
+func tame(s string) string { return tameTo(s, maxSaid) }
+
+func tameTo(s string, max int) string {
+	if len(s) > max {
+		cut := max
 		for cut > 0 && !utf8.RuneStart(s[cut]) {
 			cut--
 		}
@@ -400,6 +410,20 @@ func usableName(name string) string {
 		}
 	}
 	return name
+}
+
+// quoted says a name goose would not carry, in a form that cannot be mistaken
+// for one it did: what made the name unusable reads as an escape rather than
+// moving the cursor, and stays in, so the name is not reported as the name of
+// some other tool that happens to be left once it is taken out. A name too
+// long to print whole is measured rather than cut, for the same reason a name
+// too long to carry is refused rather than cut, and the second return says
+// which of the two came back.
+func quoted(name string) (string, bool) {
+	if q := strconv.Quote(name); len(q) <= maxSaid {
+		return q, true
+	}
+	return fmt.Sprintf("a name of %d bytes", len(name)), false
 }
 
 func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
@@ -432,25 +456,35 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			if json.Unmarshal(entry, &t) != nil || t.Name == "" {
 				continue
 			}
-			offered, name := tame(t.Name), usableName(t.Name)
+			name := usableName(t.Name)
 			// A name offered twice is one tool. Keeping both copies shows the
 			// first to the model while the second decides what goes on the
 			// wire, so the definition on display would not be the one in use.
 			// The two sets are kept apart because the two names are judged
 			// differently: one that cannot be carried must not stand in front
-			// of one that can just because they read alike once tamed.
+			// of one that can just because they read alike once the characters
+			// that made it unusable are taken out.
 			// A refusal counts against the ceiling too, since how many of them
 			// there are is no more the server's to choose than how many tools.
 			if name == "" {
 				// Cutting it would leave a name the server does not answer to,
 				// so it is not offered — and saying so is the whole point.
-				if offered == "" || dropped[offered] {
-					continue
+				// Only a name said exactly can be recognised as one already
+				// said; two merely measured are two refusals, which the
+				// ceiling below is what bounds.
+				offered, exact := quoted(t.Name)
+				if exact {
+					if dropped[offered] {
+						continue
+					}
+					dropped[offered] = true
 				}
-				dropped[offered] = true
-				if len(out)+len(refused) >= maxTools {
+				// Held on its own, so that a run of names goose will not carry
+				// cannot spend the catalogue saying so and leave no room for
+				// the tools behind it. The rest of the list is still read.
+				if len(refused) >= maxRefused {
 					truncated = true
-					break
+					continue
 				}
 				refused = append(refused, offered)
 				continue
@@ -459,7 +493,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 				continue
 			}
 			seen[name] = true
-			if len(out)+len(refused) >= maxTools {
+			if len(out) >= maxTools {
 				truncated = true
 				break
 			}

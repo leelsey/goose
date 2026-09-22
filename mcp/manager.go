@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -15,6 +16,10 @@ import (
 
 	"github.com/leelsey/goose/llm"
 )
+
+// A name no server answers to is the caller having asked for something that is
+// not there, which is a different answer from a tool that ran and failed.
+var errNoSuchTool = errors.New("no server offers a tool by that name")
 
 type TransportKind string
 
@@ -319,7 +324,10 @@ func (m *Manager) Call(ctx context.Context, name string, args json.RawMessage) (
 	e, ok := m.index[name]
 	m.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("mcp: no server offers a tool named %q", name)
+		// The name came from the caller, so it is said back the way any other
+		// name goose will not carry is said.
+		said, _ := quoted(name)
+		return nil, fmt.Errorf("mcp: %w: %s", errNoSuchTool, said)
 	}
 	return e.src.Call(ctx, e.tool, args)
 }

@@ -227,6 +227,12 @@ func empty(v any) bool {
 }
 
 func normalise(body map[string]any) {
+	// This wire takes a stop sequence as a string or as a list of them, and a
+	// list holding the one string is that string. Reading it as the list it
+	// also means is not the request changing under the caller.
+	if only, ok := body["stop"].(string); ok {
+		body["stop"] = []any{only}
+	}
 	msgs, ok := body["messages"].([]any)
 	if !ok {
 		return

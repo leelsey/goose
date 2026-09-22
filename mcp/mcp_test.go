@@ -2607,3 +2607,189 @@ func TestAToolServersCodeIsNotRelayedAsGooses(t *testing.T) {
 		}
 	}
 }
+
+// A call that fails says why, and those words reach an operator's terminal and
+// a caller's log. The server that chose them, the local tool that ran, and the
+// caller that chose the name are all somebody else: none of them gets to move
+// the cursor, and none of them decides how long the line is.
+func TestWhatAFailedCallSaysIsHeldToALine(t *testing.T) {
+	esc := string([]byte{0x1b})
+	m := NewManager()
+	defer m.Close()
+	if err := m.Serve("goose", Tool{
+		Definition: llm.Tool{Name: "boom"},
+		Call: func(context.Context, json.RawMessage) (*Result, error) {
+			return nil, fmt.Errorf("%s[2K\rall is well%s", esc, strings.Repeat("x", 200000))
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(m.Handler())
+	defer front.Close()
+
+	ask := func(name string) *rpcError {
+		t.Helper()
+		params, err := json.Marshal(map[string]any{"name": name, "arguments": map[string]any{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reply struct {
+			Error *rpcError `json:"error"`
+		}
+		body := rpc(t, front, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":`+string(params)+`}`)
+		if err := json.Unmarshal([]byte(body), &reply); err != nil {
+			t.Fatalf("%v: %s", err, body)
+		}
+		if reply.Error == nil {
+			t.Fatalf("no error came back: %s", body)
+		}
+		return reply.Error
+	}
+
+	for _, tc := range []struct {
+		what string
+		name string
+		code int
+	}{
+		{"a tool that ran and failed", "boom", -32603},
+		{"a name nobody serves, chosen by the caller", strings.Repeat("n", 1<<22) + esc + "[2K", -32602},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			e := ask(tc.name)
+			if len(e.Message) > maxAccount {
+				t.Errorf("message = %d bytes, want at most %d", len(e.Message), maxAccount)
+			}
+			for _, r := range e.Message {
+				if r < 0x20 || r == 0x7f {
+					t.Fatalf("message carries %q, which rewrites the line it is printed on: %q", r, e.Message)
+				}
+			}
+			if e.Code != tc.code {
+				t.Errorf("code = %d, want %d", e.Code, tc.code)
+			}
+		})
+	}
+}
+
+// A tool result holds parts, and a part can be a tool result. Somebody else's
+// structure is not a promise that it ends.
+func TestAToolResultThatHoldsItselfStillReturns(t *testing.T) {
+	loop := &llm.ToolResult{ID: "t1"}
+	loop.Content = []llm.Part{&llm.Text{Text: "once"}, loop}
+	if blocks := encodeContent([]llm.Part{loop}); len(blocks) == 0 {
+		t.Fatal("nothing came out of a result that holds itself")
+	}
+}
+
+// A part this wire has no block for is still a part the tool produced. What it
+// says travels where it says anything, and where it says nothing the kind of
+// block it was travels instead, so it does not quietly stop existing.
+func TestAPartWithNothingReadableStillSaysWhatItIs(t *testing.T) {
+	blocks := encodeContent([]llm.Part{&llm.Thinking{Signature: "opaque to everyone here"}})
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %d, want 1: the part vanished", len(blocks))
+	}
+	got := string(blocks[0])
+	if !strings.Contains(got, string(llm.KindThinking)) {
+		t.Errorf("block = %s, want it to say which kind of block it was", got)
+	}
+	if strings.Contains(got, "opaque to everyone here") {
+		t.Errorf("a signature is for the vendor that wrote it, not for a caller: %s", got)
+	}
+}
+
+// A refusal names the name that was refused. Taking the characters out that
+// made it unusable turns it into some other tool's name, and an operator would
+// be told a tool it is being served was refused.
+func TestARefusedNameIsNotTheNameOfAToolThatIsServed(t *testing.T) {
+	var entries []string
+	for _, name := range []string{
+		"read_file",
+		"read_file" + string(rune(1)),
+		string(rune(1)) + string(rune(2)),
+		strings.Repeat("a", maxSaid+1) + "one",
+		strings.Repeat("a", maxSaid+1) + "two",
+	} {
+		quoted, err := json.Marshal(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, `{"name":`+string(quoted)+`,"inputSchema":{"type":"object"}}`)
+	}
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "read_file" {
+		t.Fatalf("tools = %+v", tools)
+	}
+	refused := c.Refused()
+	if len(refused) != 4 {
+		t.Fatalf("refused = %q, want four: one of them was counted as another", refused)
+	}
+	for _, name := range refused {
+		if name == tools[0].Name {
+			t.Errorf("refused = %q: it names the tool that is being served", refused)
+		}
+		for _, r := range name {
+			if r < 0x20 || r == 0x7f {
+				t.Errorf("refused name %q reaches a status table with a control character in it", name)
+			}
+		}
+	}
+}
+
+// A server that offers nothing goose can carry should not be able to spend the
+// catalogue saying so. The tools behind a run of refusals are still tools.
+func TestARunOfRefusalsLeavesRoomForTheToolsBehindThem(t *testing.T) {
+	var entries []string
+	for i := range maxTools + 100 {
+		name, err := json.Marshal(fmt.Sprintf("bad%d%s", i, string(rune(1))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, `{"name":`+string(name)+`,"inputSchema":{"type":"object"}}`)
+	}
+	entries = append(entries, `{"name":"read_file","inputSchema":{"type":"object"}}`)
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "read_file" {
+		t.Fatalf("tools = %d, a run of names goose would not carry took the catalogue with them", len(tools))
+	}
+	if n := len(c.Refused()); n > maxRefused {
+		t.Errorf("refused = %d, want at most %d", n, maxRefused)
+	}
+	if !c.Truncated() {
+		t.Error("the list was cut and nothing said so")
+	}
+}
