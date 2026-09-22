@@ -16,14 +16,19 @@ const maxHeld = 64 << 10
 
 // Held is what a codec is carrying forward from frames that wrote nothing.
 //
-// Fields still waiting when a stream ends are not reported. It was tried, and
-// the routine case and the one worth hearing about have the same shape: goose
-// asks every OpenAI-dialect backend for its usage, so one of those streams
-// always ends with a contentless chunk, and OpenAI puts a fresh pad on every
-// chunk including that one. A caller that did not ask for usage gets no chunk
-// to put it on. So the last thing a stream strands is, on the commonest pairing
-// there is, a random pad nobody wants — indistinguishable from a vendor payload
-// somebody does. Saying so meant saying it about nearly every stream.
+// Fields still waiting when a stream ends are not reported. It was tried twice
+// and neither mark was worth what it cost. Remembering a field by name alone
+// misses the case the report was written for, a field that rode every chunk as
+// an identifier and arrives on the last one carrying the payload. Remembering
+// it by name and value catches that, and also calls every field a backend
+// changes between chunks a loss, which on a stream that ends with a chunk
+// carrying no content — the shape goose asks for whenever it asks for usage —
+// is most of them. Reading every value on every chunk to find that out cost
+// twenty seconds a stream where it had cost microseconds.
+//
+// If the signal is ever wanted back, it is the first case that can be reported
+// without ambiguity: a name that rode no chunk at all, marked in a fixed size.
+// The second cannot be, and nothing cheap recovers it.
 type Held struct {
 	fields map[string]json.RawMessage
 	weight int

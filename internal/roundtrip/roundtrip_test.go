@@ -394,9 +394,9 @@ func TestAnOrdinaryStreamReportsNoLoss(t *testing.T) {
 		// the contentless last one — the shape that decides whether the end of
 		// a stream can be read as a loss.
 		for _, b := range []string{
-			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","obfuscation":"aaa","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`,
-			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","obfuscation":"bbb","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
-			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","obfuscation":"ccc","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","x_backend_nonce":"aaa","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","x_backend_nonce":"bbb","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp_9","x_backend_nonce":"ccc","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
 		} {
 			_, _ = w.Write([]byte(chunk(b)))
 			w.(http.Flusher).Flush()
@@ -432,5 +432,16 @@ func TestAnOrdinaryStreamReportsNoLoss(t *testing.T) {
 	}
 	if got := resp.Header.Get(httpx.DiagnosticsHeader); got != "" {
 		t.Errorf("an ordinary stream reported %q\n%s", got, body)
+	}
+	// The stream has to be the one this is about, or it holds nothing: the
+	// answer arrived, the fields goose has no place for travelled, and the one
+	// on the chunk with no content was in fact left behind.
+	for _, want := range []string{`"content":"hi"`, `"x_backend_nonce":"bbb"`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("%s did not reach the caller\n%s", want, body)
+		}
+	}
+	if strings.Contains(string(body), `"ccc"`) {
+		t.Error("nothing was stranded, so this says nothing about what is said when something is")
 	}
 }

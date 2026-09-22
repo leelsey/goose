@@ -202,11 +202,11 @@ were left alone.
   one set of them by the time the next chunk could carry either, on the OpenAI
   and Ollama streams. They are all carried now, up to what one chunk will hold,
   and that ceiling is reported rather than the rest going quietly. Fields still
-  waiting when a stream ends are not reported: goose asks every OpenAI-dialect
-  backend for its usage, so one of those streams always ends with a contentless
-  chunk that a caller who did not ask for usage gets nowhere to put, and what it
-  carries is a fresh pad nobody wants that cannot be told from a vendor payload
-  somebody does.
+  waiting when a stream ends are not reported: a backend goose asks for usage
+  ends its stream with a chunk carrying no content, a caller who did not ask for
+  usage gets nowhere to put that chunk's fields, and whatever the backend was
+  decorating its chunks with cannot be told there from a vendor payload somebody
+  wants.
 
 ### Added
 
