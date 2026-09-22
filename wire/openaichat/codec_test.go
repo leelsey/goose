@@ -6,6 +6,7 @@ package openaichat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -420,5 +421,32 @@ func TestFieldsHeldBackFromTwoQuietFramesBothTravel(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("%s did not survive: a quiet frame's unmodelled fields were dropped\n%s", want, body)
 		}
+	}
+}
+
+// How many frames carry nothing but fields this wire does not model is the
+// upstream's to choose, so what waits for a chunk to carry them is bounded and
+// the ceiling is said rather than the rest quietly going along.
+func TestFieldsHeldBackAreBoundedAndTheCeilingIsSaid(t *testing.T) {
+	const quiet = 20000
+	frames := []*llm.Frame{{Delta: []llm.Part{&llm.Text{Text: "hi"}}}}
+	for i := range quiet {
+		frames = append(frames, &llm.Frame{Extra: map[string]json.RawMessage{
+			fmt.Sprintf("field%d", i): json.RawMessage(`"some value or other"`),
+		}})
+	}
+	frames = append(frames,
+		&llm.Frame{Delta: []llm.Part{&llm.Text{Text: " there"}}},
+		&llm.Frame{Stop: llm.StopEnd})
+
+	w, diags, err := streamOf(t, wire.Options{Stream: true}, frames...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(w.Body.String(), `"field`); n >= quiet {
+		t.Errorf("one chunk carried %d held fields: what waits is the upstream's to choose", n)
+	}
+	if !hasCode(diags, llm.DropExtraField) {
+		t.Error("fields were left behind and nothing said so")
 	}
 }

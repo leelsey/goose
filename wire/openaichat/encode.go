@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/wire"
 )
@@ -263,23 +264,9 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 	// the next chunk out where that frame produced none. Latching it and
 	// repeating it on every later chunk re-sends the upstream's own bytes once
 	// per delta; dropping it loses what only that frame carried.
-	var held map[string]json.RawMessage
+	var held wirecore.Held
 	send := func(ch outChoice, usage *outUsage, extra map[string]json.RawMessage) error {
-		if len(held) > 0 {
-			if extra == nil {
-				extra = held
-			} else {
-				merged := map[string]json.RawMessage{}
-				for k, v := range held {
-					merged[k] = v
-				}
-				for k, v := range extra {
-					merged[k] = v
-				}
-				extra = merged
-			}
-			held = nil
-		}
+		extra = held.Carry(extra)
 		body := outBody{ID: id, Object: "chat.completion.chunk", Created: created, Model: model, Choices: []outChoice{ch}, Usage: usage, Tier: tier}
 		if ch.Delta == nil && ch.FinishReason == nil && usage != nil {
 			body.Choices = []outChoice{}
@@ -347,11 +334,12 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			// are two sets of them. The later is not a replacement for the
 			// earlier, and the map is goose's own so the frame's is not written
 			// through.
-			if held == nil {
-				held = make(map[string]json.RawMessage, len(fr.Extra))
-			}
-			for k, v := range fr.Extra {
-				held[k] = v
+			if held.Keep(fr.Extra) {
+				diags = append(diags, llm.Diagnostic{
+					Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageResponse,
+					Severity: llm.SeverityLoss, Field: "extra",
+					Detail: "more fields waited for a chunk to carry them than one chunk will hold",
+				})
 			}
 		}
 	}

@@ -308,23 +308,9 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 	// the next chunk out where that frame produced none. Repeating it on every
 	// later chunk re-sends the upstream's bytes per delta; dropping it loses
 	// what only that frame carried.
-	var held map[string]json.RawMessage
+	var held wirecore.Held
 	send := func(b chatBody, extra map[string]json.RawMessage) error {
-		if len(held) > 0 {
-			if extra == nil {
-				extra = held
-			} else {
-				merged := map[string]json.RawMessage{}
-				for k, v := range held {
-					merged[k] = v
-				}
-				for k, v := range extra {
-					merged[k] = v
-				}
-				extra = merged
-			}
-			held = nil
-		}
+		extra = held.Carry(extra)
 		raw, err := wire.WithExtra(mustJSON(b), extra)
 		if err != nil {
 			return err
@@ -383,11 +369,12 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 			// are two sets of them. The later is not a replacement for the
 			// earlier, and the map is goose's own so the frame's is not written
 			// through.
-			if held == nil {
-				held = make(map[string]json.RawMessage, len(fr.Extra))
-			}
-			for k, v := range fr.Extra {
-				held[k] = v
+			if held.Keep(fr.Extra) {
+				diags = append(diags, llm.Diagnostic{
+					Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageResponse,
+					Severity: llm.SeverityLoss, Field: "extra",
+					Detail: "more fields waited for a chunk to carry them than one chunk will hold",
+				})
 			}
 		}
 		if fr.Stop != llm.StopNone {

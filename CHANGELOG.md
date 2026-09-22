@@ -197,7 +197,8 @@ were left alone.
   the only sink configured.
 - Two consecutive frames carrying nothing but fields a wire does not model were
   one set of them by the time the next chunk could carry either, on the OpenAI
-  and Ollama streams.
+  and Ollama streams. They are all carried now, up to what one chunk will hold,
+  and the ceiling is reported rather than the rest going quietly.
 
 ### Added
 
