@@ -58,7 +58,11 @@ func New(o Options) (*openai.Provider, error) {
 		}
 		opts.BaseURL = base + "/openai"
 		opts.ChatPath = "/deployments/" + url.PathEscape(o.Deployment) + "/chat/completions"
-		opts.ResponsesPath = "/deployments/" + url.PathEscape(o.Deployment) + "/responses"
+		// Chat is addressed by the path on this surface. Responses is the one
+		// shape the deployment segment does not belong in: it is named in the
+		// body instead, and in no other body.
+		opts.ResponsesPath = "/responses"
+		opts.ResponsesBody = map[string]any{"model": o.Deployment}
 		opts.Query = "api-version=" + url.QueryEscape(o.APIVersion)
 	}
 

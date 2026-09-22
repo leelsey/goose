@@ -5,6 +5,7 @@ package agentcli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -519,6 +520,17 @@ func TestTheWholeTurnShapeIsRead(t *testing.T) {
 	}
 }
 
+func TestAStreamedTurnIsNotRepeatedByTheLineThatClosesIt(t *testing.T) {
+	p := provider(t, Claude, "fake-claude-partial-then-whole.sh", nil)
+	text, usage := drain(t, p)
+	if text != "whole answer" {
+		t.Fatalf("text = %q: the deltas carried the turn, so restating it whole must not add a second copy", text)
+	}
+	if usage.Prompt != 11 || usage.Completion != 4 {
+		t.Fatalf("usage = %+v", usage)
+	}
+}
+
 func TestAnAnswerOnlyTheClosingLineCarriesStillArrives(t *testing.T) {
 	p := provider(t, Claude, "fake-claude-only-result.sh", nil)
 	text, usage := drain(t, p)
@@ -672,5 +684,104 @@ func TestTheBinarysOwnTurnCountIsKept(t *testing.T) {
 	}
 	if got := s.Usage().Turns; got != 5 {
 		t.Fatalf("turns = %d, want 5: the binary said how many it billed", got)
+	}
+}
+
+func TestCodexToolArgumentsCarryTheCallNotItsLabel(t *testing.T) {
+	raw := json.RawMessage(`{"id":"i2","type":"command_execution","name":"shell","message":"running","command":"ls -la"}`)
+	got := string(codexToolArgs(raw))
+	for _, gone := range []string{`"id"`, `"type"`, `"name"`, `"message"`} {
+		if strings.Contains(got, gone) {
+			t.Fatalf("args = %s: %s names the call, it does not describe it", got, gone)
+		}
+	}
+	if !strings.Contains(got, `"command":"ls -la"`) {
+		t.Fatalf("args = %s: what the tool was asked to do must survive", got)
+	}
+}
+
+func TestARestatedTurnStillCarriesWhatTheDeltasCouldNot(t *testing.T) {
+	kept := unstreamed([]llm.Part{
+		&llm.Text{Text: "streamed"},
+		&llm.Thinking{Text: "streamed"},
+		&llm.ToolUse{ID: "t1", Name: "search"},
+		&llm.Thinking{Redacted: []byte("opaque")},
+		&llm.Raw{Vendor: "anthropic", Type: "server_tool_use"},
+	})
+	if len(kept) != 2 {
+		t.Fatalf("kept = %+v: only the blocks no stream event spells out survive the restatement", kept)
+	}
+	if th, ok := kept[0].(*llm.Thinking); !ok || len(th.Redacted) == 0 {
+		t.Fatalf("kept[0] = %+v: redacted thinking has no delta to arrive on", kept[0])
+	}
+	if raw, ok := kept[1].(*llm.Raw); !ok || raw.Type != "server_tool_use" {
+		t.Fatalf("kept[1] = %+v: a block this parser has no event for must not be dropped", kept[1])
+	}
+}
+
+func TestAgentsAreGatedByDefault(t *testing.T) {
+	p, err := New(Options{Kind: Claude, Binary: fake(t, "fake-claude.sh"), Env: os.Environ()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+	if p.gate == nil {
+		t.Fatal("every call forks a whole agent CLI, so an ungated provider is bounded only by the host's memory")
+	}
+	if cap(p.gate) != DefaultMaxConcurrent {
+		t.Fatalf("gate = %d, want %d", cap(p.gate), DefaultMaxConcurrent)
+	}
+
+	off, err := New(Options{Kind: Claude, Binary: fake(t, "fake-claude.sh"), Env: os.Environ(), MaxConcurrent: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = off.Close(context.Background()) })
+	if off.gate != nil {
+		t.Fatal("a negative limit is how an operator asks for no gate at all")
+	}
+}
+
+func TestASessionHandleMustLookLikeOne(t *testing.T) {
+	for _, bad := range []string{"--sandbox=danger-full-access", "-x", "a b", "a;b", "a$(id)", ""} {
+		if safeSession(bad) {
+			t.Fatalf("%q was accepted: this reaches a child process's argument list", bad)
+		}
+	}
+	for _, good := range []string{"sess-42", "t1", "01JABC.def:ghi", "a_b-c"} {
+		if !safeSession(good) {
+			t.Fatalf("%q was refused: this is what the binaries actually issue", good)
+		}
+	}
+}
+
+func TestOneCallersSessionIsNotAnothersToResume(t *testing.T) {
+	p := provider(t, Claude, "fake-claude.sh", nil)
+	p.remember("sess-42", owner(llm.Credential{Key: "tenant-a"}))
+
+	req := hello()
+	a := attempt(req)
+	a.Session = "sess-42"
+	a.Credential = llm.Credential{Key: "tenant-b"}
+	var diags llm.Diagnostics
+	a.Recorder = &diags
+
+	in, _, err := p.prepare(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Session != "" {
+		t.Fatal("another caller's conversation was taken up, with its history and its working directory")
+	}
+
+	a2 := attempt(hello())
+	a2.Session = "sess-42"
+	a2.Credential = llm.Credential{Key: "tenant-a"}
+	in2, _, err := p.prepare(a2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in2.Session != "sess-42" {
+		t.Fatal("the caller it was issued to must still be able to resume it")
 	}
 }

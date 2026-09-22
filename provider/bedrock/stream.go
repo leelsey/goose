@@ -5,7 +5,6 @@ package bedrock
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 
 	"github.com/leelsey/goose/internal/awsstream"
@@ -27,6 +26,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 		return nil, err
 	}
 	st := &parser{
+		ctx:      ctx,
 		provider: p.ID(),
 		reader:   awsstream.NewReader(resp.Body, a.Limits.MaxFrameBytes),
 		blocks:   map[int]string{},
@@ -39,6 +39,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 }
 
 type parser struct {
+	ctx      context.Context
 	provider string
 	reader   *awsstream.Reader
 	blocks   map[int]string
@@ -53,7 +54,7 @@ func (b *parser) next() (*llm.Frame, error) {
 		}
 		if !b.reader.Next() {
 			if err := b.reader.Err(); err != nil {
-				return nil, &llm.Error{Kind: llm.KindTransport, Provider: b.provider, Sent: true, Message: err.Error(), Err: err}
+				return nil, httpcore.ReadError(b.ctx, b.provider, err)
 			}
 			b.done = true
 			if !b.ended {
@@ -182,7 +183,9 @@ func (b *parser) event(name string, payload []byte) (*llm.Frame, error) {
 		case m.Delta.Reasoning != nil:
 			r := m.Delta.Reasoning
 			if r.RedactedContent != "" {
-				data, _ := base64.StdEncoding.DecodeString(r.RedactedContent)
+				// The shared shape keeps a backend's own spelling, and Anthropic's is
+				// the base64 this wire already carries.
+				data := []byte(r.RedactedContent)
 				return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Redacted: data}}}, nil
 			}
 			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: r.Text, Signature: r.Signature}}}, nil

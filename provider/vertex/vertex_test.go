@@ -123,3 +123,58 @@ func TestMissingProjectOrTokenIsRefused(t *testing.T) {
 		t.Fatal("an unauthenticated request must not be attempted")
 	}
 }
+
+// Model Garden sits beside the project rather than inside it, so the surface
+// that answers a call is not the one that lists what it serves: asking the
+// project-scoped path leaves every Vertex backend reading as unready.
+func TestTheCatalogueComesFromModelGarden(t *testing.T) {
+	for _, tc := range []struct{ name, model, publisher string }{
+		{"gemini", "gemini-2.5-pro", "google"},
+		{"claude", "claude-sonnet-4@20250514", "anthropic"},
+		{"llama", "llama-3.1-70b", "meta"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked []string
+			p, reqs, _ := serve(t, Options{Model: tc.model}, func(w http.ResponseWriter, r *http.Request) {
+				asked = append(asked, r.URL.Path)
+				want := "/v1beta1/publishers/" + tc.publisher + "/models"
+				if r.URL.Path != want {
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte(`{"error":{"code":404,"message":"not found"}}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"publisherModels":[
+					{"name":"publishers/` + tc.publisher + `/models/one"},
+					{"name":"publishers/` + tc.publisher + `/models/two"}]}`))
+			})
+			_ = reqs
+
+			lister, ok := p.(llm.Lister)
+			if !ok {
+				t.Fatal("a Vertex backend has a catalogue")
+			}
+			models, err := lister.Models(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(models) != 2 || models[0].ID != "one" || models[1].ID != "two" {
+				t.Fatalf("models = %+v", models)
+			}
+			prober, ok := p.(llm.Prober)
+			if !ok {
+				t.Fatal("a Vertex backend can be probed")
+			}
+			if err := prober.Probe(context.Background()); err != nil {
+				t.Fatalf("a reachable backend reads as unready: %v", err)
+			}
+			if _, ok := p.(llm.Passer); !ok {
+				t.Fatal("a Vertex backend still forwards opaque requests")
+			}
+			for _, path := range asked {
+				if !strings.HasPrefix(path, "/v1beta1/publishers/") {
+					t.Fatalf("asked %q, which this host does not serve", path)
+				}
+			}
+		})
+	}
+}

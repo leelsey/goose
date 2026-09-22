@@ -407,7 +407,7 @@ func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 
 	raw, rerr := io.ReadAll(resp.Body)
 	if rerr != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "response body: " + rerr.Error(), Err: rerr}
+		return nil, httpcore.BodyError(ctx, p.ID(), rerr)
 	}
 	var out upstreamFrame
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -444,7 +444,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 		return nil, err
 	}
 	lines := wirecore.NewLines(resp.Body, a.Limits.MaxFrameBytes)
-	st := &parser{provider: p.ID(), lines: lines, attempt: a, mint: wirecore.NewIDMinter()}
+	st := &parser{ctx: ctx, provider: p.ID(), lines: lines, attempt: a, mint: wirecore.NewIDMinter()}
 	return llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: p.model(a), Requested: a.Request.Model, Created: p.now()},
 		st.next,
@@ -453,6 +453,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 }
 
 type parser struct {
+	ctx      context.Context
 	provider string
 	lines    *wirecore.Lines
 	done     bool
@@ -469,7 +470,7 @@ func (o *parser) next() (*llm.Frame, error) {
 		}
 		if !o.lines.Scan() {
 			if err := o.lines.Err(); err != nil {
-				return nil, &llm.Error{Kind: llm.KindTransport, Provider: o.provider, Sent: true, Message: err.Error(), Err: err}
+				return nil, httpcore.ReadError(o.ctx, o.provider, err)
 			}
 			o.done = true
 			return nil, nil
@@ -508,7 +509,7 @@ func (o *parser) next() (*llm.Frame, error) {
 			}
 			frame.TurnEnd = true
 		}
-		if frame.Empty() && frame.Model == "" {
+		if frame.Empty() {
 			continue
 		}
 		return frame, nil
@@ -534,7 +535,7 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, &llm.Error{Kind: llm.KindTransport, Provider: p.ID(), Message: err.Error(), Sent: true, Err: err}
+		return nil, httpcore.ReadError(ctx, p.ID(), err)
 	}
 	return &llm.PassResponse{Status: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
 }

@@ -14,13 +14,15 @@ import (
 const defaultBaseURL = "https://openrouter.ai/api/v1"
 
 type Options struct {
-	ID             string
-	BaseURL        string
-	APIKey         string
-	Model          string
-	Referer        string
-	Title          string
-	Providers      []string
+	ID        string
+	BaseURL   string
+	APIKey    string
+	Model     string
+	Referer   string
+	Title     string
+	Providers []string
+	// AllowFallbacks left false asks the gateway not to reach for a second
+	// provider, which is the opposite of its own default; the CLI sets it.
 	AllowFallbacks bool
 	MaxRetries     int
 	Timeout        time.Duration

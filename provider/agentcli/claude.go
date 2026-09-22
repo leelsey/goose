@@ -61,7 +61,7 @@ func claudeParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 		return nil, err
 	}
 	if evt.SessionID != "" {
-		st.session = evt.SessionID
+		st.began(p, evt.SessionID)
 	}
 
 	switch evt.Type {
@@ -126,18 +126,42 @@ func claudeWholeTurn(p *Provider, evt *claudeEvent, st *state) ([]*llm.Frame, er
 		return nil, nil
 	}
 	st.sawContent = true
-	if st.turnOpen {
-		st.turnOpen = false
-	}
 	f := &llm.Frame{
 		Role: llm.RoleAssistant, Session: st.session, Delta: parts,
 		ID: evt.Message.ID, Model: evt.Message.Model, Diagnostics: diags,
+	}
+	// With --include-partial-messages the deltas already carried this turn, and
+	// the closing message restates all of it. Keep the figures and whatever the
+	// deltas had no event for, drop the second copy of the rest.
+	if st.turnOpen {
+		st.turnOpen = false
+		f.Delta = unstreamed(parts)
 	}
 	if evt.Message.Usage != nil {
 		u := anthropicmsg.DecodeUsage(*evt.Message.Usage)
 		f.Usage = &u
 	}
 	return []*llm.Frame{f, {TurnEnd: true}}, nil
+}
+
+// unstreamed keeps the parts of a restated turn that no stream event could
+// have carried. claudeStreamEvent spells out text, thinking and tool calls;
+// everything else — redacted thinking, a server-side tool, any block this
+// binary learns to emit later — reaches the caller on the closing line alone.
+func unstreamed(parts []llm.Part) []llm.Part {
+	var out []llm.Part
+	for _, p := range parts {
+		switch v := p.(type) {
+		case *llm.Text, *llm.ToolUse:
+		case *llm.Thinking:
+			if len(v.Redacted) > 0 {
+				out = append(out, p)
+			}
+		default:
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func claudeError(evt *claudeEvent) string {

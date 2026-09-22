@@ -30,7 +30,7 @@ func (p *Provider) Models(ctx context.Context) ([]llm.Model, error) {
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "malformed model list: " + err.Error(), Err: err}
+		return nil, httpcore.MalformedList(p.ID(), err)
 	}
 	out := make([]llm.Model, 0, len(body.Models))
 	for _, m := range body.Models {
@@ -44,11 +44,7 @@ func (p *Provider) Models(ctx context.Context) ([]llm.Model, error) {
 }
 
 func (p *Provider) Probe(ctx context.Context) error {
-	resp, err := p.call.Do(ctx, httpcore.Request{
+	return p.call.Reach(ctx, httpcore.Request{
 		Method: http.MethodGet, URL: httpcore.JoinURL(p.opts.BaseURL, "/api/tags"), Header: p.header(),
 	})
-	if err != nil {
-		return err
-	}
-	return resp.Body.Close()
 }

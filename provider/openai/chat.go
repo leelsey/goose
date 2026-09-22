@@ -360,22 +360,19 @@ type chatMessageOut struct {
 	} `json:"tool_calls"`
 }
 
-func (m *chatMessageOut) streamParts(cur *int, c *chatParser) []llm.Part {
+func (m *chatMessageOut) streamParts(st *choiceTools) []llm.Part {
 	out := m.contentParts()
 	for _, tc := range m.ToolCalls {
 		switch {
 		case tc.Index != nil:
-			*cur = *tc.Index
-		case tc.ID != "" && tc.ID == c.openTool[*cur]:
-		case tc.ID != "" || *cur < 0:
-			*cur++
+			st.cur = *tc.Index
+		case tc.ID != "" && tc.ID == st.open[st.cur]:
+		case tc.ID != "" || st.cur < 0:
+			st.cur++
 		}
-		idx := *cur
+		idx := st.cur
 		if tc.ID != "" {
-			if c.openTool == nil {
-				c.openTool = map[int]string{}
-			}
-			c.openTool[idx] = tc.ID
+			st.open[idx] = tc.ID
 		}
 		out = append(out, &llm.ToolUse{
 			ID: tc.ID, Name: tc.Function.Name,
@@ -474,17 +471,25 @@ func (p *Provider) completeChat(ctx context.Context, a *llm.Attempt) (*llm.Respo
 
 	raw, rerr := io.ReadAll(resp.Body)
 	if rerr != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "response body: " + rerr.Error(), Err: rerr}
+		return nil, httpcore.BodyError(ctx, p.ID(), rerr)
 	}
 	var out chatResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "malformed response: " + err.Error(), Err: err}
 	}
-	if out.Error != nil && len(out.Choices) == 0 {
-		return nil, &llm.Error{
-			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200,
-			Code: out.Error.Code, Message: out.Error.Message,
+	if out.Error != nil {
+		if len(out.Choices) == 0 {
+			return nil, &llm.Error{
+				Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200,
+				Code: out.Error.Code, Message: out.Error.Message,
+			}
 		}
+		// Some gateways fail partway and answer with both. The answer stands,
+		// but the caller is told it is not the whole one.
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.WireErrorInBody, Class: llm.ClassTransport, Stage: llm.StageResponse,
+			Severity: llm.SeverityLoss, Provider: p.ID(), Detail: out.Error.Message,
+		})
 	}
 
 	res := &llm.Response{
@@ -543,7 +548,7 @@ func (p *Provider) streamChat(ctx context.Context, a *llm.Attempt) (*llm.Stream,
 		return nil, err
 	}
 	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
-	st := &chatParser{provider: p.ID(), sc: sc, attempt: a}
+	st := &chatParser{ctx: ctx, provider: p.ID(), sc: sc, attempt: a}
 	return llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: p.model(a), Requested: a.Request.Model, Created: p.now()},
 		st.next,
@@ -552,27 +557,33 @@ func (p *Provider) streamChat(ctx context.Context, a *llm.Attempt) (*llm.Stream,
 }
 
 type chatParser struct {
+	ctx      context.Context
 	provider string
 	sc       *wirecore.Scanner
 	done     bool
 	ended    bool
 	queue    []*llm.Frame
 	attempt  *llm.Attempt
-	tools    map[int]*int
-	openTool map[int]string
+	tools    map[int]*choiceTools
 }
 
-func (c *chatParser) toolFor(choice int) *int {
+// Which tool call is open belongs to the choice that opened it; with more than
+// one candidate in flight their indices collide otherwise.
+type choiceTools struct {
+	cur  int
+	open map[int]string
+}
+
+func (c *chatParser) toolFor(choice int) *choiceTools {
 	if c.tools == nil {
-		c.tools = map[int]*int{}
+		c.tools = map[int]*choiceTools{}
 	}
-	cur, ok := c.tools[choice]
+	st, ok := c.tools[choice]
 	if !ok {
-		n := -1
-		cur = &n
-		c.tools[choice] = cur
+		st = &choiceTools{cur: -1, open: map[int]string{}}
+		c.tools[choice] = st
 	}
-	return cur
+	return st
 }
 
 func (c *chatParser) next() (*llm.Frame, error) {
@@ -587,7 +598,7 @@ func (c *chatParser) next() (*llm.Frame, error) {
 		}
 		if !c.sc.Scan() {
 			if err := c.sc.Err(); err != nil {
-				return nil, &llm.Error{Kind: llm.KindTransport, Provider: c.provider, Sent: true, Message: err.Error(), Err: err}
+				return nil, httpcore.ReadError(c.ctx, c.provider, err)
 			}
 			c.done = true
 			if !c.ended {
@@ -628,7 +639,7 @@ func (c *chatParser) next() (*llm.Frame, error) {
 			}
 			f := &llm.Frame{
 				ID: chunk.ID, Model: chunk.Model, Choice: &idx,
-				Delta:       delta.streamParts(c.toolFor(ch.Index), c),
+				Delta:       delta.streamParts(c.toolFor(ch.Index)),
 				Diagnostics: wirecore.Unmodelled(ch.raw, chatChoiceKnown, "choice", c.attempt),
 			}
 			if delta.Role != "" {
@@ -650,7 +661,7 @@ func (c *chatParser) next() (*llm.Frame, error) {
 		frames[0].Extra = c.extras(data)
 		kept := frames[:0]
 		for _, f := range frames {
-			if f.Empty() && f.ID == "" {
+			if f.Empty() {
 				continue
 			}
 			kept = append(kept, f)

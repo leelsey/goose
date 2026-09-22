@@ -135,6 +135,9 @@ func (p *Provider) responsesBody(a *llm.Attempt, stream bool) ([]byte, llm.Diagn
 		body["stream"] = true
 	}
 	diags = append(diags, p.extend(body, req)...)
+	for k, v := range p.opts.ResponsesBody {
+		body[k] = v
+	}
 	diags = append(diags, llm.UnsentSampling(req, p.ID(),
 		llm.FieldTemperature, llm.FieldTopP, llm.FieldMaxOutputTokens)...)
 	for _, x := range diags {
@@ -325,6 +328,9 @@ var responsesKnown = map[string]bool{
 	"id": true, "model": true, "status": true, "output": true,
 	"usage": true, "incomplete_details": true, "error": true,
 	"created_at": true, "service_tier": true,
+	// goose puts its own session handle here and reads it back as one, so an
+	// upstream's is not a spare field to be carried through.
+	"previous_response_id": true,
 }
 
 type responsesBodyOut struct {
@@ -425,7 +431,7 @@ func (p *Provider) completeResponses(ctx context.Context, a *llm.Attempt) (*llm.
 
 	raw, rerr := io.ReadAll(resp.Body)
 	if rerr != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "response body: " + rerr.Error(), Err: rerr}
+		return nil, httpcore.BodyError(ctx, p.ID(), rerr)
 	}
 	var out responsesBodyOut
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -472,7 +478,7 @@ func (p *Provider) streamResponses(ctx context.Context, a *llm.Attempt) (*llm.St
 		return nil, err
 	}
 	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
-	st := &responsesParser{provider: p.ID(), sc: sc, attempt: a}
+	st := &responsesParser{ctx: ctx, provider: p.ID(), sc: sc, attempt: a}
 	return llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: p.model(a), Requested: a.Request.Model, Created: p.now()},
 		st.next,
@@ -481,6 +487,7 @@ func (p *Provider) streamResponses(ctx context.Context, a *llm.Attempt) (*llm.St
 }
 
 type responsesParser struct {
+	ctx         context.Context
 	provider    string
 	sc          *wirecore.Scanner
 	done        bool
@@ -522,7 +529,7 @@ func (r *responsesParser) next() (*llm.Frame, error) {
 		}
 		if !r.sc.Scan() {
 			if err := r.sc.Err(); err != nil {
-				return nil, &llm.Error{Kind: llm.KindTransport, Provider: r.provider, Sent: true, Message: err.Error(), Err: err}
+				return nil, httpcore.ReadError(r.ctx, r.provider, err)
 			}
 			r.done = true
 			return nil, nil

@@ -38,7 +38,7 @@ func (p *Provider) Models(ctx context.Context) ([]llm.Model, error) {
 		err = json.NewDecoder(resp.Body).Decode(&body)
 		resp.Body.Close()
 		if err != nil {
-			return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "malformed model list: " + err.Error(), Err: err}
+			return nil, httpcore.MalformedList(p.ID(), err)
 		}
 		for _, m := range body.Models {
 			out = append(out, llm.Model{
@@ -54,13 +54,9 @@ func (p *Provider) Models(ctx context.Context) ([]llm.Model, error) {
 }
 
 func (p *Provider) Probe(ctx context.Context) error {
-	resp, err := p.call.Do(ctx, httpcore.Request{
+	return p.call.Reach(ctx, httpcore.Request{
 		Method: http.MethodGet,
 		URL:    httpcore.JoinURL(p.opts.BaseURL, p.opts.Prefix) + "/models?pageSize=1",
 		Header: p.header(nil), Sign: p.opts.Sign,
 	})
-	if err != nil {
-		return err
-	}
-	return resp.Body.Close()
 }

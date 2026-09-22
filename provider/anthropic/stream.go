@@ -28,7 +28,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 	}
 
 	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
-	st := &parser{provider: p.ID(), sc: sc, blocks: map[int]*blockState{}, attempt: a}
+	st := &parser{ctx: ctx, provider: p.ID(), sc: sc, blocks: map[int]*blockState{}, attempt: a}
 	stream := llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Requested: a.Request.Model, Model: a.Model, Created: p.now()},
 		st.next,
@@ -45,6 +45,7 @@ type blockState struct {
 }
 
 type parser struct {
+	ctx      context.Context
 	provider string
 	sc       *wirecore.Scanner
 	blocks   map[int]*blockState
@@ -59,7 +60,7 @@ func (p *parser) next() (*llm.Frame, error) {
 		}
 		if !p.sc.Scan() {
 			if err := p.sc.Err(); err != nil {
-				return nil, &llm.Error{Kind: llm.KindTransport, Provider: p.provider, Message: err.Error(), Sent: true, Err: err}
+				return nil, httpcore.ReadError(p.ctx, p.provider, err)
 			}
 			p.done = true
 			return nil, nil

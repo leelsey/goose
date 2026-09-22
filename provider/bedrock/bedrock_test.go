@@ -297,6 +297,78 @@ func TestAnErrorFrameIsAFailureWhicheverWayItIsSpelt(t *testing.T) {
 	}
 }
 
+func cached() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},
+			"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1}}`))
+	}
+}
+
+func TestCachePointsMarkWhatWasAskedToBeKept(t *testing.T) {
+	p, bodies, _ := serve(t, cached())
+	req := &llm.Request{
+		Model:       "m",
+		System:      []llm.Part{&llm.Text{Text: "long standing instructions"}},
+		SystemCache: &llm.CacheHint{},
+		Tools:       []llm.Tool{{Name: "f", Schema: []byte(`{"type":"object"}`), Cache: &llm.CacheHint{}}},
+		Messages: []llm.Message{
+			{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}, Cache: &llm.CacheHint{}},
+		},
+	}
+	if _, err := p.Complete(context.Background(), attempt(req)); err != nil {
+		t.Fatal(err)
+	}
+	body := (*bodies)[0]
+	if n := strings.Count(body, "cachePoint"); n != 3 {
+		t.Fatalf("cache points = %d, want 3: the system, the turn and the tool were each asked for\n%s", n, body)
+	}
+
+	var out struct {
+		System []map[string]any `json:"system"`
+	}
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.System) != 2 || out.System[1]["cachePoint"] == nil {
+		t.Fatalf("system = %v: the point marks everything before it, so it comes last", out.System)
+	}
+}
+
+func TestCachePointsStopAtTheFourth(t *testing.T) {
+	p, bodies, _ := serve(t, cached())
+	req := &llm.Request{Model: "m", System: []llm.Part{&llm.Text{Text: "instructions"}}, SystemCache: &llm.CacheHint{}}
+	for _, text := range []string{"one", "two", "three", "four", "five"} {
+		req.Messages = append(req.Messages,
+			llm.Message{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: text}}, Cache: &llm.CacheHint{}},
+			llm.Message{Role: llm.RoleAssistant, Content: []llm.Part{&llm.Text{Text: "ok"}}})
+	}
+	if _, err := p.Complete(context.Background(), attempt(req)); err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count((*bodies)[0], "cachePoint"); n != maxBreakpoints {
+		t.Fatalf("cache points = %d, want %d", n, maxBreakpoints)
+	}
+}
+
+func TestAModelThatCannotCacheSaysSoRatherThanFailing(t *testing.T) {
+	p, bodies, _ := serve(t, cached())
+	a := attempt(&llm.Request{
+		Model: "m", System: []llm.Part{&llm.Text{Text: "instructions"}}, SystemCache: &llm.CacheHint{},
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}},
+	})
+	a.Model = "anthropic.claude-3-sonnet-20240229-v1:0"
+	resp, err := p.Complete(context.Background(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains((*bodies)[0], "cachePoint") {
+		t.Fatal("a cache point on a model that does not serve caching is a refused request")
+	}
+	if !resp.Diagnostics.Has(llm.DropCacheHint) {
+		t.Fatalf("diagnostics = %+v: the hint went missing without a word", resp.Diagnostics)
+	}
+}
+
 func TestAToolChoiceOfNoneIsReported(t *testing.T) {
 	p, _, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},
@@ -313,5 +385,25 @@ func TestAToolChoiceOfNoneIsReported(t *testing.T) {
 	}
 	if !resp.Diagnostics.Has(llm.DropToolDefinition) {
 		t.Fatalf("diagnostics = %+v: the choice went missing without a word", resp.Diagnostics)
+	}
+}
+
+func TestOnlyModelsThatServeCachingAreSentCachePoints(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"anthropic.claude-3-7-sonnet-20250219-v1:0", true},
+		{"us.anthropic.claude-sonnet-4-20250514-v1:0", true},
+		{"amazon.nova-lite-v1:0", true},
+		{"anthropic.claude-3-5-sonnet-20241022-v2:0", false},
+		{"anthropic.claude-3-sonnet-20240229-v1:0", false},
+		{"meta.llama3-70b-instruct-v1:0", false},
+	}
+	for _, c := range cases {
+		if got := cacheable(c.model); got != c.want {
+			t.Errorf("cacheable(%q) = %v, want %v: a cache point on a model that refuses one fails the whole request",
+				c.model, got, c.want)
+		}
 	}
 }

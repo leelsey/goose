@@ -4,10 +4,12 @@
 package agentcli
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
 
+	"github.com/leelsey/goose/internal/httpcore"
 	"github.com/leelsey/goose/internal/spawn"
 	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
@@ -15,7 +17,7 @@ import (
 
 type state struct {
 	session     string
-	model       string
+	owner       string
 	id          string
 	toolIdx     int
 	openTool    bool
@@ -23,6 +25,26 @@ type state struct {
 	turnOpen    bool
 	sawContent  bool
 	lastWasTool bool
+}
+
+// began records a session the binary has just issued, against the caller it was
+// issued to, so that nobody else can take it up later.
+func (st *state) began(p *Provider, id string) {
+	if id == "" || id == st.session {
+		return
+	}
+	st.session = id
+	p.remember(id, st.owner)
+}
+
+// toolFrame mints the next tool-call index and opens a frame carrying it.
+func (st *state) toolFrame(id, name string, args json.RawMessage) []*llm.Frame {
+	idx := st.toolIdx
+	st.toolIdx++
+	st.lastWasTool = true
+	return []*llm.Frame{{Delta: []llm.Part{&llm.ToolUse{
+		ID: id, Name: name, Args: args, Index: &idx,
+	}}}}
 }
 
 func (st *state) ending() llm.StopReason {
@@ -37,6 +59,7 @@ func (st *state) ending() llm.StopReason {
 }
 
 type parser struct {
+	ctx      context.Context
 	provider string
 	owner    *Provider
 	proc     *spawn.Process
@@ -67,7 +90,7 @@ func (pr *parser) next() (*llm.Frame, error) {
 				if typed := llm.AsError(err); typed != nil && typed.Kind != llm.KindInternal {
 					return nil, typed
 				}
-				return nil, &llm.Error{Kind: llm.KindTransport, Provider: pr.provider, Sent: true, Message: err.Error(), Err: err}
+				return nil, httpcore.ReadError(pr.ctx, pr.provider, err)
 			}
 			if err := pr.exit(); err != nil {
 				return nil, err

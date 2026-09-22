@@ -7,6 +7,7 @@ package openai
 import (
 	"context"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 
@@ -49,8 +50,14 @@ type Options struct {
 	ChatPath      string
 	ResponsesPath string
 	Query         string
-	Sign          func(ctx context.Context, r *http.Request, body []byte) error
-	Body          map[string]any
+	// Sign authenticates a request the backend will not take a static key for.
+	// Passthrough forwards a body it never reads, so it signs a nil one: a
+	// signer that covers the body cannot be used on that path.
+	Sign func(ctx context.Context, r *http.Request, body []byte) error
+	Body map[string]any
+	// ResponsesBody is Body for the Responses shape alone, for a field that
+	// belongs there and nowhere else.
+	ResponsesBody map[string]any
 }
 
 type Provider struct {
@@ -178,13 +185,7 @@ func (p *Provider) header(a *llm.Attempt) http.Header {
 			h.Add(k, v)
 		}
 	}
-	if key := p.key(a); key != "" && p.opts.Sign == nil {
-		name, prefix := p.opts.AuthHeader, p.opts.AuthPrefix
-		if name == "" {
-			name, prefix = "Authorization", "Bearer "
-		}
-		h.Set(name, prefix+key)
-	}
+	p.authorise(h, p.key(a))
 	if p.opts.Organisation != "" {
 		h.Set("OpenAI-Organization", p.opts.Organisation)
 	}
@@ -197,6 +198,19 @@ func (p *Provider) header(a *llm.Attempt) http.Header {
 		}
 	}
 	return h
+}
+
+// authorise names the credential the way this backend expects it. A signed
+// backend mints its own, so the static key stays off the wire.
+func (p *Provider) authorise(h http.Header, key string) {
+	if key == "" || p.opts.Sign != nil {
+		return
+	}
+	name, prefix := p.opts.AuthHeader, p.opts.AuthPrefix
+	if name == "" {
+		name, prefix = "Authorization", "Bearer "
+	}
+	h.Set(name, prefix+key)
 }
 
 func created(unix int64, fallback time.Time) time.Time {
@@ -262,17 +276,27 @@ func (p *Provider) passKey(r *llm.PassRequest) string {
 }
 
 func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassResponse, error) {
-	url := httpcore.JoinURL(p.opts.BaseURL, r.Path)
-	if r.Query != "" {
-		url += "?" + r.Query
-	}
-	req, err := http.NewRequestWithContext(ctx, r.Method, url, r.Body)
+	u := httpcore.JoinURL(p.opts.BaseURL, r.Path)
+	q, err := mergeQuery(p.opts.Query, r.Query)
 	if err != nil {
-		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(), Message: err.Error()}
+		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(),
+			Message: "the query string could not be read: " + err.Error(), Err: err}
+	}
+	if q != "" {
+		u += "?" + q
+	}
+	req, rerr := http.NewRequestWithContext(ctx, r.Method, u, r.Body)
+	if rerr != nil {
+		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(), Message: rerr.Error()}
 	}
 	httpcore.ForwardPassthrough(req.Header, r.Header)
-	if key := p.passKey(r); key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	p.authorise(req.Header, p.passKey(r))
+	if p.opts.Sign != nil {
+		// The body is a stream here, so a signer that covers it cannot be used
+		// for passthrough; the token minters this reaches do not read it.
+		if err := p.opts.Sign(ctx, req, nil); err != nil {
+			return nil, &llm.Error{Kind: llm.KindAuth, Provider: p.ID(), Message: err.Error(), Err: err}
+		}
 	}
 	client := p.call.HTTP
 	if client == nil {
@@ -280,9 +304,36 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, &llm.Error{Kind: llm.KindTransport, Provider: p.ID(), Message: err.Error(), Sent: true, Err: err}
+		return nil, httpcore.ReadError(ctx, p.ID(), err)
 	}
 	return &llm.PassResponse{Status: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
+}
+
+// mergeQuery keeps every parameter the caller sent and adds the configured ones
+// it left out, so a pinned api-version reaches the backend without overruling a
+// caller that named its own. A query that cannot be read is refused rather than
+// guessed at: appending to it would send the same parameter twice.
+func mergeQuery(configured, caller string) (string, error) {
+	if configured == "" {
+		return caller, nil
+	}
+	if caller == "" {
+		return configured, nil
+	}
+	have, err := neturl.ParseQuery(caller)
+	if err != nil {
+		return "", err
+	}
+	add, err := neturl.ParseQuery(configured)
+	if err != nil {
+		return "", err
+	}
+	for k, vs := range add {
+		if _, taken := have[k]; !taken {
+			have[k] = vs
+		}
+	}
+	return have.Encode(), nil
 }
 
 func (p *Provider) ceiling() llm.CeilingField {

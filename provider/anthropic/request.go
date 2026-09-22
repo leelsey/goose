@@ -116,10 +116,14 @@ func (p *Provider) buildRequest(a *llm.Attempt, stream bool) ([]byte, llm.Diagno
 			toolsets = sets
 		}
 		for _, field := range unsent {
+			detail := "this backend has no field for it on a tool server, so that part of the connector was not sent"
+			if strings.HasSuffix(field, ": connector_id") {
+				detail = "this backend reaches a tool server by URL alone, so this connector was not sent at all"
+			}
 			diags = append(diags, llm.Diagnostic{
 				Code: llm.DropMCPServer, Class: llm.ClassCapability, Stage: llm.StageRequest,
 				Severity: llm.SeverityLoss, Provider: p.ID(), Field: field,
-				Detail: "this backend has no field for it on a tool server, so that part of the connector was not sent",
+				Detail: detail,
 			})
 		}
 	}

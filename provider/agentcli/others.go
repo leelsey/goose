@@ -47,6 +47,23 @@ var codexToolItem = map[string]bool{
 	"file_change": true, "web_search": true, "patch_apply": true,
 }
 
+// An item names the call in its own bookkeeping; what describes the call is
+// everything else, so the naming is not handed over as an argument.
+func codexToolArgs(raw json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return wirecore.ObjectArgs(raw)
+	}
+	for _, key := range []string{"id", "type", "name", "message"} {
+		delete(obj, key)
+	}
+	trimmed, err := json.Marshal(obj)
+	if err != nil {
+		return wirecore.ObjectArgs(raw)
+	}
+	return wirecore.ObjectArgs(trimmed)
+}
+
 type codexUsage struct {
 	InputTokens           int `json:"input_tokens"`
 	CachedInputTokens     int `json:"cached_input_tokens"`
@@ -73,7 +90,7 @@ func codexParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 	switch evt.Type {
 	case "thread.started":
 		if evt.ThreadID != "" {
-			st.session = evt.ThreadID
+			st.began(p, evt.ThreadID)
 		}
 		return []*llm.Frame{{Role: llm.RoleAssistant, Session: st.session}}, nil
 
@@ -101,14 +118,10 @@ func codexParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 			}}}, nil
 		}
 		if codexToolItem[evt.Item.Type] {
-			idx := st.toolIdx
-			st.toolIdx++
-			st.lastWasTool = true
-			return []*llm.Frame{{Delta: []llm.Part{&llm.ToolUse{
-				ID:   firstNonEmpty(evt.Item.ID, evt.Item.Type),
-				Name: firstNonEmpty(evt.Item.Name, evt.Item.Type),
-				Args: wirecore.ObjectArgs(evt.Item.raw), Index: &idx,
-			}}}}, nil
+			return st.toolFrame(
+				firstNonEmpty(evt.Item.ID, evt.Item.Type),
+				firstNonEmpty(evt.Item.Name, evt.Item.Type),
+				codexToolArgs(evt.Item.raw)), nil
 		}
 		if len(evt.Item.raw) > 0 {
 			return []*llm.Frame{{
@@ -162,7 +175,7 @@ func antigravityParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error)
 		return nil, err
 	}
 	if evt.SessionID != "" {
-		st.session = evt.SessionID
+		st.began(p, evt.SessionID)
 	}
 	switch evt.Type {
 	case "init":
@@ -177,12 +190,7 @@ func antigravityParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error)
 		return []*llm.Frame{{Delta: []llm.Part{&llm.Text{Text: text}}}}, nil
 
 	case "tool_use":
-		idx := st.toolIdx
-		st.toolIdx++
-		st.lastWasTool = true
-		return []*llm.Frame{{Delta: []llm.Part{&llm.ToolUse{
-			ID: evt.ID, Name: evt.Name, Args: evt.Arguments, Index: &idx,
-		}}}}, nil
+		return st.toolFrame(evt.ID, evt.Name, evt.Arguments), nil
 
 	case "result":
 		u := llm.Usage{}
@@ -235,7 +243,7 @@ func copilotParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 		return nil, err
 	}
 	if id := firstNonEmpty(evt.SessionID, evt.ThreadID); id != "" {
-		st.session = id
+		st.began(p, id)
 	}
 	switch evt.Type {
 	case "session.started", "session.start", "session", "ready", "thread.started", "init",
@@ -252,12 +260,7 @@ func copilotParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 		return []*llm.Frame{{Delta: []llm.Part{&llm.Text{Text: text}}}}, nil
 
 	case "tool_use", "tool.use", "tool.call", "tool_call", "item.tool_use":
-		idx := st.toolIdx
-		st.toolIdx++
-		st.lastWasTool = true
-		return []*llm.Frame{{Delta: []llm.Part{&llm.ToolUse{
-			ID: evt.ID, Name: evt.Name, Args: evt.Arguments, Index: &idx,
-		}}}}, nil
+		return st.toolFrame(evt.ID, evt.Name, evt.Arguments), nil
 
 	case "completion", "completed", "complete", "done", "finished", "end", "turn.completed", "result",
 		"message_delta", "message_stop":

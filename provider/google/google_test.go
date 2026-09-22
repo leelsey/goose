@@ -296,3 +296,55 @@ func TestTheBackendsResponseIdSurvives(t *testing.T) {
 		t.Fatalf("id = %q: the backend named its own answer", resp.ID)
 	}
 }
+
+// The model names the collection it is served from, and a name that already
+// carries a publisher must not have the slash escaped into the model id.
+func TestTheModelPathNamesItsCollection(t *testing.T) {
+	for _, tc := range []struct{ model, want string }{
+		{"gemini-2.5-pro", "models/gemini-2.5-pro"},
+		{"models/gemini-2.5-pro", "models/gemini-2.5-pro"},
+		{"google/gemini-2.5-pro", "models/gemini-2.5-pro"},
+		{"publishers/google/models/gemini-2.5-pro", "models/gemini-2.5-pro"},
+		{"tunedModels/mine", "tunedModels/mine"},
+		{"tunedModels/", "models/"},
+		{"a b", "models/a%20b"},
+	} {
+		if got := modelPath(tc.model); got != tc.want {
+			t.Errorf("modelPath(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+}
+
+// The path is what the backend is actually asked for, so the rule about which
+// collection a model sits in has to reach it.
+func TestTheRequestPathNamesTheCollection(t *testing.T) {
+	for _, tc := range []struct{ model, want string }{
+		{"gemini-2.5-pro", "/v1beta/models/gemini-2.5-pro:generateContent"},
+		{"google/gemini-2.5-pro", "/v1beta/models/gemini-2.5-pro:generateContent"},
+		{"tunedModels/mine", "/v1beta/tunedModels/mine:generateContent"},
+	} {
+		var path string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path = r.URL.Path
+			_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},` +
+				`"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3}}`))
+		}))
+		p, err := New(Options{ID: "g", BaseURL: srv.URL, APIKey: "k"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = p.Complete(context.Background(), &llm.Attempt{
+			Model: tc.model, Recorder: llm.NopRecorder{},
+			Request: &llm.Request{Messages: []llm.Message{
+				{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}},
+			}},
+		})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.model, err)
+		}
+		if path != tc.want {
+			t.Errorf("model %q asked for %q, want %q", tc.model, path, tc.want)
+		}
+	}
+}

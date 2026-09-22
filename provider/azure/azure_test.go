@@ -4,7 +4,9 @@
 package azure
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +20,8 @@ func serve(t *testing.T, o Options, h http.HandlerFunc) (llm.Provider, *[]*http.
 	t.Helper()
 	var reqs []*http.Request
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
 		reqs = append(reqs, r)
 		h(w, r)
 	}))
@@ -100,5 +103,63 @@ func TestEntraTokenReplacesTheKeyHeader(t *testing.T) {
 func TestResourceOrBaseURLIsRequired(t *testing.T) {
 	if _, err := New(Options{APIKey: "k"}); err == nil || !strings.Contains(err.Error(), "resource") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// The Responses API names its deployment in the body, so it is not scoped
+// under /deployments/ the way chat completions is.
+func TestDatedSurfaceKeepsResponsesOffTheDeploymentPath(t *testing.T) {
+	p, reqs := serve(t, Options{
+		APIKey: "k", Deployment: "my-deploy", APIVersion: "2025-03-01-preview",
+	}, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"r","model":"m","status":"completed","output":[]}`))
+	})
+	a := attempt()
+	a.Format = "openai-responses"
+	if _, err := p.Complete(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	r := (*reqs)[0]
+	if r.URL.Path != "/openai/responses" {
+		t.Fatalf("path = %q, want the deployment out of the path", r.URL.Path)
+	}
+	if r.URL.Query().Get("api-version") != "2025-03-01-preview" {
+		t.Fatalf("query = %q", r.URL.RawQuery)
+	}
+	// With the deployment out of the path, the body is the only thing left
+	// that says which one to serve.
+	var sent struct {
+		Model string `json:"model"`
+	}
+	raw, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent.Model != "my-deploy" {
+		t.Fatalf("body model = %q, want the deployment: nothing else names it", sent.Model)
+	}
+}
+
+// The deployment belongs in the Responses body, not in every body: a chat call
+// names its own model in the path, and rewriting the body one changes what a
+// gateway in front of this host routes on.
+func TestTheDeploymentDoesNotRewriteTheChatModel(t *testing.T) {
+	p, reqs := serve(t, Options{
+		APIKey: "k", Deployment: "my-deploy", APIVersion: "2024-10-21",
+	}, ok)
+	a := attempt()
+	a.Model = "gpt-4o-mini"
+	if _, err := p.Complete(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	var sent struct {
+		Model string `json:"model"`
+	}
+	raw, _ := io.ReadAll((*reqs)[0].Body)
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent.Model != "gpt-4o-mini" {
+		t.Fatalf("body model = %q, want what was asked for", sent.Model)
 	}
 }

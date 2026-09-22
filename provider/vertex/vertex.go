@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/leelsey/goose/internal/httpcore"
 	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/provider/anthropic"
 	"github.com/leelsey/goose/provider/google"
@@ -68,10 +69,20 @@ func New(o Options) (llm.Provider, error) {
 		o.Region = defaultRegion
 	}
 	if o.BaseURL == "" {
-		o.BaseURL = "https://" + o.Region + "-aiplatform.googleapis.com"
+		// Only a regional endpoint takes the region as a prefix; the global one
+		// is the bare host, and "global-aiplatform.googleapis.com" is nobody.
+		if o.Region == "global" {
+			o.BaseURL = "https://aiplatform.googleapis.com"
+		} else {
+			o.BaseURL = "https://" + o.Region + "-aiplatform.googleapis.com"
+		}
 	}
 	publisher := o.Publisher
 	if publisher == "" {
+		if o.Model == "" {
+			return nil, llm.Errorf(llm.KindInvalidRequest,
+				"vertex: this surface serves one publisher per provider, so it needs a model or a publisher to know which")
+		}
 		publisher = Publisher(o.Model)
 	}
 	id := o.ID
@@ -91,6 +102,21 @@ func New(o Options) (llm.Provider, error) {
 		"/locations/" + url.PathEscape(o.Region) +
 		"/publishers/" + url.PathEscape(publisher)
 
+	inner, err := surface(o, publisher, id, prefix, sign)
+	if err != nil {
+		return nil, err
+	}
+	return &garden{
+		Provider: inner,
+		list:     o.BaseURL + "/v1beta1/publishers/" + url.PathEscape(publisher) + "/models",
+		header:   o.Header,
+		sign:     sign,
+		call:     &httpcore.Caller{Provider: id, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout)},
+	}, nil
+}
+
+func surface(o Options, publisher, id, prefix string,
+	sign func(ctx context.Context, r *http.Request, body []byte) error) (llm.Provider, error) {
 	switch publisher {
 	case "google":
 		return google.New(google.Options{
@@ -108,7 +134,7 @@ func New(o Options) (llm.Provider, error) {
 				if stream {
 					action = "streamRawPredict"
 				}
-				return prefix + "/models/" + url.PathEscape(modelOf(a, o.Model)) + ":" + action
+				return prefix + "/models/" + url.PathEscape(lastSegment(modelOf(a, o.Model))) + ":" + action
 			},
 			RewriteBody: func(body map[string]any, _ bool) {
 				delete(body, "model")

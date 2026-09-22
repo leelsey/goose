@@ -20,6 +20,7 @@ type invocation struct {
 	System     string
 	SystemFile string
 	Session    string
+	Owner      string
 	Stream     bool
 }
 
@@ -76,6 +77,30 @@ func (p *Provider) prepare(a *llm.Attempt) (invocation, llm.Diagnostics, error) 
 	}
 	if !kinds[p.opts.Kind].sessions {
 		in.Session = ""
+	}
+	if in.Session != "" {
+		by := owner(a.Credential)
+		switch {
+		case !safeSession(in.Session):
+			in.Session = ""
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.CapSessionElsewhere, Class: llm.ClassPolicy, Stage: llm.StageRequest,
+				Severity: llm.SeverityLoss, Provider: p.ID(), Field: "session",
+				Detail: "this conversation handle is not one this binary could have issued, so a new conversation was started",
+			})
+		case !p.resumable(in.Session, by):
+			in.Session = ""
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.CapSessionElsewhere, Class: llm.ClassPolicy, Stage: llm.StageRequest,
+				Severity: llm.SeverityLoss, Provider: p.ID(), Field: "session",
+				Detail: "this conversation was begun by another caller, so a new one was started rather than taking up theirs",
+			})
+		default:
+			in.Owner = by
+		}
+	}
+	if in.Session == "" {
+		in.Owner = owner(a.Credential)
 	}
 
 	mode := p.opts.SystemMode
@@ -160,9 +185,9 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 	}
 	p.track(proc)
 
-	st := &state{}
+	st := &state{owner: in.Owner}
 	pr := &parser{
-		provider: p.ID(), proc: proc, state: st, parse: spec.parse, owner: p,
+		ctx: runCtx, provider: p.ID(), proc: proc, state: st, parse: spec.parse, owner: p,
 		lines:   wirecore.NewLines(httpcore.Capped(proc.Stdout(), a.Limits.MaxResponseBytes, p.ID()), a.Limits.MaxFrameBytes),
 		release: release,
 	}

@@ -15,7 +15,7 @@ import (
 
 func (p *Provider) Models(ctx context.Context) ([]llm.Model, error) {
 	resp, err := p.call.Do(ctx, httpcore.Request{
-		Method: http.MethodGet, URL: p.endpoint("/models", ""), Header: p.header(nil),
+		Method: http.MethodGet, URL: p.endpoint("/models", ""), Header: p.header(nil), Sign: p.opts.Sign,
 	})
 	if err != nil {
 		return nil, err
@@ -30,7 +30,7 @@ func (p *Provider) Models(ctx context.Context) ([]llm.Model, error) {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "malformed model list: " + err.Error(), Err: err}
+		return nil, httpcore.MalformedList(p.ID(), err)
 	}
 	out := make([]llm.Model, 0, len(body.Data))
 	for _, m := range body.Data {
@@ -47,11 +47,7 @@ func (p *Provider) Models(ctx context.Context) ([]llm.Model, error) {
 }
 
 func (p *Provider) Probe(ctx context.Context) error {
-	resp, err := p.call.Do(ctx, httpcore.Request{
-		Method: http.MethodGet, URL: p.endpoint("/models", ""), Header: p.header(nil),
+	return p.call.Reach(ctx, httpcore.Request{
+		Method: http.MethodGet, URL: p.endpoint("/models", ""), Header: p.header(nil), Sign: p.opts.Sign,
 	})
-	if err != nil {
-		return err
-	}
-	return resp.Body.Close()
 }

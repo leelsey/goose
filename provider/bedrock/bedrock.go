@@ -18,6 +18,8 @@ import (
 	"github.com/leelsey/goose/llm"
 )
 
+const maxBreakpoints = 4
+
 type Credentials struct {
 	AccessKeyID     string
 	SecretAccessKey string
@@ -84,7 +86,7 @@ func (p *Provider) Capabilities() llm.Capabilities {
 		Thinking:           true,
 		ThinkingSignatures: true,
 		Candidates:         1,
-		CacheBreakpoints:   4,
+		CacheBreakpoints:   maxBreakpoints,
 		Ceiling:            llm.CeilingMaxTokens,
 	}
 }
@@ -145,10 +147,19 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 	req := a.Request
 	body := map[string]any{}
 
+	tools := a.Tools
+	if len(tools) == 0 {
+		tools = req.Tools
+	}
+	cache := p.caching(a, tools, &diags)
+
 	system, msgs := req.SystemAndMessages()
 	if len(system) > 0 {
 		blocks, d := contentBlocks(system, &diags)
 		diags = append(diags, d...)
+		if req.SystemCache != nil && cache.take() {
+			blocks = append(blocks, cachePoint())
+		}
 		body["system"] = blocks
 	}
 
@@ -179,6 +190,9 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 				"this turn reached no block on this endpoint, so the conversation arrives a turn shorter"))
 			continue
 		}
+		if m.Cache != nil && cache.take() {
+			blocks = append(blocks, cachePoint())
+		}
 		if n := len(turns); n > 0 && turns[n-1]["role"] == role {
 			turns[n-1]["content"] = append(turns[n-1]["content"].([]map[string]any), blocks...)
 			continue
@@ -207,10 +221,6 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 		body["inferenceConfig"] = cfg
 	}
 
-	tools := a.Tools
-	if len(tools) == 0 {
-		tools = req.Tools
-	}
 	if len(tools) > 0 {
 		specs := make([]map[string]any, 0, len(tools))
 		for _, t := range tools {
@@ -223,6 +233,9 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 				spec["description"] = t.Description
 			}
 			specs = append(specs, map[string]any{"toolSpec": spec})
+			if t.Cache != nil && cache.take() {
+				specs = append(specs, cachePoint())
+			}
 		}
 		cfg := map[string]any{"tools": specs}
 		if req.ToolChoice != nil {
@@ -294,7 +307,7 @@ func contentBlocks(parts []llm.Part, diags *llm.Diagnostics) ([]map[string]any, 
 		case *llm.Thinking:
 			if len(v.Redacted) > 0 {
 				out = append(out, map[string]any{"reasoningContent": map[string]any{
-					"redactedContent": base64.StdEncoding.EncodeToString(v.Redacted),
+					"redactedContent": string(v.Redacted),
 				}})
 				continue
 			}
@@ -473,7 +486,7 @@ func decodeBlocks(blocks []json.RawMessage) ([]llm.Part, llm.Diagnostics) {
 			out = append(out, &llm.ToolUse{ID: b.ToolUse.ID, Name: b.ToolUse.Name, Args: b.ToolUse.Input, Index: &i})
 		case b.Reasoning != nil:
 			if b.Reasoning.RedactedContent != "" {
-				data, _ := base64.StdEncoding.DecodeString(b.Reasoning.RedactedContent)
+				data := []byte(b.Reasoning.RedactedContent)
 				out = append(out, &llm.Thinking{Redacted: data})
 				continue
 			}

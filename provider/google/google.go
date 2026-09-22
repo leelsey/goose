@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/leelsey/goose/internal/httpcore"
@@ -35,7 +36,10 @@ type Options struct {
 	AllowClientKey bool
 	KeyScheme      llm.CredentialScheme
 	Header         http.Header
-	Sign           func(ctx context.Context, r *http.Request, body []byte) error
+	// Sign authenticates a request the backend will not take a static key for.
+	// Passthrough forwards a body it never reads, so it signs a nil one: a
+	// signer that covers the body cannot be used on that path.
+	Sign func(ctx context.Context, r *http.Request, body []byte) error
 }
 
 type Provider struct {
@@ -128,11 +132,25 @@ func (p *Provider) header(a *llm.Attempt) http.Header {
 }
 
 func (p *Provider) url(a *llm.Attempt, action string, stream bool) string {
-	u := httpcore.JoinURL(p.opts.BaseURL, p.opts.Prefix) + "/models/" + url.PathEscape(p.model(a)) + ":" + action
+	u := httpcore.JoinURL(p.opts.BaseURL, p.opts.Prefix) + "/" + modelPath(p.model(a)) + ":" + action
 	if stream {
 		u += "?alt=sse"
 	}
 	return u
+}
+
+// modelPath names the collection the model is served from. A tuned model has
+// its own; on Vertex the publisher is already a path segment, so a model
+// written "google/gemini-..." names it twice, and escaping the slash would bury
+// the second copy inside the model id.
+func modelPath(model string) string {
+	if collection, id, ok := strings.Cut(model, "/"); ok && collection == "tunedModels" && id != "" {
+		return "tunedModels/" + url.PathEscape(id)
+	}
+	if i := strings.LastIndexByte(model, '/'); i >= 0 {
+		model = model[i+1:]
+	}
+	return "models/" + url.PathEscape(model)
 }
 
 func (p *Provider) now() time.Time {
@@ -372,7 +390,7 @@ func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 
 	raw, rerr := io.ReadAll(resp.Body)
 	if rerr != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "response body: " + rerr.Error(), Err: rerr}
+		return nil, httpcore.BodyError(ctx, p.ID(), rerr)
 	}
 	var out upstreamBody
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -479,7 +497,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 		return nil, err
 	}
 	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
-	st := &parser{provider: p.ID(), sc: sc, attempt: a}
+	st := &parser{ctx: ctx, provider: p.ID(), sc: sc, attempt: a}
 	return llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: p.model(a), Requested: a.Request.Model, Created: p.now()},
 		st.next,
@@ -488,14 +506,27 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 }
 
 type parser struct {
+	ctx      context.Context
 	provider string
 	sc       *wirecore.Scanner
 	done     bool
 	ended    bool
-	tools    bool
 	queue    []*llm.Frame
 	attempt  *llm.Attempt
 	toolIdx  map[int]*int
+	toolSeen map[int]bool
+}
+
+// Whether a candidate has called a tool is that candidate's own business; a
+// sibling's call says nothing about how this one finishes.
+func (g *parser) calledTool(choice int, now bool) bool {
+	if g.toolSeen == nil {
+		g.toolSeen = map[int]bool{}
+	}
+	if now {
+		g.toolSeen[choice] = true
+	}
+	return g.toolSeen[choice]
 }
 
 func (g *parser) toolFor(choice int) *int {
@@ -532,7 +563,7 @@ func (g *parser) next() (*llm.Frame, error) {
 		}
 		if !g.sc.Scan() {
 			if err := g.sc.Err(); err != nil {
-				return nil, &llm.Error{Kind: llm.KindTransport, Provider: g.provider, Sent: true, Message: err.Error(), Err: err}
+				return nil, httpcore.ReadError(g.ctx, g.provider, err)
 			}
 			g.done = true
 			if !g.ended {
@@ -567,12 +598,10 @@ func (g *parser) next() (*llm.Frame, error) {
 				return nil, err
 			}
 			number(parts, g.toolFor(idx))
-			if llm.HasKind(parts, llm.KindToolUse) {
-				g.tools = true
-			}
+			called := g.calledTool(idx, llm.HasKind(parts, llm.KindToolUse))
 			frames = append(frames, &llm.Frame{
 				ID: out.ResponseID, Model: out.ModelVersion, Choice: &idx, Delta: parts,
-				Stop:        decodeFinish(c.FinishReason, g.tools),
+				Stop:        decodeFinish(c.FinishReason, called),
 				Diagnostics: wirecore.Unmodelled(c.raw, candidateKnown, "candidate", g.attempt),
 			})
 		}
@@ -589,7 +618,7 @@ func (g *parser) next() (*llm.Frame, error) {
 		frames[0].Extra = wirecore.Extras(data, responseKnown, g.attempt, geminiapi.Name)
 		kept := frames[:0]
 		for _, f := range frames {
-			if f.Empty() && f.Model == "" {
+			if f.Empty() {
 				continue
 			}
 			kept = append(kept, f)
@@ -622,8 +651,15 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(), Message: err.Error()}
 	}
 	httpcore.ForwardPassthrough(req.Header, r.Header)
-	if key := p.passKey(r); key != "" {
+	if key := p.passKey(r); key != "" && p.opts.Sign == nil {
 		req.Header.Set("x-goog-api-key", key)
+	}
+	if p.opts.Sign != nil {
+		// The body is a stream here, so a signer that covers it cannot be used
+		// for passthrough; the token minters this reaches do not read it.
+		if err := p.opts.Sign(ctx, req, nil); err != nil {
+			return nil, &llm.Error{Kind: llm.KindAuth, Provider: p.ID(), Message: err.Error(), Err: err}
+		}
 	}
 	client := p.call.HTTP
 	if client == nil {
@@ -631,7 +667,7 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, &llm.Error{Kind: llm.KindTransport, Provider: p.ID(), Message: err.Error(), Sent: true, Err: err}
+		return nil, httpcore.ReadError(ctx, p.ID(), err)
 	}
 	return &llm.PassResponse{Status: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
 }

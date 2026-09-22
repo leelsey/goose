@@ -40,7 +40,10 @@ type Options struct {
 
 	Path        func(a *llm.Attempt, stream bool) string
 	RewriteBody func(body map[string]any, stream bool)
-	Sign        func(ctx context.Context, r *http.Request, body []byte) error
+	// Sign authenticates a request the backend will not take a static key for.
+	// Passthrough forwards a body it never reads, so it signs a nil one: a
+	// signer that covers the body cannot be used on that path.
+	Sign func(ctx context.Context, r *http.Request, body []byte) error
 }
 
 type Provider struct {
@@ -174,7 +177,7 @@ func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 
 	raw, rerr := io.ReadAll(resp.Body)
 	if rerr != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Message: "response body: " + rerr.Error(), Sent: true, Err: rerr}
+		return nil, httpcore.BodyError(ctx, p.ID(), rerr)
 	}
 	var out upstreamResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -282,9 +285,15 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 	}
 	httpcore.ForwardPassthrough(req.Header, r.Header)
 	req.Header.Set("anthropic-version", p.opts.Version)
-	key := p.passKey(r)
-	if key != "" {
+	if key := p.passKey(r); key != "" && p.opts.Sign == nil {
 		req.Header.Set("x-api-key", key)
+	}
+	if p.opts.Sign != nil {
+		// The body is a stream here, so a signer that covers it cannot be used
+		// for passthrough; the token minters this reaches do not read it.
+		if err := p.opts.Sign(ctx, req, nil); err != nil {
+			return nil, &llm.Error{Kind: llm.KindAuth, Provider: p.ID(), Message: err.Error(), Err: err}
+		}
 	}
 	client := p.call.HTTP
 	if client == nil {
@@ -292,7 +301,7 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, &llm.Error{Kind: llm.KindTransport, Provider: p.ID(), Message: err.Error(), Sent: true, Err: err}
+		return nil, httpcore.ReadError(ctx, p.ID(), err)
 	}
 	return &llm.PassResponse{Status: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
 }

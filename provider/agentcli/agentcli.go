@@ -25,6 +25,12 @@ const (
 	Copilot     Kind = "copilot"
 )
 
+// Every call forks a whole agent CLI, which costs hundreds of megabytes while
+// it runs, so what bounds this is the host's memory rather than its cores.
+// A request past the limit is shed, which is what the route's next link is for.
+// A zero MaxConcurrent takes this default; a negative one removes the gate.
+const DefaultMaxConcurrent = 4
+
 type SystemMode string
 
 const (
@@ -66,10 +72,12 @@ type Provider struct {
 	env  llm.Env
 	gate chan struct{}
 
-	mu     sync.Mutex
-	live   map[*spawn.Process]struct{}
-	vault  *spawn.Vault
-	closed bool
+	mu       sync.Mutex
+	live     map[*spawn.Process]struct{}
+	sessions map[string]string
+	order    []string
+	vault    *spawn.Vault
+	closed   bool
 }
 
 func (p *Provider) systemFile(content string) (string, error) {
@@ -126,6 +134,9 @@ func New(o Options) (*Provider, error) {
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = 5 * time.Minute
+	}
+	if o.MaxConcurrent == 0 {
+		o.MaxConcurrent = DefaultMaxConcurrent
 	}
 	p := &Provider{opts: o, live: map[*spawn.Process]struct{}{}}
 	if o.MaxConcurrent > 0 {
