@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/leelsey/goose"
 	"github.com/leelsey/goose/internal/spawn"
@@ -29,6 +30,38 @@ import (
 	"github.com/leelsey/goose/usage"
 )
 
+// Without these an attempt has no deadline and an upstream body no ceiling, so
+// one stalled backend holds a request, its connection and its concurrency slot
+// until the client gives up.
+func limitsOf(s Server) llm.Limits {
+	timeout := defAttempt
+	if d, err := time.ParseDuration(s.AttemptTimeout); err == nil && d > 0 {
+		timeout = d
+	}
+	response := int64(defResponse)
+	if s.MaxResponseMB > 0 {
+		response = int64(s.MaxResponseMB) << 20
+	}
+	return llm.Limits{Timeout: timeout, MaxResponseBytes: response}
+}
+
+// In a config file zero is how an operator asks for no gate at all, which the
+// provider spells as a negative; leaving the key out is what asks for its
+// default. The two cannot be told apart once the string has been through atoi.
+func agentGate(v string) int {
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n <= 0 {
+		return -1
+	} else if err == nil {
+		return n
+	}
+	// Unreadable: checkOptions refuses this before it reaches here, so taking
+	// the default is belt and braces rather than a silent removal of the gate.
+	return 0
+}
+
 func build(cfg *Config, logger *slog.Logger, sinks []usage.Sink, tools *mcp.Manager) (*goose.Client, error) {
 	opts := []goose.Option{goose.WithLogger(logger)}
 	if tools != nil {
@@ -45,6 +78,10 @@ func build(cfg *Config, logger *slog.Logger, sinks []usage.Sink, tools *mcp.Mana
 	}
 	if cfg.Server.Strict {
 		opts = append(opts, goose.WithLossPolicy(llm.LossPolicy{Strict: true}))
+	}
+	opts = append(opts, goose.WithLimits(limitsOf(cfg.Server)))
+	if cfg.Server.RedactUpstream {
+		opts = append(opts, goose.WithRedactedErrors())
 	}
 
 	for _, p := range cfg.Providers {
@@ -198,7 +235,7 @@ func newProvider(p Provider) (llm.Provider, error) {
 			Tools:         p.Options["tools"],
 			MaxTurns:      atoi(p.Options["max_turns"]),
 			Sandbox:       p.Options["sandbox"],
-			MaxConcurrent: atoi(p.Options["max_concurrent"]),
+			MaxConcurrent: agentGate(p.Options["max_concurrent"]),
 			Timeout:       timeout,
 			TempDir:       p.Options["temp_dir"],
 		})
@@ -263,7 +300,8 @@ func newRule(r Route, pinned map[string]string) (route.Rule, error) {
 	}
 	rule := route.Rule{
 		Name: r.Name, Match: match, Model: r.Model, Sticky: r.Sticky, Tools: r.Tools,
-		Policy: llm.LossPolicy{Strict: r.Strict, Allow: r.Allow, Deny: r.Deny},
+		Policy:    llm.LossPolicy{Strict: r.Strict != nil && *r.Strict, Allow: r.Allow, Deny: r.Deny},
+		PolicySet: r.Strict != nil || len(r.Allow) > 0 || len(r.Deny) > 0,
 	}
 	for _, id := range r.Chain {
 		provider, model, _ := strings.Cut(id, ":")

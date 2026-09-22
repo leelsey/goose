@@ -22,10 +22,13 @@ func FuzzLoadConfig(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, body string) {
+		// Every execution writes a file, so the disk is in the loop. A write
+		// that fails says nothing about the input: failing here would record a
+		// blameless input as a crasher and keep replaying it for ever.
 		dir := t.TempDir()
 		path := filepath.Join(dir, "goose.toml")
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
+			t.Skipf("writing the config failed, which is the disk and not the input: %v", err)
 		}
 		cfg, _, err := load(path)
 		if err != nil {

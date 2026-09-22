@@ -15,7 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/leelsey/goose/internal/spawn"
 	"github.com/leelsey/goose/llm"
@@ -790,5 +792,124 @@ func TestARefusedContainerEndpointIsReportedWithoutItsToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "the-tasks-token") {
 		t.Fatalf("the token reached the error: %v", err)
+	}
+}
+
+func TestEveryAttemptGetsADeadlineAndACeiling(t *testing.T) {
+	got := limitsOf(Server{})
+	if got.Timeout <= 0 {
+		t.Fatal("an attempt with no deadline holds its request, connection and slot until the client gives up")
+	}
+	if got.MaxResponseBytes <= 0 {
+		t.Fatal("an upstream that never stops sending is not answering a question anyone asked")
+	}
+
+	set := limitsOf(Server{AttemptTimeout: "90s", MaxResponseMB: 8})
+	if set.Timeout != 90*time.Second {
+		t.Fatalf("timeout = %v", set.Timeout)
+	}
+	if set.MaxResponseBytes != 8<<20 {
+		t.Fatalf("ceiling = %d", set.MaxResponseBytes)
+	}
+
+	if bad := limitsOf(Server{AttemptTimeout: "not a duration"}); bad.Timeout != defAttempt {
+		t.Fatalf("timeout = %v: an unreadable duration falls back rather than disabling the deadline", bad.Timeout)
+	}
+}
+
+func TestAnAgentGateIsOffOnlyWhenAskedFor(t *testing.T) {
+	if got := agentGate(""); got != 0 {
+		t.Fatalf("unset = %d: leaving the key out asks for the provider's default", got)
+	}
+	if got := agentGate("0"); got >= 0 {
+		t.Fatalf("zero = %d: in a config file zero is how an operator removes a limit", got)
+	}
+	if got := agentGate("8"); got != 8 {
+		t.Fatalf("eight = %d", got)
+	}
+}
+
+func TestDisablingInstanceMetadataIsNotUndoneByAContainerRole(t *testing.T) {
+	var reachedIMDS atomic.Bool
+	imds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reachedIMDS.Store(true)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer imds.Close()
+	task := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer task.Close()
+
+	env := map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI": task.URL + "/creds",
+		"AWS_EC2_METADATA_DISABLED":          "true",
+		"AWS_EC2_METADATA_SERVICE_ENDPOINT":  imds.URL,
+	}
+	src := awsCredentials(Provider{}, func(k string) string { return env[k] })
+	if _, err := src(context.Background()); err == nil {
+		t.Fatal("the task role refused, so resolving credentials must fail")
+	}
+	if reachedIMDS.Load() {
+		t.Fatal("the node's own role was asked for on a host where the operator turned it off")
+	}
+}
+
+func TestARouteCanBeLenientUnderAStrictServer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "goose.toml")
+	body := `
+formats = ["openai"]
+[server]
+strict = true
+[[provider]]
+id = "p"
+kind = "ollama"
+[[route]]
+name = "lenient"
+models = ["*"]
+strict = false
+chain = ["p"]
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routes) != 1 || cfg.Routes[0].Strict == nil || *cfg.Routes[0].Strict {
+		t.Fatalf("route = %+v: a route that says strict = false has said something", cfg.Routes)
+	}
+	rule, err := newRule(cfg.Routes[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rule.PolicySet {
+		t.Fatal("the route chose a policy, so the server default must not overrule it")
+	}
+	if rule.Policy.Strict {
+		t.Fatalf("policy = %+v", rule.Policy)
+	}
+}
+
+// One Vertex entry serves one publisher, and which one comes from the model
+// name; a config that names neither fails at startup rather than on first call.
+func TestVertexNeedsAModelOrAPublisher(t *testing.T) {
+	cfg := defaults()
+	cfg.Providers = []Provider{
+		{ID: "vx", Kind: "vertex", Options: map[string]string{"project": "p", "region": "us-east5"}},
+	}
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "publisher") {
+		t.Fatalf("err = %v", err)
+	}
+	cfg.Providers[0].Options["publisher"] = "anthropic"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("a named publisher is enough: %v", err)
+	}
+	cfg.Providers[0].Options["publisher"] = ""
+	cfg.Providers[0].Model = "gemini-2.5-pro"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("a model names its publisher: %v", err)
 	}
 }

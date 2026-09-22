@@ -252,6 +252,9 @@ func serveStdio(tools *mcp.Manager, stdout, stderr *os.File, cfg *Config, origin
 	for _, s := range tools.Servers() {
 		fmt.Fprintf(stderr, "  tools    %-12s %-24s %-11s %d tools",
 			s.Name, dashIfEmpty(s.Info.Name), dashIfEmpty(s.Info.ProtocolVersion), s.Tools)
+		if s.Truncated {
+			fmt.Fprint(stderr, " (and more than goose will hold)")
+		}
 		if n := len(s.Refused); n > 0 {
 			fmt.Fprintf(stderr, " (%d refused: %s)", n, strings.Join(s.Refused, ", "))
 		}

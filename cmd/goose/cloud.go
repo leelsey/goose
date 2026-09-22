@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"net/url"
@@ -30,13 +31,20 @@ func awsCredentials(p Provider, getenv func(string) string) bedrock.CredentialSo
 	relative := getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
 	full, fullErr := containerURI(getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"))
 
-	runtime := bedrock.FirstWorkingCredentials(
-		bedrock.ContainerCredentials(nil, relative, full,
-			getenv("AWS_CONTAINER_AUTHORIZATION_TOKEN")),
-		bedrock.InstanceCredentials(nil, getenv("AWS_EC2_METADATA_SERVICE_ENDPOINT")),
-	)
-	if getenv("AWS_EC2_METADATA_DISABLED") == "true" && relative == "" && full == "" {
-		runtime = nil
+	// Each source stands on its own. Tying the metadata switch to the absence of
+	// a container URI left the instance role reachable as a fallback on exactly
+	// the hosts where it is turned off to keep a task from borrowing the node's.
+	var sources []bedrock.CredentialSource
+	if relative != "" || full != "" {
+		sources = append(sources, bedrock.ContainerCredentials(nil, relative, full,
+			getenv("AWS_CONTAINER_AUTHORIZATION_TOKEN")))
+	}
+	if getenv("AWS_EC2_METADATA_DISABLED") != "true" {
+		sources = append(sources, bedrock.InstanceCredentials(nil, getenv("AWS_EC2_METADATA_SERVICE_ENDPOINT")))
+	}
+	var runtime bedrock.CredentialSource
+	if len(sources) > 0 {
+		runtime = bedrock.FirstWorkingCredentials(sources...)
 	}
 
 	return func(ctx context.Context) (bedrock.Credentials, error) {
@@ -68,6 +76,9 @@ func awsCredentials(p Provider, getenv func(string) string) bedrock.CredentialSo
 				return creds, nil
 			}
 			reasons = append(reasons, err.Error())
+		}
+		if len(reasons) == 0 {
+			return bedrock.Credentials{}, errors.New("aws credentials: none are configured, in the file, the environment or the runtime")
 		}
 		return bedrock.Credentials{}, fmt.Errorf("aws credentials: nothing usable in the file, the environment or the runtime: %s",
 			strings.Join(reasons, "; "))

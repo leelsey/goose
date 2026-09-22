@@ -14,17 +14,37 @@ port = 11234
 # tls_cert = "/etc/goose/fullchain.pem"
 # tls_key  = "/etc/goose/privkey.pem"
 
+# api_key = "..."                   # prefer api_key_env: argv and files are read by others
+# cors_origin = "https://app.example"  # a wildcard origin needs a key
+# max_body_mb = 32                  # largest request body accepted
 # max_concurrent = 64               # requests in flight; over it, 503
-# max_per_minute = 600              # per caller, by credential else address
+# max_per_minute = 600              # by what a caller proved: one allowance for
+#                                   everyone holding server.api_key, and one per
+#                                   upstream credential where there is no key
+# forwarded_header = "X-Forwarded-For"  # only behind a proxy you trust
+# attempt_timeout = "15m"           # one attempt; a stream stops the clock once primed
+# max_response_mb = 64              # ceiling on one upstream body
+# breaker_failures = 5              # failures before a backend is skipped
+# breaker_cooldown = "30s"          # before it is probed again
 # metrics = true                    # GET /metrics, behind the same key
 # mcp_tools = false                 # goose's own models as tools on /mcp
-# redact_upstream_errors = false    # keep a backend's error text off the reply
+# redact_upstream_errors = false    # keep a backend's own words off the reply and
+#                                   out of the usage ledger, where a refusal that
+#                                   quotes the request would carry the prompt
+# passthrough = "claude"            # forward anything unrouted to this provider
+# formats = [...]                   # same as the root key, kept for older files
 
 [[provider]]
 id = "claude"
 kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
-# model = "claude-sonnet-5"
+# model = "claude-sonnet-5"        # what this backend is asked for when the route does not say
+# version = "2023-06-01"           # anthropic-version; the built-in default is current
+# betas = ["context-1m-2025-08-07"]
+# timeout = "60s"                  # how long this backend has to start answering
+# max_retries = 2                  # retries within one attempt, on its own errors
+# allow_client_key = false         # let a caller's own key reach this backend
+# headers = { x-team = "core" }    # sent with every call to it
 
 [[provider]]
 id = "gpt"
@@ -35,6 +55,7 @@ api_key_env = "OPENAI_API_KEY"
 id = "local"
 kind = "ollama"
 base_url = "http://127.0.0.1:11434"
+# prefix = "/v1beta"               # path between base_url and the endpoint, for google-shaped hosts
 
 # Azure AI Foundry. Omit api_version for the rolling v1 surface; a dated value
 # selects the deployment-scoped one.
@@ -66,7 +87,8 @@ base_url = "http://127.0.0.1:11434"
 # model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
 # options = { region = "us-east-1", profile = "default" }
 
-# GCP Vertex. The publisher comes from the model name; one entry per vendor.
+# GCP Vertex. One entry per vendor: the publisher comes from the model name, so
+# either model or options.publisher is required.
 # [[provider]]
 # id = "vertex"
 # kind = "vertex"
@@ -102,8 +124,14 @@ chain = ["gpt"]
 name = "rest"
 chain = ["local"]
 # strict = true                       # refuse a translation that lost content
+# strict = false                      # say so to opt out of a strict server
 # allow  = ["wire.no_finish_reason"]  # live with this one
 # deny   = ["drop.thinking"]          # refuse for this one
+# formats = ["openai"]                # match only calls arriving on these wires
+# header  = ["x-team=core"]           # match only calls carrying these headers
+# model   = "claude-sonnet-5"         # what every link of the chain is asked for
+# tools   = ["mcp"]                   # tool groups offered on this route
+# sticky  = true                      # keep a session on the backend that began it
 
 # Tool servers goose dials. Their tools are advertised on the routes that ask
 # for them. A server the backend dials itself is named by the request instead.
@@ -111,6 +139,9 @@ chain = ["local"]
 # name = "files"
 # command = "mcp-server-filesystem"
 # args = ["/srv/data"]
+# dir = "/srv"                      # working directory for the server process
+# env_allow = ["HOME", "PATH"]      # the only environment it inherits
+# timeout = "30s"                   # how long one of its calls may take
 
 # [[mcp]]
 # name = "remote"

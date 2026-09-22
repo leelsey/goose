@@ -51,6 +51,8 @@ type Server struct {
 	MCPTools        bool     `toml:"mcp_tools"`
 	MaxConcurrent   int      `toml:"max_concurrent"`
 	MaxPerMinute    int      `toml:"max_per_minute"`
+	AttemptTimeout  string   `toml:"attempt_timeout"`
+	MaxResponseMB   int      `toml:"max_response_mb"`
 	ForwardedHeader string   `toml:"forwarded_header"`
 	BreakerFailures int      `toml:"breaker_failures"`
 	BreakerCooldown string   `toml:"breaker_cooldown"`
@@ -88,7 +90,7 @@ type Route struct {
 	Chain   []string `toml:"chain"`
 	Tools   []string `toml:"tools"`
 	Sticky  bool     `toml:"sticky"`
-	Strict  bool     `toml:"strict"`
+	Strict  *bool    `toml:"strict"`
 	Allow   []string `toml:"allow"`
 	Deny    []string `toml:"deny"`
 }
@@ -105,6 +107,15 @@ const (
 	defPort  = 11234
 	defHost  = "127.0.0.1"
 	defTimeo = 5 * time.Minute
+
+	// An attempt that has not answered in this long is not going to, and an
+	// upstream that keeps sending past this is not answering a question anyone
+	// asked. Both are generous: a streamed answer stops this clock once it has
+	// been primed, so only a whole non-streamed answer has to fit inside it,
+	// and that includes a reasoning model working through a large ceiling.
+	// Raise it with server.attempt_timeout where that is not enough.
+	defAttempt  = 15 * time.Minute
+	defResponse = 64 << 20
 )
 
 func defaults() *Config {
@@ -209,6 +220,7 @@ func (c *Config) validate() error {
 		{"server.max_body_mb", c.Server.MaxBodyMB},
 		{"server.max_concurrent", c.Server.MaxConcurrent},
 		{"server.max_per_minute", c.Server.MaxPerMinute},
+		{"server.max_response_mb", c.Server.MaxResponseMB},
 		{"server.breaker_failures", c.Server.BreakerFailures},
 	} {
 		if knob.value < 0 {
@@ -437,6 +449,9 @@ func checkOptions(id string, p Provider) error {
 			return fmt.Errorf("provider %q: %s is read by kind %s, not %s", id, only.name, strings.Join(only.kinds, ", "), p.Kind)
 		}
 	}
+	if p.Kind == "vertex" && p.Model == "" && p.Options["publisher"] == "" {
+		return fmt.Errorf("provider %q: vertex serves one publisher per entry, so it needs model or option publisher", id)
+	}
 	return nil
 }
 
@@ -475,7 +490,10 @@ func parseDuration(s string) time.Duration {
 type namedDuration struct{ name, value string }
 
 func (c *Config) durations() []namedDuration {
-	out := []namedDuration{{"server.breaker_cooldown", c.Server.BreakerCooldown}}
+	out := []namedDuration{
+		{"server.breaker_cooldown", c.Server.BreakerCooldown},
+		{"server.attempt_timeout", c.Server.AttemptTimeout},
+	}
 	for _, p := range c.Providers {
 		id := p.ID
 		if id == "" {

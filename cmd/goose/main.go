@@ -196,8 +196,12 @@ func run(args []string, stdout, stderr *os.File) error {
 		Addr:              addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 30 * time.Second,
-		WriteTimeout:      60 * time.Minute,
-		IdleTimeout:       2 * time.Minute,
+		// A request body arrives in one go; only the answer is slow. Without
+		// this a client dribbling its body holds a connection, and a
+		// concurrency slot behind it, for as long as it cares to.
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 60 * time.Minute,
+		IdleTimeout:  2 * time.Minute,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -365,6 +369,9 @@ func banner(out *os.File, cfg *Config, origin, addr string, routes []string, too
 	if tools != nil {
 		for _, t := range tools.Servers() {
 			count := fmt.Sprintf("%d tools", t.Tools)
+			if t.Truncated {
+				count += " (and more than goose will hold)"
+			}
 			if n := len(t.Refused); n > 0 {
 				count += fmt.Sprintf(" (%d refused: %s)", n, strings.Join(t.Refused, ", "))
 			}
@@ -411,7 +418,8 @@ usage: goose [flags]
   -c <file>        configuration file (default .goose.toml, goose.toml,
                    ~/.config/goose/config.toml)
   -l <host:port>   listen address (default 127.0.0.1:11234)
-  -k <key>         proxy API key (or set GOOSE_PROXY_KEY)
+  -k <key>         proxy API key; prefer GOOSE_PROXY_KEY, since anyone on this
+                   host can read an argument list
   -p <kind>        serve one provider: anthropic, openai, google, ollama, compatible
   -m <model>       model that provider serves
   -u <url>         provider base URL
