@@ -476,3 +476,86 @@ func TestTheClosingItemCarriesEveryPartTheStreamAnnounced(t *testing.T) {
 		})
 	}
 }
+
+// The same answer read from the events and read from one unstreamed reply must
+// hold the same parts: a refusal on its own is a refusal on its own either way.
+func TestStreamedAndUnstreamedAgreeOnTheParts(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		parts []llm.Part
+	}{
+		{"refusal only", []llm.Part{&llm.Refusal{Text: "I can't."}}},
+		{"text only", []llm.Part{&llm.Text{Text: "hello"}}},
+		{"text then refusal", []llm.Part{&llm.Text{Text: "hm"}, &llm.Refusal{Text: "no"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frames := []*llm.Frame{{Delta: tc.parts}, {Stop: llm.StopEnd, TurnEnd: true}}
+			s := llm.StaticStream(llm.StreamMeta{Model: "m"}, frames)
+			w := &wire.BufferWriter{}
+			if _, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, w); err != nil {
+				t.Fatal(err)
+			}
+			streamed := lastMessageParts(t, w.Body.String())
+
+			resp := &llm.Response{ID: "r", Model: "m", Choices: []llm.Choice{{
+				Message: llm.Message{Role: llm.RoleAssistant, Content: tc.parts}, Stop: llm.StopEnd,
+			}}}
+			out, _, err := New(Options{}).EncodeResponse(resp, wire.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var body struct {
+				Output []struct {
+					Type    string `json:"type"`
+					Content []struct {
+						Type string `json:"type"`
+					} `json:"content"`
+				} `json:"output"`
+			}
+			if err := json.Unmarshal(out.Body, &body); err != nil {
+				t.Fatal(err)
+			}
+			var unstreamed []string
+			for _, it := range body.Output {
+				if it.Type != "message" {
+					continue
+				}
+				for _, p := range it.Content {
+					unstreamed = append(unstreamed, p.Type)
+				}
+			}
+			if strings.Join(streamed, ",") != strings.Join(unstreamed, ",") {
+				t.Fatalf("streamed %v, unstreamed %v", streamed, unstreamed)
+			}
+		})
+	}
+}
+
+func lastMessageParts(t *testing.T, body string) []string {
+	t.Helper()
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		raw, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		var ev struct {
+			Type string `json:"type"`
+			Item struct {
+				Type    string `json:"type"`
+				Content []struct {
+					Type string `json:"type"`
+				} `json:"content"`
+			} `json:"item"`
+		}
+		if json.Unmarshal([]byte(raw), &ev) != nil || ev.Type != "response.output_item.done" ||
+			ev.Item.Type != "message" {
+			continue
+		}
+		out = nil
+		for _, p := range ev.Item.Content {
+			out = append(out, p.Type)
+		}
+	}
+	return out
+}

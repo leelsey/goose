@@ -59,22 +59,31 @@ func mustJSON(v any) json.RawMessage {
 func describe(p llm.Part) string {
 	switch v := p.(type) {
 	case *llm.Text:
-		return v.Text
+		if v.Text != "" {
+			return v.Text
+		}
 	case *llm.Thinking:
-		return v.Text
+		if v.Text != "" {
+			return v.Text
+		}
 	case *llm.Refusal:
-		return v.Text
+		if v.Text != "" {
+			return v.Text
+		}
 	case *llm.ToolUse:
 		if len(v.Args) > 0 {
 			return v.Name + " " + string(v.Args)
 		}
 		return v.Name
 	case *llm.ToolResult:
-		inner := llm.TextOf(v.Content)
-		if v.IsError {
-			return "error: " + inner
+		if inner := llm.TextOf(v.Content); inner != "" {
+			if v.IsError {
+				return "error: " + inner
+			}
+			return inner
 		}
-		return inner
 	}
+	// Nothing readable came out of it, but a part that reached here is still a
+	// part the tool produced, so its kind travels rather than nothing at all.
 	return string(p.Kind())
 }

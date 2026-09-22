@@ -58,7 +58,7 @@ func (e *rpcError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	return fmt.Sprintf("mcp: %d %s", e.Code, e.Message)
+	return fmt.Sprintf("%d %s", e.Code, e.Message)
 }
 
 func (r *response) isAnswer(id string) bool {

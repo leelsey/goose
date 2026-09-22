@@ -28,8 +28,13 @@ type streamer struct {
 	outputIndex int
 	buf         string
 	refusalBuf  string
-	refusalOpen bool
-	summaryOpen bool
+	// A part is announced when something arrives for it, and its index is the
+	// order it was announced in. A message that carries only a refusal has no
+	// text part at all, which is what the unstreamed shape says too.
+	textIndex    int
+	refusalIndex int
+	parts        int
+	summaryOpen  bool
 
 	imageBuf    []byte
 	imageFmt    string
@@ -59,6 +64,7 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 		sse:    wire.NewSSE(w),
 		respID: c.id(meta.ID), model: model, created: created(meta.Created), extra: meta.Extra,
 		items: []item{}, merger: wirecore.NewToolMerger(),
+		textIndex: -1, refusalIndex: -1,
 		budget: c.opts.MaxBuffer,
 	}
 	if st.budget <= 0 {
@@ -206,27 +212,21 @@ func (s *streamer) part(p llm.Part) {
 			return
 		}
 		s.openMessage()
+		at := s.announce(&s.textIndex, contentPart{Type: "output_text", Annotations: []string{}})
 		s.hold(&s.buf, v.Text)
 		s.event("response.output_text.delta", map[string]any{
-			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 0, "delta": v.Text,
+			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "delta": v.Text,
 		})
 	case *llm.Refusal:
 		if v.Text == "" {
 			return
 		}
 		s.openMessage()
-		// A part is announced before anything is streamed into it, and a
-		// refusal sits beside the text rather than replacing it.
-		if !s.refusalOpen {
-			s.refusalOpen = true
-			s.event("response.content_part.added", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1,
-				"part": contentPart{Type: "refusal"},
-			})
-		}
+		// A refusal sits beside the text rather than replacing it.
+		at := s.announce(&s.refusalIndex, contentPart{Type: "refusal"})
 		s.hold(&s.refusalBuf, v.Text)
 		s.event("response.refusal.delta", map[string]any{
-			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1, "delta": v.Text,
+			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "delta": v.Text,
 		})
 	case *llm.ToolUse:
 		s.merger.Merge(v, s.charge)
@@ -328,10 +328,19 @@ func (s *streamer) openMessage() {
 		"output_index": s.outputIndex,
 		"item":         item{Type: "message", ID: s.itemID, Role: "assistant", Status: "in_progress", Content: []contentPart{}},
 	})
-	s.event("response.content_part.added", map[string]any{
-		"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 0,
-		"part": contentPart{Type: "output_text", Annotations: []string{}},
-	})
+}
+
+// part announces a content part the first time something arrives for it.
+func (s *streamer) announce(index *int, p contentPart) int {
+	if *index < 0 {
+		*index = s.parts
+		s.parts++
+		s.event("response.content_part.added", map[string]any{
+			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": *index,
+			"part": p,
+		})
+	}
+	return *index
 }
 
 func (s *streamer) closeItem() {
@@ -367,38 +376,39 @@ func (s *streamer) closeItem() {
 		s.event("response.output_item.done", map[string]any{"output_index": s.outputIndex, "item": it})
 		s.imageBuf, s.imagePrompt, s.imageFmt, s.imageParts = nil, "", "", 0
 	case "message":
-		s.event("response.output_text.done", map[string]any{
-			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 0, "text": s.buf,
-		})
-		s.event("response.content_part.done", map[string]any{
-			"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 0,
-			"part": contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}},
-		})
 		it := item{Type: "message", ID: s.itemID, Role: "assistant", Status: "completed"}
-		// The text part was announced when the message opened, so it is carried
-		// whether or not anything was written into it: a client that followed
-		// the events and one that read the closing object have to agree on
-		// which part sits at which index.
-		it.Content = append(it.Content, contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}})
-		// The part was announced when the refusal opened, so it is closed on
-		// the way out whether or not anything fitted in it.
-		if s.refusalOpen {
-			s.event("response.refusal.done", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1, "refusal": s.refusalBuf,
+		// Every part announced is closed and carried, at the index it was
+		// announced under, so a client that followed the events and one that
+		// read the closing object agree about what the message holds.
+		parts := make([]contentPart, s.parts)
+		if s.textIndex >= 0 {
+			parts[s.textIndex] = contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}}
+			s.event("response.output_text.done", map[string]any{
+				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.textIndex, "text": s.buf,
 			})
 			s.event("response.content_part.done", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": 1,
-				"part": contentPart{Type: "refusal", Refusal: s.refusalBuf},
+				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.textIndex,
+				"part": parts[s.textIndex],
 			})
-			it.Content = append(it.Content, contentPart{Type: "refusal", Refusal: s.refusalBuf})
 		}
+		if s.refusalIndex >= 0 {
+			parts[s.refusalIndex] = contentPart{Type: "refusal", Refusal: s.refusalBuf}
+			s.event("response.refusal.done", map[string]any{
+				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.refusalIndex, "refusal": s.refusalBuf,
+			})
+			s.event("response.content_part.done", map[string]any{
+				"item_id": s.itemID, "output_index": s.outputIndex, "content_index": s.refusalIndex,
+				"part": parts[s.refusalIndex],
+			})
+		}
+		it.Content = append(it.Content, parts...)
 		s.items = append(s.items, it)
 		s.event("response.output_item.done", map[string]any{"output_index": s.outputIndex, "item": it})
 	}
 	s.open = ""
 	s.buf = ""
 	s.refusalBuf = ""
-	s.refusalOpen = false
+	s.textIndex, s.refusalIndex, s.parts = -1, -1, 0
 }
 
 func (s *streamer) flushTools() {

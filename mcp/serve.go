@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -43,9 +44,14 @@ func (m *Manager) modern(ctx context.Context, req *request, agreement meta, seen
 		// vouch for, and waving them through is the one answer it must not give.
 		expected, err := paramHeaders(m.schemaOf(params.Name), params.Arguments)
 		if err != nil {
+			if errors.Is(err, errNotAnObject) {
+				return nil, &rpcError{Code: -32602, status: 400, Message: errNotAnObject.Error()}
+			}
+			// The tool's own schema is what could not be read, which is not
+			// something the caller can put right or needs the detail of.
 			return nil, &rpcError{
-				Code: -32602, status: 400,
-				Message: "the arguments are not an object",
+				Code: -32603, status: 500,
+				Message: "this tool's schema cannot be checked against what was sent",
 			}
 		}
 		if bad := seen.checkParams(expected); bad != nil {
@@ -219,7 +225,13 @@ func (m *Manager) rawTool(name string) map[string]any {
 func (m *Manager) callTool(ctx context.Context, name string, args json.RawMessage) (map[string]any, *rpcError) {
 	result, err := m.Call(ctx, name, args)
 	if err != nil {
-		return nil, &rpcError{Code: -32602, Message: err.Error()}
+		// A server's own words were already kept to a line where they arrived;
+		// repeating the whole chain here would put them back over it.
+		var upstream *rpcError
+		if errors.As(err, &upstream) {
+			return nil, &rpcError{Code: upstream.Code, Message: tame(upstream.Message)}
+		}
+		return nil, &rpcError{Code: -32602, Message: tame(err.Error())}
 	}
 	out := map[string]any{
 		"content": encodeContent(result.Content),

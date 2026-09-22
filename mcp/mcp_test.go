@@ -2419,3 +2419,69 @@ func TestAResourceTravelsOnce(t *testing.T) {
 		t.Fatalf("text = %q", llm.TextOf(parts))
 	}
 }
+
+// How much a server can make goose hold is not the server's to choose, and a
+// name it refuses is no exception: the refusals are printed whole.
+func TestRefusalsAreBoundedToo(t *testing.T) {
+	bad, _ := json.Marshal("bad" + string(rune(1)) + "name")
+	var entries []string
+	for i := 0; i < 20000; i++ {
+		entries = append(entries, `{"name":`+string(bad)+`,"inputSchema":{"type":"object"}}`)
+	}
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+	}}
+	c := newClient("loud", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	refused := c.Refused()
+	if len(refused) > maxTools {
+		t.Fatalf("held %d refusals for a ceiling of %d tools", len(refused), maxTools)
+	}
+	if len(refused) == 0 {
+		t.Fatal("twenty thousand names were not carried and nothing said so")
+	}
+	var bytes int
+	for _, r := range refused {
+		bytes += len(r)
+	}
+	if bytes > maxTools*maxSaid {
+		t.Fatalf("the refusals come to %d bytes, and a status line prints them whole", bytes)
+	}
+}
+
+// The caller's arguments failing to be an object and the tool's own schema
+// failing to be checkable are different things, and the answer says which.
+func TestABadSchemaIsNotBlamedOnTheCaller(t *testing.T) {
+	m := NewManager()
+	defer m.Close()
+	err := m.Serve("fs", Tool{
+		Definition: llm.Tool{Name: "read", Schema: json.RawMessage(
+			`{"type":"object","properties":{"a":{"type":"string","x-mcp-header":"bad header"}}}`)},
+		Call: func(context.Context, json.RawMessage) (*Result, error) { return &Result{}, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := paramHeaders(m.schemaOf("read"), json.RawMessage(`{"a":"x"}`)); err == nil {
+		t.Fatal("a header name this wire cannot carry is a schema goose cannot mirror")
+	} else if errors.Is(err, errNotAnObject) {
+		t.Fatalf("a schema fault was read as the caller's arguments: %v", err)
+	}
+	if _, err := paramHeaders(json.RawMessage(
+		`{"type":"object","properties":{"a":{"type":"string","x-mcp-header":"A"}}}`),
+		json.RawMessage(`[1,2]`)); !errors.Is(err, errNotAnObject) {
+		t.Fatalf("arguments that are not an object were read as something else: %v", err)
+	}
+}

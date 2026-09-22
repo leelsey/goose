@@ -431,24 +431,29 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			if json.Unmarshal(entry, &t) != nil || t.Name == "" {
 				continue
 			}
-			offered := t.Name
+			offered := tame(t.Name)
+			// A name offered twice is one tool. Keeping both copies shows the
+			// first to the model while the second decides what goes on the
+			// wire, so the definition on display would not be the one in use.
+			// A refusal counts for this too: how many of them there are is no
+			// more the server's to choose than how many tools there are.
+			if offered == "" || seen[offered] {
+				continue
+			}
+			seen[offered] = true
+			if len(out)+len(refused) >= maxTools {
+				truncated = true
+				break
+			}
 			t.Name = usableName(t.Name)
 			if t.Name == "" {
 				// Cutting it would leave a name the server does not answer to,
 				// so it is not offered — and saying so is the whole point.
-				refused = append(refused, tame(offered))
+				refused = append(refused, offered)
 				continue
 			}
-			// A name offered twice is one tool. Keeping both copies shows the
-			// first to the model while the second decides what goes on the
-			// wire, so the definition on display would not be the one in use.
-			if _, taken := raw[t.Name]; taken || seen[t.Name] {
+			if _, taken := raw[t.Name]; taken {
 				continue
-			}
-			seen[t.Name] = true
-			if len(out) >= maxTools {
-				truncated = true
-				break
 			}
 			schema := t.InputSchema
 			if len(schema) == 0 || string(schema) == "null" {

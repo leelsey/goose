@@ -6,6 +6,7 @@ package llm
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -623,5 +624,28 @@ func TestRedactionDoesNotRewriteTheProvidersFrame(t *testing.T) {
 	}
 	if frames[0].Err != original {
 		t.Fatal("the provider's slice now holds a different error")
+	}
+}
+
+// Priming a stream twice hands back the same failure the first call did, and a
+// proxy that must not repeat a backend's words gets none of them either time.
+func TestPrimingTwiceTellsTheSameStory(t *testing.T) {
+	s := NewStream(StreamMeta{Provider: "up"}, func() (*Frame, error) {
+		return nil, &Error{Kind: KindUpstream, Provider: "up", Message: "SECRET-UPSTREAM-TEXT"}
+	}, nil)
+	s.Redact(func(*Error) *Error {
+		return &Error{Kind: KindUpstream, Message: "the upstream failed to serve this request"}
+	})
+	first, second := s.Prime(), s.Prime()
+	if first == nil {
+		t.Fatal("a stream whose only frame is a failure did not fail")
+	}
+	if first.Error() != second.Error() {
+		t.Fatalf("first = %q, second = %q", first, second)
+	}
+	for _, e := range []error{first, second} {
+		if strings.Contains(e.Error(), "SECRET-UPSTREAM-TEXT") {
+			t.Fatalf("the backend's own words reached the caller: %v", e)
+		}
 	}
 }

@@ -5,12 +5,18 @@ package mcp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 )
 
 const headerAnnotation = "x-mcp-header"
+
+// errNotAnObject is the caller's arguments failing to be an object. Every other
+// failure here is the tool's own schema failing, which is not the caller's
+// doing and must not be reported to them as though it were.
+var errNotAnObject = errors.New("the arguments are not an object")
 
 func paramHeaders(schema, args json.RawMessage) (map[string]string, error) {
 	named, err := annotated(schema)
@@ -22,7 +28,7 @@ func paramHeaders(schema, args json.RawMessage) (map[string]string, error) {
 		if err := json.Unmarshal(args, &values); err != nil {
 			// The mirror check reads these. Answering "nothing to check"
 			// for arguments nobody could read would skip it instead.
-			return nil, fmt.Errorf("mcp: the arguments are not an object: %w", err)
+			return nil, fmt.Errorf("%w: %v", errNotAnObject, err)
 		}
 	}
 	out := map[string]string{}
