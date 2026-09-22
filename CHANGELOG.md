@@ -177,6 +177,27 @@ were left alone.
 - A locally registered tool answering with neither a result nor an error was
   read as an answer, and the first thing that reached into it took the process
   with it.
+- The accumulation ceiling reported itself once for every delta that arrived
+  after it rather than once, so the setting that exists to stop an answer
+  filling memory filled it faster than the text it was refusing: thirty-two
+  megabytes past the ceiling held eight hundred thousand copies of one
+  diagnostic, and every copy travelled into the answer and the ledger row.
+- An attempt that was sent and then discarded on a retry had the upstream's own
+  message written into the ledger whole, whatever `WithRedactedErrors` had been
+  told, because that row is booked from under the provider. A backend's refusal
+  routinely quotes the request back, so the passage an operator asked to keep
+  out was kept out of the row that failed and written down on every row that was
+  retried past.
+- An attempt that was made now always leaves a row saying what it knows: a
+  backend handing back a stream and a failure together had its usage recorded as
+  though nothing had been spent rather than as uncounted, and one answering with
+  neither a stream nor a failure left no row at all for a call the vendor may
+  have billed.
+- A usage sink panicking took the process rather than the row whenever it was
+  the only sink configured.
+- Two consecutive frames carrying nothing but fields a wire does not model were
+  one set of them by the time the next chunk could carry either, on the OpenAI
+  and Ollama streams.
 
 ### Added
 
@@ -220,6 +241,10 @@ were left alone.
 - `llm.MCPServer`'s tool and approval lists tell an empty list from an absent
   one: naming nothing is a setting, and it is kept through a clone and out to
   every wire.
+- `llm.Error` gained `Reason` and `Detail`, which say what a ledger is told about
+  a failure and whether the upstream's own words are part of it, and
+  `llm.Attempt` gained `Redact`, which carries that choice down to the rows
+  booked from under a provider.
 
 ## v0.1.0
 
