@@ -17,18 +17,19 @@ const maxHeld = 64 << 10
 // Held is what a codec is carrying forward from frames that wrote nothing.
 type Held struct {
 	fields  map[string]json.RawMessage
-	carried map[string]bool
+	carried map[uint64]struct{}
 	weight  int
 	full    bool
 	unsure  bool
 }
 
-// A field name is remembered so that one arriving again after the last chunk
-// can be told from one arriving for the first time. How many distinct names a
-// stream uses is the upstream's to choose, so past this many the question is
-// answered the quiet way: an upstream that names this many fields is not one
-// whose last frame is worth crying loss over.
-const maxNames = 256
+// What has already gone out is remembered as a fixed-size mark apiece rather
+// than as the field itself, because what a field is called and what it says are
+// both the upstream's to choose the size of, and remembering them would put no
+// ceiling on what a stream costs to encode. A field repeated unchanged is one
+// mark however many chunks carry it, so an ordinary stream makes a handful;
+// past this many the question is answered the quiet way rather than wrongly.
+const maxCarried = 1024
 
 // Keep takes a frame's unmodelled fields. Two frames that each carry some are
 // two sets of them, not one replacing the other, and the map is the codec's own
@@ -78,12 +79,31 @@ func (h *Held) Waiting() bool {
 	if h.unsure {
 		return false
 	}
-	for k := range h.fields {
-		if !h.carried[k] {
+	for k, v := range h.fields {
+		if _, gone := h.carried[mark(k, v)]; !gone {
 			return true
 		}
 	}
 	return false
+}
+
+// mark stands for one field and what it said. A name that went out saying one
+// thing and is stranded saying another has not gone out: the field is the pair,
+// not the name.
+func mark(name string, value json.RawMessage) uint64 {
+	const (
+		offset = 1469598103934665603
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := range len(name) {
+		h = (h ^ uint64(name[i])) * prime
+	}
+	h = (h ^ 0) * prime
+	for i := range len(value) {
+		h = (h ^ uint64(value[i])) * prime
+	}
+	return h
 }
 
 // Carry merges what has waited into the fields of the chunk now being written
@@ -108,16 +128,16 @@ func (h *Held) Carry(own map[string]json.RawMessage) map[string]json.RawMessage 
 	return merged
 }
 
-// remember notes the names that have now ridden a chunk of this answer.
+// remember notes the fields that have now ridden a chunk of this answer.
 func (h *Held) remember(fields map[string]json.RawMessage) {
-	for k := range fields {
-		if len(h.carried) >= maxNames {
+	for k, v := range fields {
+		if len(h.carried) >= maxCarried {
 			h.unsure = true
 			return
 		}
 		if h.carried == nil {
-			h.carried = make(map[string]bool, len(fields))
+			h.carried = map[uint64]struct{}{}
 		}
-		h.carried[k] = true
+		h.carried[mark(k, v)] = struct{}{}
 	}
 }

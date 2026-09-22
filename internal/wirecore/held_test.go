@@ -124,3 +124,49 @@ func TestWhatSurvivesTheCeilingIsTheSameEveryTime(t *testing.T) {
 		}
 	}
 }
+
+// A name that travelled carrying one thing and is stranded carrying another is
+// a loss, whatever the name did before. Asking only whether the name has been
+// seen answers no to exactly the frame this is about.
+func TestAFieldStrandedWithSomethingNewToSayIsALoss(t *testing.T) {
+	for _, tc := range []struct {
+		what     string
+		carried  json.RawMessage
+		stranded json.RawMessage
+		loss     bool
+	}{
+		{"the same thing again", json.RawMessage(`{"id":"req_1"}`), json.RawMessage(`{"id":"req_1"}`), false},
+		{"and something more", json.RawMessage(`{"id":"req_1"}`), json.RawMessage(`{"id":"req_1","queue_time":0.12}`), true},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			var h Held
+			h.Carry(map[string]json.RawMessage{"x_vendor": tc.carried})
+			h.Keep(map[string]json.RawMessage{"x_vendor": tc.stranded})
+			if got := h.Waiting(); got != tc.loss {
+				t.Errorf("reported a loss = %v, want %v", got, tc.loss)
+			}
+		})
+	}
+}
+
+// What is remembered about the answer so far is the upstream's to choose the
+// size of, so it is counted in fixed pieces rather than in whatever it named
+// them.
+func TestTheMemoryOfWhatTravelledIsBounded(t *testing.T) {
+	var h Held
+	fat := strings.Repeat("n", 1<<16)
+	for i := range maxCarried + 100 {
+		h.Carry(map[string]json.RawMessage{
+			fmt.Sprintf("%s%d", fat, i): json.RawMessage(`1`),
+		})
+	}
+	if len(h.carried) > maxCarried {
+		t.Errorf("remembered %d pieces, want at most %d", len(h.carried), maxCarried)
+	}
+	// Past what it will remember it stops answering rather than answering
+	// wrongly, and says nothing rather than crying loss over what it forgot.
+	h.Keep(map[string]json.RawMessage{"brand_new": json.RawMessage(`1`)})
+	if h.Waiting() {
+		t.Error("it answered a question it had already forgotten the answer to")
+	}
+}
