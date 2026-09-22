@@ -68,8 +68,12 @@ func SynthesiseFrames(resp *llm.Response) []*llm.Frame {
 		out = append(out, fin)
 	}
 
+	// A block is why the backend stopped, and a candidate having arrived does
+	// not make that less true.
 	if len(resp.Choices) == 0 && (resp.Block != nil || resp.Stop != llm.StopNone) {
 		out = append(out, &llm.Frame{Block: resp.Block, Stop: resp.Stop})
+	} else if len(resp.Choices) > 0 && resp.Block != nil {
+		out = append(out, &llm.Frame{Block: resp.Block})
 	}
 
 	u := resp.Usage

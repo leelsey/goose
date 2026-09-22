@@ -42,7 +42,6 @@ type Reader struct {
 	r    io.Reader
 	max  int
 	crc  *crc32.Table
-	buf  []byte
 	last Message
 	err  error
 	done bool
@@ -66,9 +65,17 @@ func (r *Reader) Next() bool {
 	prelude := make([]byte, preludeLen)
 	if _, err := io.ReadFull(r.r, prelude); err != nil {
 		r.done = true
-		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			r.err = err
+		// ReadFull answers io.EOF only when it read nothing, which is where a
+		// clean end falls: between messages. Anything else lost bytes, and a
+		// stream that lost its last message is not a stream that finished.
+		if errors.Is(err, io.EOF) {
+			return false
 		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			r.err = fmt.Errorf("awsstream: truncated message: %w", err)
+			return false
+		}
+		r.err = err
 		return false
 	}
 	total := binary.BigEndian.Uint32(prelude[0:4])

@@ -271,3 +271,40 @@ func TestFoldContinuesACallWhoseIDRepeats(t *testing.T) {
 		t.Fatalf("second = %+v", calls[1])
 	}
 }
+
+func TestFoldGathersALongRunWithoutRewritingIt(t *testing.T) {
+	frames := make([]*llm.Frame, 0, 2001)
+	for range 1000 {
+		frames = append(frames, &llm.Frame{Delta: []llm.Part{&llm.Text{Text: "ab"}}})
+	}
+	for range 1000 {
+		frames = append(frames, &llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: "cd"}}})
+	}
+	frames = append(frames, &llm.Frame{Stop: llm.StopEnd})
+	r := fold(t, frames...)
+
+	if got := llm.TextOf(parts(r)); len(got) != 2000 {
+		t.Fatalf("text = %d bytes, want 2000", len(got))
+	}
+	var thinking int
+	for _, p := range parts(r) {
+		if th, ok := p.(*llm.Thinking); ok {
+			thinking += len(th.Text)
+		}
+	}
+	if thinking != 2000 {
+		t.Fatalf("thinking = %d bytes: every delta of a run must survive being gathered", thinking)
+	}
+}
+
+func TestFoldBoundsWhatAnUpstreamCanMint(t *testing.T) {
+	f := NewFolder(FoldOptions{})
+	for i := range maxChoices * 3 {
+		idx := i
+		f.Add(&llm.Frame{Choice: &idx, Delta: []llm.Part{&llm.Text{Text: "x"}}, Stop: llm.StopEnd})
+	}
+	resp := f.Response(llm.StreamMeta{Provider: "stub"}, llm.Usage{})
+	if len(resp.Choices) > maxChoices {
+		t.Fatalf("choices = %d: the candidate index is the upstream's to choose", len(resp.Choices))
+	}
+}

@@ -14,11 +14,18 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 }
 
-func interrupt(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
+func interrupt(cmd *exec.Cmd, reaped bool) error {
+	if cmd.Process == nil || reaped {
 		return nil
 	}
 	return cmd.Process.Kill()
+}
+
+func kill(cmd *exec.Cmd, reaped bool) {
+	if cmd.Process == nil || reaped {
+		return
+	}
+	_ = cmd.Process.Kill()
 }
 
 func isSignalled(error) bool { return false }

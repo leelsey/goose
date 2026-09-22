@@ -272,3 +272,56 @@ func TestAChildWithNoEnvironmentInheritsNone(t *testing.T) {
 		t.Fatalf("the child inherited this process's environment:\n%s", out)
 	}
 }
+
+func TestRingKeepsAWriteThatLandsOnTheBoundary(t *testing.T) {
+	r := newRing(8)
+	if _, err := r.Write([]byte("abcde")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Write([]byte("fgh")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(r.Bytes()); got != "abcdefgh" {
+		t.Fatalf("tail = %q: filling the buffer exactly is still filling it", got)
+	}
+}
+
+func TestRingKeepsTheTailOnceItWraps(t *testing.T) {
+	r := newRing(8)
+	if _, err := r.Write([]byte("abcdefgh")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Write([]byte("ij")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(r.Bytes()); got != "cdefghij" {
+		t.Fatalf("tail = %q", got)
+	}
+}
+
+func TestAChildThatIgnoresTheHintIsKilled(t *testing.T) {
+	p, err := StartPiped(context.Background(), Options{
+		Binary: "/bin/sh",
+		Args:   []string{"-c", "trap '' INT; while :; do sleep 1; done"},
+		Grace:  300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Skipf("no shell to spawn: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Without a bound here this blocks for as long as the child cares to live,
+	// and exec's own watchdog does not run for the context such a child is
+	// started with.
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { _ = p.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a server that traps the signal and stays up held shutdown open")
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("close took %v: the grace period is what bounds this", took)
+	}
+}

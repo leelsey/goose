@@ -15,14 +15,30 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func interrupt(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
+// interrupt signals the child and everything it started. The group carries the
+// grandchildren — an agent CLI's own helpers — which the direct signal never
+// reaches, so the group is what is signalled.
+//
+// reaped says the child has already been waited on. Its pid is then the host's
+// to hand out again, and a group signal sent to it could land on a stranger, so
+// the only safe thing left is nothing.
+func interrupt(cmd *exec.Cmd, reaped bool) error {
+	if cmd.Process == nil || reaped {
 		return nil
 	}
 	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGINT); err != nil {
 		return cmd.Process.Signal(syscall.SIGINT)
 	}
 	return nil
+}
+
+func kill(cmd *exec.Cmd, reaped bool) {
+	if cmd.Process == nil || reaped {
+		return
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		_ = cmd.Process.Kill()
+	}
 }
 
 func isSignalled(err error) bool {

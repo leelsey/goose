@@ -79,6 +79,13 @@ func (s *Scanner) Scan() bool {
 		}
 		if len(line) > 0 {
 			s.field(line)
+			if s.done {
+				// The ceiling tripped part way through an event. What has been
+				// read is half of one, and handing that over would let whoever
+				// is upstream choose where the frame ends and so what it says.
+				s.pending, s.data = false, nil
+				return false
+			}
 		}
 		if eof {
 			s.done = true
@@ -139,8 +146,10 @@ func (s *Scanner) readLine() ([]byte, error) {
 	var buf []byte
 	for {
 		chunk, err := s.r.ReadSlice('\n')
-		if len(buf)+len(chunk) > s.maxLine {
-			return nil, fmt.Errorf("%w: %d bytes", ErrLineTooLong, len(buf)+len(chunk))
+		// The terminator is not part of the line, so a line of exactly the
+		// ceiling is a line that fits.
+		if n := len(buf) + len(trimEOL(chunk)); n > s.maxLine {
+			return nil, fmt.Errorf("%w: %d bytes", ErrLineTooLong, n)
 		}
 		buf = append(buf, chunk...)
 		if errors.Is(err, bufio.ErrBufferFull) {
@@ -184,8 +193,10 @@ func (l *Lines) Scan() bool {
 		for {
 			var chunk []byte
 			chunk, err = l.r.ReadSlice('\n')
-			if len(buf)+len(chunk) > l.maxLine {
-				l.err = fmt.Errorf("%w: %d bytes", ErrLineTooLong, len(buf)+len(chunk))
+			// The terminator is not part of the line, the same as it is not for
+			// the event scanner beside this.
+			if n := len(buf) + len(trimEOL(chunk)); n > l.maxLine {
+				l.err = fmt.Errorf("%w: %d bytes", ErrLineTooLong, n)
 				l.done = true
 				return false
 			}

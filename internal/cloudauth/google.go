@@ -88,23 +88,69 @@ type saSource struct {
 	scope  string
 	now    func() time.Time
 
-	mu      sync.Mutex
-	token   string
-	expires time.Time
+	mu       sync.Mutex
+	token    string
+	expires  time.Time
+	inFlight chan struct{}
 }
 
+// A token exchange already under way is waited on rather than repeated, and a
+// waiter waits on its own context. Holding the lock across the exchange would
+// queue every request behind it with no way to give up, and would let whichever
+// one started it cancel the token they are all waiting for.
 func (s *saSource) Token(ctx context.Context) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.token != "" && s.now().Before(s.expires.Add(-time.Minute)) {
-		return s.token, nil
+	for {
+		s.mu.Lock()
+		if s.token != "" && s.now().Before(s.expires.Add(-time.Minute)) {
+			token := s.token
+			s.mu.Unlock()
+			return token, nil
+		}
+		if wait := s.inFlight; wait != nil {
+			s.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		s.inFlight = done
+		s.mu.Unlock()
+
+		token, _, err := s.refresh(ctx, done)
+
+		if err != nil {
+			return "", err
+		}
+		return token, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, exchangeTimeout)
+}
+
+// refresh always clears the in-flight marker and wakes the waiters, including
+// when the exchange panics: leaving either behind parks every future caller on
+// a refresh that will never finish.
+func (s *saSource) refresh(ctx context.Context, done chan struct{}) (token string, expires time.Time, err error) {
+	defer func() {
+		s.mu.Lock()
+		s.inFlight = nil
+		if err == nil {
+			s.token, s.expires = token, expires
+		}
+		s.mu.Unlock()
+		close(done)
+	}()
+	return s.exchange(ctx)
+}
+
+func (s *saSource) exchange(parent context.Context) (string, time.Time, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), exchangeTimeout)
 	defer cancel()
 
 	assertion, err := s.assertion()
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	form := url.Values{
 		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
@@ -112,7 +158,7 @@ func (s *saSource) Token(ctx context.Context) (string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.key.TokenURI, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	client := s.client
@@ -121,26 +167,24 @@ func (s *saSource) Token(ctx context.Context) (string, error) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("google: token exchange: %w", err)
+		return "", time.Time{}, fmt.Errorf("google: token exchange: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("google: token exchange: %d %s", resp.StatusCode, oauthError(body))
+		return "", time.Time{}, fmt.Errorf("google: token exchange: %d %s", resp.StatusCode, oauthError(body))
 	}
 	var out struct {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("google: token exchange: %w", err)
+		return "", time.Time{}, fmt.Errorf("google: token exchange: %w", err)
 	}
 	if out.AccessToken == "" {
-		return "", errors.New("google: token exchange returned no token")
+		return "", time.Time{}, errors.New("google: token exchange returned no token")
 	}
-	s.token = out.AccessToken
-	s.expires = s.now().Add(time.Duration(out.ExpiresIn) * time.Second)
-	return s.token, nil
+	return out.AccessToken, s.now().Add(time.Duration(out.ExpiresIn) * time.Second), nil
 }
 
 func (s *saSource) assertion() (string, error) {
@@ -202,24 +246,59 @@ type metaSource struct {
 	host   string
 	now    func() time.Time
 
-	mu      sync.Mutex
-	token   string
-	expires time.Time
+	mu       sync.Mutex
+	token    string
+	expires  time.Time
+	inFlight chan struct{}
 }
 
 func (m *metaSource) Token(ctx context.Context) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.token != "" && m.now().Before(m.expires.Add(-time.Minute)) {
-		return m.token, nil
+	for {
+		m.mu.Lock()
+		if m.token != "" && m.now().Before(m.expires.Add(-time.Minute)) {
+			token := m.token
+			m.mu.Unlock()
+			return token, nil
+		}
+		if wait := m.inFlight; wait != nil {
+			m.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		m.inFlight = done
+		m.mu.Unlock()
+
+		token, _, err := m.refresh(ctx, done)
+		if err != nil {
+			return "", err
+		}
+		return token, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, exchangeTimeout)
+}
+
+func (m *metaSource) refresh(parent context.Context, done chan struct{}) (token string, expires time.Time, err error) {
+	defer func() {
+		m.mu.Lock()
+		m.inFlight = nil
+		if err == nil {
+			m.token, m.expires = token, expires
+		}
+		m.mu.Unlock()
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), exchangeTimeout)
 	defer cancel()
 
 	url := m.host + "/computeMetadata/v1/instance/service-accounts/default/token"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	req.Header.Set("Metadata-Flavor", "Google")
 	c := m.client
@@ -228,26 +307,24 @@ func (m *metaSource) Token(ctx context.Context) (string, error) {
 	}
 	resp, err := c.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("google: metadata token: %w", err)
+		return "", time.Time{}, fmt.Errorf("google: metadata token: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("google: metadata token: %d %s", resp.StatusCode, oauthError(body))
+		return "", time.Time{}, fmt.Errorf("google: metadata token: %d %s", resp.StatusCode, oauthError(body))
 	}
 	var out struct {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	if out.AccessToken == "" {
-		return "", errors.New("google: metadata returned no token")
+		return "", time.Time{}, errors.New("google: metadata returned no token")
 	}
-	m.token = out.AccessToken
-	m.expires = m.now().Add(time.Duration(out.ExpiresIn) * time.Second)
-	return m.token, nil
+	return out.AccessToken, m.now().Add(time.Duration(out.ExpiresIn) * time.Second), nil
 }
 
 func FirstWorkingSource(sources ...TokenSource) TokenSource {

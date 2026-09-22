@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,8 +40,10 @@ type Process struct {
 	stdin  io.WriteCloser
 	stderr *ring
 
-	once sync.Once
-	err  error
+	once   sync.Once
+	err    error
+	grace  time.Duration
+	reaped atomic.Bool
 }
 
 func StartPiped(ctx context.Context, o Options) (*Process, error) {
@@ -72,7 +75,7 @@ func start(ctx context.Context, o Options, piped bool) (*Process, error) {
 		cmd.Env = []string{}
 	}
 	setProcessGroup(cmd)
-	cmd.Cancel = func() error { return interrupt(cmd) }
+	cmd.Cancel = func() error { return interrupt(cmd, false) }
 	cmd.WaitDelay = o.Grace
 
 	var stdin io.WriteCloser
@@ -95,7 +98,7 @@ func start(ctx context.Context, o Options, piped bool) (*Process, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn %s: %w", o.Binary, err)
 	}
-	return &Process{cmd: cmd, stdout: stdout, stdin: stdin, stderr: errBuf}, nil
+	return &Process{cmd: cmd, stdout: stdout, stdin: stdin, stderr: errBuf, grace: o.Grace}, nil
 }
 
 func (p *Process) Stdout() io.Reader { return p.stdout }
@@ -103,7 +106,10 @@ func (p *Process) Stdout() io.Reader { return p.stdout }
 func (p *Process) Stderr() string { return strings.TrimSpace(string(p.stderr.Bytes())) }
 
 func (p *Process) Wait() error {
-	p.once.Do(func() { p.err = p.cmd.Wait() })
+	p.once.Do(func() {
+		p.err = p.cmd.Wait()
+		p.reaped.Store(true)
+	})
 	return p.err
 }
 
@@ -111,15 +117,34 @@ func (p *Process) Close() error {
 	if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
-	if p.cmd.Process != nil {
-		_ = interrupt(p.cmd)
-	}
+	_ = interrupt(p.cmd, p.reaped.Load())
 	_ = p.stdout.Close()
-	err := p.Wait()
+
+	// A child that will not take the hint is killed rather than waited on for
+	// ever. exec's own watchdog runs only for a context that can be cancelled,
+	// and a child meant to outlive one request is started without one, so the
+	// grace period is kept here instead.
+	err := p.waitGrace()
 	if err != nil && isSignalled(err) {
 		return nil
 	}
 	return err
+}
+
+func (p *Process) waitGrace() error {
+	grace := p.grace
+	if grace <= 0 {
+		grace = DefaultGrace
+	}
+	done := make(chan error, 1)
+	go func() { done <- p.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(grace):
+	}
+	kill(p.cmd, p.reaped.Load())
+	return <-done
 }
 
 func (p *Process) ExitCode() int {
@@ -225,6 +250,9 @@ func (r *ring) Write(p []byte) (int, error) {
 	written := copy(r.buf[r.pos:], p)
 	if written < n {
 		copy(r.buf, p[written:])
+	}
+	// Reaching the end fills the buffer just as wrapping past it does.
+	if r.pos+n >= r.size {
 		r.full = true
 	}
 	r.pos = (r.pos + n) % r.size

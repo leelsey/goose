@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const maxMessage = 2 << 10
@@ -16,49 +17,44 @@ func Upstream(body []byte) (message, code string) {
 	if len(body) == 0 || body[0] != '{' {
 		return "", ""
 	}
-	var top struct {
-		Error   json.RawMessage `json:"error"`
-		Errors  []detail        `json:"errors"`
-		Detail  json.RawMessage `json:"detail"`
-		Message string          `json:"message"`
-		Type    string          `json:"__type"`
-		Code    json.RawMessage `json:"code"`
-		Status  string          `json:"status"`
-	}
+	// Every field is read on its own. A vendor is free to give one of them a
+	// shape goose did not expect, and decoding the whole object at once would
+	// let that one field throw away the sentence the client needs.
+	var top map[string]json.RawMessage
 	if json.Unmarshal(body, &top) != nil {
 		return "", ""
 	}
-	switch {
-	case len(top.Error) > 0:
-		if m, c := read(top.Error); m != "" {
-			return m, c
-		}
-	case len(top.Errors) > 0:
-		if m := clip(top.Errors[0].Message); m != "" {
-			return m, first(number(top.Errors[0].Code), top.Errors[0].Type)
-		}
-	case len(top.Detail) > 0:
-		if m, c := read(top.Detail); m != "" {
-			return m, c
+	// Each shape is tried in turn rather than switched on, because a field
+	// being present is not the same as it carrying anything.
+	if m, c := read(top["error"]); m != "" {
+		return m, c
+	}
+	var many []detail
+	if json.Unmarshal(top["errors"], &many) == nil && len(many) > 0 {
+		if m := clip(many[0].Message); m != "" {
+			return m, first(number(many[0].Code), number(many[0].Type))
 		}
 	}
-	if m := clip(top.Message); m != "" {
-		return m, first(shortType(top.Type), number(top.Code), top.Status)
+	if m, c := read(top["detail"]); m != "" {
+		return m, c
+	}
+	if m := clip(number(top["message"])); m != "" {
+		return m, first(shortType(number(top["__type"])), number(top["code"]), number(top["status"]))
 	}
 	return "", ""
 }
 
 type detail struct {
 	Message string          `json:"message"`
-	Type    string          `json:"type"`
+	Type    json.RawMessage `json:"type"`
 	Code    json.RawMessage `json:"code"`
-	Status  string          `json:"status"`
+	Status  json.RawMessage `json:"status"`
 }
 
 func read(raw json.RawMessage) (string, string) {
 	var d detail
 	if json.Unmarshal(raw, &d) == nil && d.Message != "" {
-		return clip(d.Message), first(number(d.Code), d.Type, d.Status)
+		return clip(d.Message), first(number(d.Code), number(d.Type), number(d.Status))
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
@@ -100,10 +96,16 @@ func first(vals ...string) string {
 
 func clip(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) > maxMessage {
-		return s[:maxMessage] + "…"
+	if len(s) <= maxMessage {
+		return s
 	}
-	return s
+	// The ceiling is in bytes and the message is in characters, so the cut
+	// falls back to the last boundary rather than through one.
+	cut := maxMessage
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 func trim(b []byte) []byte {

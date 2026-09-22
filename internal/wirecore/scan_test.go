@@ -5,6 +5,7 @@ package wirecore
 
 import (
 	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -176,5 +177,64 @@ func TestTheLastEventIDCarries(t *testing.T) {
 	}
 	if got[0].ID != "7" || got[1].ID != "7" {
 		t.Fatalf("ids = %q, %q", got[0].ID, got[1].ID)
+	}
+}
+
+// An event that outgrew the ceiling is not an event: half of one, handed over
+// as though it were whole, lets whoever is upstream choose where the frame ends
+// and so what it says.
+func TestAnOverlongEventIsNotDelivered(t *testing.T) {
+	body := "event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}` + "\n" +
+		"data: " + strings.Repeat("A", 4096) + "\n\n"
+	sc := NewScanner(strings.NewReader(body), 0, 200)
+	for sc.Scan() {
+		t.Fatalf("an event past the ceiling was delivered: name=%q data=%q", sc.Event().Name, sc.Event().Data)
+	}
+	if !errors.Is(sc.Err(), ErrEventTooLong) {
+		t.Fatalf("err = %v, want %v", sc.Err(), ErrEventTooLong)
+	}
+}
+
+// Reading on after the ceiling trips spends exactly the budget the ceiling
+// exists to cap.
+func TestAnOverlongEventStopsReading(t *testing.T) {
+	r := &counter{Reader: strings.NewReader(strings.Repeat("data: AAAAAAAA\n", 1<<16) + "\n")}
+	sc := NewScanner(r, 1<<20, 64)
+	for sc.Scan() {
+	}
+	if !errors.Is(sc.Err(), ErrEventTooLong) {
+		t.Fatalf("err = %v", sc.Err())
+	}
+	if r.n > 1<<16 {
+		t.Fatalf("read %d bytes for a 64-byte ceiling", r.n)
+	}
+}
+
+type counter struct {
+	io.Reader
+	n int
+}
+
+func (c *counter) Read(p []byte) (int, error) {
+	n, err := c.Reader.Read(p)
+	c.n += n
+	return n, err
+}
+
+// Both readers mean the same thing by a line: the terminator is not part of it.
+func TestBothReadersAgreeOnWhatALineIs(t *testing.T) {
+	line := strings.Repeat("a", 64)
+	sc := NewScanner(strings.NewReader("data: "+line[:58]+"\n\n"), 64, 1<<20)
+	for sc.Scan() {
+	}
+	if sc.Err() != nil {
+		t.Errorf("the event scanner refused a line of exactly the ceiling: %v", sc.Err())
+	}
+	l := NewLines(strings.NewReader(line+"\n"), 64)
+	for l.Scan() {
+	}
+	if l.Err() != nil {
+		t.Errorf("the line reader refused a line of exactly the ceiling: %v", l.Err())
 	}
 }

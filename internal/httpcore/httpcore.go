@@ -90,10 +90,15 @@ func (c *Caller) Do(ctx context.Context, req Request) (*http.Response, error) {
 		}
 		last = err
 		elapsed := time.Since(started)
+		timer := time.NewTimer(wait(backoff, attempt, err.RetryAfter))
 		select {
 		case <-ctx.Done():
-			return nil, cancelled(ctx.Err(), c.Provider)
-		case <-time.After(wait(backoff, attempt, err.RetryAfter)):
+			// Not booked here: the caller's own error carries Sent, so this
+			// attempt is on the row the chain writes for it. Booking it again
+			// would put one upstream request on the ledger twice.
+			timer.Stop()
+			return nil, cancelled(why(ctx), c.Provider)
+		case <-timer.C:
 		}
 		if last.Sent {
 			if req.OnDiscard != nil {
@@ -135,7 +140,7 @@ func (c *Caller) once(ctx context.Context, req Request) (*http.Response, *llm.Er
 	resp, err := client.Do(r)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, cancelled(ctx.Err(), c.Provider)
+			return nil, cancelled(why(ctx), c.Provider)
 		}
 		return nil, &llm.Error{
 			Kind: llm.KindTransport, Provider: c.Provider, Message: err.Error(),
@@ -151,6 +156,47 @@ func (c *Caller) once(ctx context.Context, req Request) (*http.Response, *llm.Er
 	e := StatusError(c.Provider, resp)
 	resp.Body.Close()
 	return nil, e
+}
+
+// ReadError names what went wrong reading a streamed answer. A context error is
+// the proxy's own wall or the caller leaving, and reporting either as the
+// backend failing sends the wrong status and counts a fault against a backend
+// that has none.
+func ReadError(ctx context.Context, provider string, err error) *llm.Error {
+	if e := contextual(ctx, err, provider); e != nil {
+		return e
+	}
+	return &llm.Error{Kind: llm.KindTransport, Provider: provider, Sent: true, Message: err.Error(), Err: err}
+}
+
+// BodyError is ReadError for an answer read in one piece.
+func BodyError(ctx context.Context, provider string, err error) *llm.Error {
+	if e := contextual(ctx, err, provider); e != nil {
+		return e
+	}
+	return &llm.Error{
+		Kind: llm.KindUpstream, Provider: provider, Sent: true,
+		Message: "response body: " + err.Error(), Err: err,
+	}
+}
+
+func contextual(ctx context.Context, err error, provider string) *llm.Error {
+	switch {
+	case ctx.Err() != nil:
+		return cancelled(why(ctx), provider)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return cancelled(err, provider)
+	}
+	return nil
+}
+
+// why prefers the cause, so a deadline the proxy set for itself is not read as
+// the caller having hung up.
+func why(ctx context.Context) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
 }
 
 func cancelled(err error, provider string) *llm.Error {
@@ -309,5 +355,23 @@ func ForwardHeader(dst, src http.Header, drop ...string) {
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
+	}
+}
+
+// Reach makes a request only to learn whether the backend answers, and closes
+// whatever came back.
+func (c *Caller) Reach(ctx context.Context, req Request) error {
+	resp, err := c.Do(ctx, req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// MalformedList is what a model list that cannot be read returns.
+func MalformedList(provider string, err error) error {
+	return &llm.Error{
+		Kind: llm.KindUpstream, Provider: provider, Sent: true,
+		Message: "malformed model list: " + err.Error(), Err: err,
 	}
 }

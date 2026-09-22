@@ -5,7 +5,9 @@ package httpcore
 
 import (
 	"net/http"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestUpstreamReadsEveryVendorShape(t *testing.T) {
@@ -83,5 +85,33 @@ func TestForwardHeaderKeepsTheConnectionToItself(t *testing.T) {
 	}
 	if dst.Get("Content-Type") != "application/json" || dst.Get("X-Trace") != "keep-me" {
 		t.Fatalf("header = %+v: what belongs to the message still travels", dst)
+	}
+}
+
+// A vendor is free to add a field goose does not read, and to give a field
+// goose does read a shape it did not expect. Neither is a reason to throw away
+// the sentence the client needs.
+func TestAnUnexpectedSiblingDoesNotSwallowTheMessage(t *testing.T) {
+	for _, tc := range []struct{ body, want string }{
+		{`{"error":{"message":"Resource exhausted"},"status":429}`, "Resource exhausted"},
+		{`{"error":{"message":"Not found","status":404}}`, "Not found"},
+		{`{"error":{"message":"Overloaded","type":503}}`, "Overloaded"},
+		{`{"message":"Too Many Requests","errors":["rate limited"]}`, "Too Many Requests"},
+		{`{"message":"Bad gateway","errors":{"reason":"x"}}`, "Bad gateway"},
+		{`{"error":{"code":7003},"errors":[{"message":"Could not route"}]}`, "Could not route"},
+		{`{"error":"plain words"}`, "plain words"},
+	} {
+		if got, _ := Upstream([]byte(tc.body)); got != tc.want {
+			t.Errorf("Upstream(%s) = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+}
+
+// The ceiling is in bytes and the message is in characters.
+func TestAClippedMessageIsStillText(t *testing.T) {
+	long := strings.Repeat("가", maxMessage)
+	got := clip(long)
+	if !utf8.ValidString(got) {
+		t.Fatalf("clip cut a character in half: %q", got[len(got)-12:])
 	}
 }

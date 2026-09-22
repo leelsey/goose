@@ -8,17 +8,28 @@ import (
 	"encoding/json"
 )
 
+// ObjectArgs shapes a tool call's arguments into the object a wire expects.
+// Broken returns whether what arrived could not be used, so that a call cut off
+// mid-argument is reported rather than handed over as a call with none.
 func ObjectArgs(raw json.RawMessage) json.RawMessage {
+	out, _ := ObjectArgsBroken(raw)
+	return out
+}
+
+func ObjectArgsBroken(raw json.RawMessage) (json.RawMessage, bool) {
 	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || string(trimmed) == "null" || !json.Valid(trimmed) {
-		return json.RawMessage(`{}`)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return json.RawMessage(`{}`), false
+	}
+	if !json.Valid(trimmed) {
+		return json.RawMessage(`{}`), true
 	}
 	if trimmed[0] == '{' {
-		return trimmed
+		return trimmed, false
 	}
-	out, err := json.Marshal(map[string]json.RawMessage{"_raw": trimmed})
+	wrapped, err := json.Marshal(map[string]json.RawMessage{"_raw": trimmed})
 	if err != nil {
-		return json.RawMessage(`{}`)
+		return json.RawMessage(`{}`), true
 	}
-	return out
+	return wrapped, false
 }

@@ -28,29 +28,68 @@ type expiring struct {
 	fetch func(ctx context.Context) (Creds, time.Time, error)
 	now   func() time.Time
 
-	mu      sync.Mutex
-	creds   Creds
-	expires time.Time
+	mu       sync.Mutex
+	creds    Creds
+	expires  time.Time
+	inFlight chan struct{}
 }
 
+// A refresh already under way is waited on rather than repeated, and a waiter
+// waits on its own context. Holding the lock across the fetch instead would
+// queue every caller behind one slow exchange with no way to give up, and would
+// let whichever of them started it cancel the answer they are all waiting for.
 func (e *expiring) Get(ctx context.Context) (Creds, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.creds.valid() && e.now().Before(e.expires.Add(-time.Minute)) {
-		return e.creds, nil
+	for {
+		e.mu.Lock()
+		if e.creds.valid() && e.now().Before(e.expires.Add(-time.Minute)) {
+			creds := e.creds
+			e.mu.Unlock()
+			return creds, nil
+		}
+		if wait := e.inFlight; wait != nil {
+			e.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return Creds{}, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		e.inFlight = done
+		e.mu.Unlock()
+
+		creds, err := e.refresh(ctx, done)
+		if err != nil {
+			return Creds{}, err
+		}
+		return creds, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+}
+
+// refresh always clears the in-flight marker and wakes the waiters, including
+// when the fetch panics: leaving either behind parks every future caller on a
+// refresh that will never finish.
+func (e *expiring) refresh(parent context.Context, done chan struct{}) (creds Creds, err error) {
+	var expires time.Time
+	defer func() {
+		e.mu.Lock()
+		e.inFlight = nil
+		if err == nil {
+			if expires.IsZero() {
+				// No stated life: re-read next call rather than held forever.
+				expires = e.now()
+			}
+			e.creds, e.expires = creds, expires
+		}
+		e.mu.Unlock()
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), metadataTimeout)
 	defer cancel()
-	creds, expires, err := e.fetch(ctx)
-	if err != nil {
-		return Creds{}, err
-	}
-	if expires.IsZero() {
-		// No stated life: re-read next call rather than held forever.
-		expires = e.now()
-	}
-	e.creds, e.expires = creds, expires
-	return creds, nil
+	creds, expires, err = e.fetch(ctx)
+	return creds, err
 }
 
 type containerCreds struct {
@@ -123,12 +162,15 @@ func InstanceCredentials(client *http.Client, host string, now func() time.Time)
 		now = time.Now
 	}
 	e := &expiring{now: now, fetch: func(ctx context.Context) (Creds, time.Time, error) {
-		session, err := imdsToken(ctx, client, host)
-		if err != nil {
-			return Creds{}, time.Time{}, err
-		}
+		// A token is how IMDSv2 answers; where the PUT fails the older service
+		// still answers without one, so the reason is carried rather than
+		// returned, and told alongside the refusal it explains.
+		session, tokenErr := imdsToken(ctx, client, host)
 		role, err := imdsGet(ctx, client, host+"/latest/meta-data/iam/security-credentials/", session)
 		if err != nil {
+			if tokenErr != nil {
+				return Creds{}, time.Time{}, fmt.Errorf("aws instance credentials: no metadata token (%v): %w", tokenErr, err)
+			}
 			return Creds{}, time.Time{}, fmt.Errorf("aws instance credentials: %w", err)
 		}
 		name := strings.TrimSpace(strings.SplitN(string(role), "\n", 2)[0])
@@ -160,7 +202,7 @@ func imdsToken(ctx context.Context, client *http.Client, host string) (string, e
 	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", tokenTTL)
 	body, err := read(ctx, client, req)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 	return string(body), nil
 }

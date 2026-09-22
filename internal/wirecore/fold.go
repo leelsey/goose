@@ -14,6 +14,8 @@ const DefaultMaxBuffer = 32 << 20
 
 type Folder struct {
 	max      int
+	spent    int
+	crowded  bool
 	recorder llm.Recorder
 
 	choices map[int]*choice
@@ -41,8 +43,49 @@ type choice struct {
 	role     llm.Role
 	stop     llm.StopReason
 	stopSeq  string
-	bytes    int
 	full     bool
+
+	run     []byte
+	runPart llm.Part
+}
+
+// A long answer arrives as thousands of small deltas. Adding each to the part's
+// string re-allocates and copies everything before it, so the text is gathered
+// in one buffer and written back once, when the answer is read.
+func (c *choice) appendTo(p llm.Part, text string) {
+	if c.runPart != p {
+		c.flush()
+		c.runPart = p
+		c.run = append(c.run[:0], textOf(p)...)
+	}
+	c.run = append(c.run, text...)
+}
+
+func (c *choice) flush() {
+	if c.runPart == nil {
+		return
+	}
+	switch v := c.runPart.(type) {
+	case *llm.Text:
+		v.Text = string(c.run)
+	case *llm.Refusal:
+		v.Text = string(c.run)
+	case *llm.Thinking:
+		v.Text = string(c.run)
+	}
+	c.runPart, c.run = nil, c.run[:0]
+}
+
+func textOf(p llm.Part) string {
+	switch v := p.(type) {
+	case *llm.Text:
+		return v.Text
+	case *llm.Refusal:
+		return v.Text
+	case *llm.Thinking:
+		return v.Text
+	}
+	return ""
 }
 
 func NewFolder(opts FoldOptions) *Folder {
@@ -86,6 +129,17 @@ func (f *Folder) Add(fr *llm.Frame) {
 	}
 
 	c := f.choice(fr.ChoiceIndex())
+	if c == nil {
+		if !f.crowded {
+			f.crowded = true
+			f.note(llm.Diagnostic{
+				Code: llm.DropCandidate, Class: llm.ClassContent, Stage: llm.StageResponse,
+				Severity: llm.SeverityLoss,
+				Detail:   "the backend named more candidates than one answer can hold, so the rest were dropped",
+			})
+		}
+		return
+	}
 	if fr.Role != "" {
 		c.role = fr.Role
 	}
@@ -100,9 +154,22 @@ func (f *Folder) Add(fr *llm.Frame) {
 	}
 }
 
+// The candidate index is the upstream's to choose, and every distinct one costs
+// a choice that lives as long as the answer. This sits above the most any
+// backend advertises it will serve (128, provider/openai), so a request goose
+// accepted is always foldable; past it the upstream is naming candidates
+// nobody asked for.
+const maxChoices = 256
+
+// choice returns nil once the cap is reached, because there is no honest place
+// to put a candidate goose cannot hold: folding it into another one would splice
+// two answers together and overwrite the first one's finish reason.
 func (f *Folder) choice(i int) *choice {
 	c, ok := f.choices[i]
 	if !ok {
+		if len(f.choices) >= maxChoices {
+			return nil
+		}
 		c = &choice{tools: map[int]*llm.ToolUse{}, images: map[string]*llm.Image{}, current: -1, role: llm.RoleAssistant}
 		f.choices[i] = c
 		f.order = append(f.order, i)
@@ -110,11 +177,10 @@ func (f *Folder) choice(i int) *choice {
 	return c
 }
 
+// The budget is for the whole answer. Charging it per candidate would let an
+// upstream that names candidates freely hold max bytes for each of them.
 func (f *Folder) grow(c *choice, n int, what string) bool {
-	if c.full {
-		return false
-	}
-	if c.bytes+n > f.max {
+	if c.full || f.spent+n > f.max {
 		c.full = true
 		f.note(llm.Diagnostic{
 			Code: llm.WireBufferFull, Class: llm.ClassContent, Stage: llm.StageResponse,
@@ -123,7 +189,7 @@ func (f *Folder) grow(c *choice, n int, what string) bool {
 		})
 		return false
 	}
-	c.bytes += n
+	f.spent += n
 	return true
 }
 
@@ -134,7 +200,7 @@ func (f *Folder) merge(c *choice, p llm.Part) {
 			return
 		}
 		if last, ok := lastOf[*llm.Text](c.parts); ok {
-			last.Text += v.Text
+			c.appendTo(last, v.Text)
 			return
 		}
 		c.parts = append(c.parts, &llm.Text{Text: v.Text})
@@ -147,7 +213,7 @@ func (f *Folder) merge(c *choice, p llm.Part) {
 			return
 		}
 		if last, ok := lastOf[*llm.Refusal](c.parts); ok {
-			last.Text += v.Text
+			c.appendTo(last, v.Text)
 			return
 		}
 		c.parts = append(c.parts, &llm.Refusal{Text: v.Text})
@@ -176,7 +242,7 @@ func (f *Folder) mergeThinking(c *choice, v *llm.Thinking) {
 			return
 		}
 		if last, ok := lastOf[*llm.Thinking](c.parts); ok && last.Signature == "" && len(last.Redacted) == 0 {
-			last.Text += v.Text
+			c.appendTo(last, v.Text)
 		} else {
 			c.parts = append(c.parts, &llm.Thinking{Text: v.Text})
 		}
@@ -294,6 +360,7 @@ func (f *Folder) Response(meta llm.StreamMeta, usage llm.Usage) *llm.Response {
 	sort.Ints(f.order)
 	for _, i := range f.order {
 		c := f.choices[i]
+		c.flush()
 		stop := c.stop
 		if stop == llm.StopNone {
 			stop = llm.StopUnknown
