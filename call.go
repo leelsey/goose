@@ -165,6 +165,7 @@ func (c *Client) attemptFor(dec route.Decision, target route.Target, index int, 
 		Policy:     c.policyFor(dec, cc),
 		Limits:     c.limitsFor(dec, cc),
 		Recorder:   rec,
+		Redact:     c.redact,
 	}
 	if a.Model == "" {
 		a.Model = req.Model

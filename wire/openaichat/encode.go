@@ -343,7 +343,16 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			sent = true
 		}
 		if !sent && len(fr.Extra) > 0 {
-			held = fr.Extra
+			// Two frames carrying nothing but fields this wire does not model
+			// are two sets of them. The later is not a replacement for the
+			// earlier, and the map is goose's own so the frame's is not written
+			// through.
+			if held == nil {
+				held = make(map[string]json.RawMessage, len(fr.Extra))
+			}
+			for k, v := range fr.Extra {
+				held[k] = v
+			}
 		}
 	}
 

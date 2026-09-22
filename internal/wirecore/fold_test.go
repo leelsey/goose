@@ -6,6 +6,7 @@ package wirecore
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/leelsey/goose/llm"
@@ -306,5 +307,34 @@ func TestFoldBoundsWhatAnUpstreamCanMint(t *testing.T) {
 	resp := f.Response(llm.StreamMeta{Provider: "stub"}, llm.Usage{})
 	if len(resp.Choices) > maxChoices {
 		t.Fatalf("choices = %d: the candidate index is the upstream's to choose", len(resp.Choices))
+	}
+}
+
+// The ceiling is there to stop an upstream filling memory. Saying so once for
+// every delta past it fills memory faster than keeping the text would have.
+func TestTheBufferCeilingIsSaidOnceAndNotOncePerDelta(t *testing.T) {
+	const deltas = 4000
+	frames := make([]*llm.Frame, 0, deltas+1)
+	for range deltas {
+		frames = append(frames, &llm.Frame{Choice: idx(0), Delta: []llm.Part{&llm.Text{Text: strings.Repeat("x", 64)}}})
+	}
+	frames = append(frames, &llm.Frame{Choice: idx(0), Stop: llm.StopEnd})
+	s := llm.StaticStream(llm.StreamMeta{Provider: "stub", Model: "m"}, frames)
+	resp, err := Fold(s, FoldOptions{MaxBufferBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCode(resp.Diagnostics, llm.WireBufferFull) {
+		t.Fatal("an accumulation cap that drops content must say so")
+	}
+	var said int
+	for _, d := range resp.Diagnostics {
+		if d.Code == llm.WireBufferFull {
+			said++
+		}
+	}
+	if said > maxChoices {
+		t.Errorf("the ceiling was reported %d times for %d deltas past it: "+
+			"the note costs more than the text it refused", said, deltas)
 	}
 }

@@ -180,7 +180,12 @@ func (f *Folder) choice(i int) *choice {
 // The budget is for the whole answer. Charging it per candidate would let an
 // upstream that names candidates freely hold max bytes for each of them.
 func (f *Folder) grow(c *choice, n int, what string) bool {
-	if c.full || f.spent+n > f.max {
+	// Once this candidate is full, saying so again for every delta that
+	// follows costs more to hold than the text it refused.
+	if c.full {
+		return false
+	}
+	if f.spent+n > f.max {
 		c.full = true
 		f.note(llm.Diagnostic{
 			Code: llm.WireBufferFull, Class: llm.ClassContent, Stage: llm.StageResponse,

@@ -398,3 +398,27 @@ func TestOnlyTheFiguresThisWireCannotWriteAreReported(t *testing.T) {
 		t.Fatalf("uncarried = %v: this wire writes the cache and reasoning columns", fields)
 	}
 }
+
+// A frame that puts nothing on the wire can still carry fields this wire does
+// not model, and they wait for the next chunk that does. Two such frames are
+// two sets of fields, not one replacing the other.
+func TestFieldsHeldBackFromTwoQuietFramesBothTravel(t *testing.T) {
+	// The first frame of a stream always opens a chunk, so the two quiet ones
+	// have to come after something has already been said.
+	w, _, err := streamOf(t, wire.Options{Stream: true},
+		&llm.Frame{Delta: []llm.Part{&llm.Text{Text: "hi"}}},
+		&llm.Frame{Extra: map[string]json.RawMessage{"first": json.RawMessage(`1`)}},
+		&llm.Frame{Extra: map[string]json.RawMessage{"second": json.RawMessage(`2`)}},
+		&llm.Frame{Delta: []llm.Part{&llm.Text{Text: " there"}}},
+		&llm.Frame{Stop: llm.StopEnd},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"first":1`, `"second":2`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("%s did not survive: a quiet frame's unmodelled fields were dropped\n%s", want, body)
+		}
+	}
+}

@@ -222,7 +222,9 @@ func (c *Client) Stream(ctx context.Context, req *llm.Request, opts ...CallOptio
 			rec.Detail = c.detail(e)
 			rec.Started, rec.Elapsed, rec.Diagnostics = started, elapsed(started, c.now()), *pend.diags
 			if s != nil {
-				rec.Usage = s.Usage()
+				// Read the same way a row that succeeded is read: what a
+				// backend did not count is uncounted, not nothing.
+				rec.Usage = s.Usage().Unmeasured().Unpriced(p.Capabilities().Usage.Cost)
 			}
 			book(rec)
 			if s != nil {
@@ -239,7 +241,16 @@ func (c *Client) Stream(ctx context.Context, req *llm.Request, opts ...CallOptio
 			acancel()
 			release()
 			c.breaker.abandoned(target.Provider)
-			lastErr = llm.Errorf(llm.KindInternal, "provider %q returned no stream and no error", target.Provider)
+			// The attempt was made, so it is a row like any other. Saying
+			// nothing about it would leave a call the vendor may have billed
+			// with no line in the ledger at all.
+			e := llm.Errorf(llm.KindInternal, "provider %q returned no stream and no error", target.Provider)
+			rec := base
+			rec.Sent, rec.Outcome, rec.Err = true, outcomeFor(e), c.reason(llm.AsError(e))
+			rec.Started, rec.Elapsed, rec.Diagnostics = started, elapsed(started, c.now()), *pend.diags
+			rec.Usage = llm.Usage{}.Unmeasured()
+			book(rec)
+			lastErr = e
 			break
 		}
 

@@ -29,6 +29,29 @@ const (
 	KindNoRoute        ErrorKind = "no_route"
 )
 
+// Reason is the ledger's short account of a failure. A message parsed out of
+// an upstream's body is the upstream's own sentence, and for a content filter
+// that sentence is usually the passage it objected to, so redaction covers it
+// too; goose's own words are kept, since nobody's request is in them.
+func (e *Error) Reason(redact bool) string {
+	if e == nil {
+		return ""
+	}
+	if redact && e.Body != "" {
+		return string(e.Kind)
+	}
+	return e.Message
+}
+
+// Detail is what the ledger is told beyond the reason, and is the upstream's
+// body in full.
+func (e *Error) Detail(redact bool) string {
+	if e == nil || redact {
+		return ""
+	}
+	return e.Body
+}
+
 type Error struct {
 	Kind     ErrorKind
 	Code     string

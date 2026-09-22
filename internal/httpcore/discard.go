@@ -24,7 +24,9 @@ func BookDiscards(a *llm.Attempt) Attempted {
 			Usage: llm.Usage{}.Unmeasured(),
 		}
 		if e != nil {
-			rec.Err, rec.Status = e.Message, e.Status
+			// A row booked from under the provider is a row like any other,
+			// and is held to what the operator asked of the ledger.
+			rec.Err, rec.Status = e.Reason(a.Redact), e.Status
 		}
 		a.BookExtra(rec)
 	}

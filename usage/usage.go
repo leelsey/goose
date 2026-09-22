@@ -117,9 +117,20 @@ type Multi []Sink
 // Record writes the row to every sink at once: a call waits for the slowest
 // ledger rather than for all of them in turn. The error reported is the first
 // in configured order, not whichever failed soonest.
+// only writes one row to one sink. A single sink is someone else's code as much
+// as several are, and a panic in it must fail the row rather than the process.
+func only(ctx context.Context, s Sink, r Record) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("usage sink panicked: %v", p)
+		}
+	}()
+	return s.Record(ctx, r)
+}
+
 func (m Multi) Record(ctx context.Context, r Record) error {
 	if len(m) == 1 && m[0] != nil {
-		return m[0].Record(ctx, r)
+		return only(ctx, m[0], r)
 	}
 	errs := make([]error, len(m))
 	var wg sync.WaitGroup

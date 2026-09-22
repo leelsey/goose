@@ -148,24 +148,9 @@ func WithRedactedErrors() Option {
 	return func(c *Client) error { c.redact = true; return nil }
 }
 
-// detail is what the ledger is told beyond the error's own message.
-func (c *Client) detail(e *llm.Error) string {
-	if c.redact {
-		return ""
-	}
-	return e.Body
-}
+func (c *Client) detail(e *llm.Error) string { return e.Detail(c.redact) }
 
-// reason is the ledger's short account of a failure. A message parsed out of an
-// upstream's body is the upstream's own sentence, and for a content filter that
-// sentence is usually the passage it objected to, so redaction covers it too;
-// goose's own words are kept, since nobody's request is in them.
-func (c *Client) reason(e *llm.Error) string {
-	if c.redact && e.Body != "" {
-		return string(e.Kind)
-	}
-	return e.Message
-}
+func (c *Client) reason(e *llm.Error) string { return e.Reason(c.redact) }
 
 func WithLimits(l llm.Limits) Option {
 	return func(c *Client) error {

@@ -112,6 +112,11 @@ type Attempt struct {
 	Recorder Recorder
 	Limits   Limits
 
+	// Redact says the ledger is to be kept free of the upstream's own words.
+	// It travels with the attempt because rows are booked from under the
+	// provider as well as above it.
+	Redact bool
+
 	Book func(Attempted)
 }
 

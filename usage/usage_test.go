@@ -78,3 +78,20 @@ func TestMultiFansOutAndKeepsGoing(t *testing.T) {
 		t.Fatal("a failing sink must not stop the others")
 	}
 }
+
+// A sink is someone else's code whether there is one of it or several, and a
+// panic in it fails the row rather than the process.
+func TestASinglePanickingSinkFailsTheRowAndNotTheProcess(t *testing.T) {
+	m := Multi{sinkFunc(func(context.Context, Record) error { panic("the ledger fell over") })}
+	err := m.Record(context.Background(), Record{Provider: "one"})
+	if err == nil {
+		t.Fatal("a sink that panicked was reported as having written the row")
+	}
+	if !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("err = %v, want it to say what happened", err)
+	}
+}
+
+type sinkFunc func(context.Context, Record) error
+
+func (f sinkFunc) Record(ctx context.Context, r Record) error { return f(ctx, r) }

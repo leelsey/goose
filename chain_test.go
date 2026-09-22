@@ -329,3 +329,67 @@ func TestRedactionKeepsTheUpstreamsWordsOutOfTheLedger(t *testing.T) {
 		}
 	}
 }
+
+// halting is a backend that hands back a stream and a failure together, which
+// the chain has to read as a failure while still saying what the stream had
+// counted by then.
+type halting struct{ id string }
+
+func (h *halting) ID() string                     { return h.id }
+func (h *halting) Capabilities() llm.Capabilities { return llm.Capabilities{Streaming: true} }
+
+func (h *halting) Complete(context.Context, *llm.Attempt) (*llm.Response, error) {
+	return nil, llm.Errorf(llm.KindInternal, "not this way")
+}
+
+func (h *halting) Stream(_ context.Context, a *llm.Attempt) (*llm.Stream, error) {
+	return llm.StaticStream(llm.StreamMeta{Provider: h.id}, nil),
+		&llm.Error{Kind: llm.KindOverloaded, Message: "gone", Sent: true}
+}
+
+func (h *halting) Close(context.Context) error { return nil }
+
+// hollow is a backend that answers with neither a stream nor a failure. The
+// attempt was still made, and a vendor may still have billed it.
+type hollow struct{ id string }
+
+func (h *hollow) ID() string                     { return h.id }
+func (h *hollow) Capabilities() llm.Capabilities { return llm.Capabilities{Streaming: true} }
+
+func (h *hollow) Complete(context.Context, *llm.Attempt) (*llm.Response, error) {
+	return nil, llm.Errorf(llm.KindInternal, "not this way")
+}
+
+func (h *hollow) Stream(context.Context, *llm.Attempt) (*llm.Stream, error) { return nil, nil }
+
+func (h *hollow) Close(context.Context) error { return nil }
+
+// Every attempt that was sent leaves a row, and a row says what it knows about
+// the cost rather than implying there was none.
+func TestAnAttemptThatFailedStillLeavesARowThatSaysWhatItKnows(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		p    llm.Provider
+	}{
+		{"a stream handed back with a failure", &halting{id: "one"}},
+		{"and neither a stream nor a failure", &hollow{id: "one"}},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			mem := usage.NewMemory()
+			c, err := New(WithProvider(tc.p), WithUsage(mem))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Stream(context.Background(), req()); err == nil {
+				t.Fatal("the backend did not answer")
+			}
+			rows := mem.Records()
+			if len(rows) != 1 {
+				t.Fatalf("rows = %d, want the attempt that was made to leave one", len(rows))
+			}
+			if !hasAnomaly(rows[0].Usage, llm.AnomalyNotMeasurable) {
+				t.Errorf("the row reads as having cost nothing rather than as uncounted: %+v", rows[0].Usage)
+			}
+		})
+	}
+}
