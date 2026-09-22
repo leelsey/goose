@@ -2891,17 +2891,22 @@ func TestASchemaThatCannotBeMirroredIsRefusedThroughTheSameCeiling(t *testing.T)
 // rune apiece on the way through.
 func TestALineIsMeasuredAfterItIsTamed(t *testing.T) {
 	for _, tc := range []struct {
-		what string
-		in   string
-		max  int
+		what  string
+		in    string
+		max   int
+		keeps bool
 	}{
-		{"bytes that are not text", strings.Repeat("\xff", 1<<16), maxAccount},
-		{"and the shorter ceiling", strings.Repeat("\xff", 1<<16), maxSaid},
-		{"text that is wider than one byte a letter", strings.Repeat("é", 1<<16), maxSaid},
-		{"and a line of it", strings.Repeat("파", 1<<16), maxAccount},
+		{"bytes that are not text", strings.Repeat("\xff", 1<<16), maxAccount, false},
+		{"and the shorter ceiling", strings.Repeat("\xff", 1<<16), maxSaid, false},
+		{"text that is wider than one byte a letter", strings.Repeat("é", 1<<16), maxSaid, true},
+		{"and a line of it", strings.Repeat("파", 1<<16), maxAccount, true},
 	} {
-		if got := tameTo(tc.in, tc.max); len(got) > tc.max {
+		got := tameTo(tc.in, tc.max)
+		if len(got) > tc.max {
 			t.Errorf("%s: %d bytes, want at most %d", tc.what, len(got), tc.max)
+		}
+		if tc.keeps && (got == "" || !utf8.ValidString(got)) {
+			t.Errorf("%s: %q is not the line it should have left", tc.what, got)
 		}
 	}
 }
@@ -3000,8 +3005,10 @@ func TestANamelessToolCallStillSaysWhatItIs(t *testing.T) {
 func TestAResultThatHoldsItselfTwiceDoesNotDoubleAllTheWayDown(t *testing.T) {
 	loop := &llm.ToolResult{ID: "t1"}
 	loop.Content = []llm.Part{loop, loop}
-	if n := len(encodeContent([]llm.Part{loop})); n > maxBlocks {
-		t.Fatalf("blocks = %d, want at most %d", n, maxBlocks)
+	// The ceiling is on what the tool said; the note that some of it was left
+	// out is goose's own and sits outside it.
+	if n := len(encodeContent([]llm.Part{loop})); n > maxBlocks+1 {
+		t.Fatalf("blocks = %d, want at most %d", n, maxBlocks+1)
 	}
 }
 
@@ -3042,8 +3049,8 @@ func TestABudgetCountsWhatComesOutNotWhatWentIn(t *testing.T) {
 		{"a run of results that each say they failed", flat},
 		{"and one that holds itself twice and says so", []llm.Part{loop}},
 	} {
-		if n := len(encodeContent(tc.parts)); n > maxBlocks {
-			t.Errorf("%s: blocks = %d, want at most %d", tc.what, n, maxBlocks)
+		if n := len(encodeContent(tc.parts)); n > maxBlocks+1 {
+			t.Errorf("%s: blocks = %d, want at most %d", tc.what, n, maxBlocks+1)
 		}
 	}
 }
@@ -3056,8 +3063,8 @@ func TestAResultWithMoreInItThanWillFitSaysSo(t *testing.T) {
 		parts = append(parts, &llm.Text{Text: fmt.Sprintf("part %d", i)})
 	}
 	blocks := encodeContent(parts)
-	if len(blocks) > maxBlocks {
-		t.Fatalf("blocks = %d, want at most %d", len(blocks), maxBlocks)
+	if len(blocks) > maxBlocks+1 {
+		t.Fatalf("blocks = %d, want at most %d", len(blocks), maxBlocks+1)
 	}
 	if !strings.Contains(string(blocks[len(blocks)-1]), "did not fit") {
 		t.Errorf("the rest was dropped and nothing said so: last block = %s", blocks[len(blocks)-1])
@@ -3105,7 +3112,7 @@ func TestWhatIsLookedAtIsBoundedEvenWhenNoneOfItIsKept(t *testing.T) {
 	if len(tools) != 0 {
 		t.Fatalf("tools = %d, want none of them to be mirrorable", len(tools))
 	}
-	if want := (maxTools + perPage - 1) / perPage; pages > want {
+	if want := (maxEntries + perPage - 1) / perPage; pages > want {
 		t.Errorf("read %d pages of a catalogue it kept nothing from, want at most %d", pages, want)
 	}
 	if !c.Truncated() {
@@ -3116,18 +3123,28 @@ func TestWhatIsLookedAtIsBoundedEvenWhenNoneOfItIsKept(t *testing.T) {
 // A name said back to an operator is said on one line, and what it costs to
 // say is the escapes it needs, not the bytes it was.
 func TestANameSaidBackIsItselfHeldToALine(t *testing.T) {
-	for _, name := range []string{
-		strings.Repeat(string(rune(1)), maxSaid),
-		strings.Repeat("a", 90) + strings.Repeat(string(rune(1)), 12),
-		strings.Repeat("a", maxSaid+1),
-		"read_file" + string(rune(1)),
+	for _, tc := range []struct {
+		name  string
+		exact bool
+	}{
+		{strings.Repeat(string(rune(1)), maxSaid), false},
+		{strings.Repeat("a", 90) + strings.Repeat(string(rune(1)), 12), false},
+		{strings.Repeat("a", maxSaid+1), false},
+		{"read_file" + string(rune(1)), true},
+		{string(rune(1)) + string(rune(2)), true},
 	} {
-		said, _ := quoted(name)
+		said, exact := quoted(tc.name)
 		if len(said) > maxSaid {
-			t.Errorf("a name of %d bytes is said in %d, want at most %d", len(name), len(said), maxSaid)
+			t.Errorf("a name of %d bytes is said in %d, want at most %d", len(tc.name), len(said), maxSaid)
 		}
 		if said == "" {
-			t.Errorf("a name of %d bytes was said as nothing", len(name))
+			t.Errorf("a name of %d bytes was said as nothing", len(tc.name))
+		}
+		// Only a name said exactly can be recognised as one already said, so
+		// what came back has to say which it was.
+		if exact != tc.exact {
+			t.Errorf("a name of %d bytes said as %q reports exact = %v, want %v",
+				len(tc.name), said, exact, tc.exact)
 		}
 	}
 }
@@ -3231,5 +3248,184 @@ func TestACatalogueThatRepeatsItselfIsStillServedWhole(t *testing.T) {
 	}
 	if len(tools) != maxTools {
 		t.Fatalf("tools = %d, want %d: a copy of a tool was counted as another tool", len(tools), maxTools)
+	}
+}
+
+// A tool goose will not serve is a tool goose is not holding, and it must not
+// stand in the room kept for one it will serve. Nor may a catalogue that says
+// everything twice be reported as one that was cut.
+func TestWhatIsNotServedDoesNotTakeTheRoomOfWhatIs(t *testing.T) {
+	entry := func(name, schema string) string {
+		quoted, err := json.Marshal(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return `{"name":` + string(quoted) + `,"inputSchema":` + schema + `}`
+	}
+	const (
+		plain = `{"type":"object"}`
+		unfit = `{"type":"object","properties":{"a":{"x-mcp-header":"X-A"}}}`
+	)
+	serve := func(t *testing.T, entries []string, mirrors bool) (*Client, []llm.Tool) {
+		t.Helper()
+		ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+			switch out.Method {
+			case "server/discover":
+				return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+			case "initialize":
+				return &response{Result: json.RawMessage(
+					`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+			}
+			return &response{Result: json.RawMessage(`{"tools":[` + strings.Join(entries, ",") + `]}`)}, nil
+		}}
+		c := newClient("srv", ft, Options{Mirrors: mirrors})
+		if err := c.connect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		tools, err := c.Tools(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, tools
+	}
+
+	t.Run("a schema goose cannot mirror costs no tool", func(t *testing.T) {
+		var entries []string
+		for i := range 1000 {
+			entries = append(entries, entry(fmt.Sprintf("unfit%d", i), unfit))
+		}
+		for i := range maxTools {
+			entries = append(entries, entry(fmt.Sprintf("tool%d", i), plain))
+		}
+		_, tools := serve(t, entries, true)
+		if len(tools) != maxTools {
+			t.Fatalf("tools = %d, want %d: a tool goose will not serve took the room of one it would", len(tools), maxTools)
+		}
+	})
+
+	t.Run("a catalogue said twice is not a catalogue that was cut", func(t *testing.T) {
+		var entries []string
+		for i := range maxTools {
+			e := entry(fmt.Sprintf("tool%d", i), plain)
+			entries = append(entries, e, e)
+		}
+		c, tools := serve(t, entries, false)
+		if len(tools) != maxTools {
+			t.Fatalf("tools = %d, want %d", len(tools), maxTools)
+		}
+		if c.Truncated() {
+			t.Error("a catalogue goose held whole was reported as part of one")
+		}
+	})
+
+	t.Run("a schema nobody could mirror is refused wherever it came from", func(t *testing.T) {
+		c, tools := serve(t, []string{entry("reads", unfit), entry("writes", plain)}, false)
+		if len(tools) != 1 || tools[0].Name != "writes" {
+			t.Fatalf("tools = %+v: a tool that can never be called was offered to a model", tools)
+		}
+		if len(c.Refused()) != 1 {
+			t.Errorf("refused = %q, want the one goose will not serve", c.Refused())
+		}
+	})
+}
+
+// A catalogue may say one tool more than once. Saying two thousand of them over
+// and over is a server that is not going to stop, and goose stops first.
+func TestACatalogueThatNeverEndsIsNotReadForever(t *testing.T) {
+	var entries []string
+	for i := range maxTools - 1 {
+		name, err := json.Marshal(fmt.Sprintf("tool%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, `{"name":`+string(name)+`,"inputSchema":{"type":"object"}}`)
+	}
+	page := `{"tools":[` + strings.Join(entries, ",") + `],"nextCursor":"more"}`
+	pages := 0
+	ft := &fakeTransport{answer: func(out Outbound) (*response, error) {
+		switch out.Method {
+		case "server/discover":
+			return &response{Error: &rpcError{Code: -32601, Message: "no"}}, nil
+		case "initialize":
+			return &response{Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","serverInfo":{"name":"x"}}`)}, nil
+		}
+		pages++
+		return &response{Result: json.RawMessage(page)}, nil
+	}}
+	c := newClient("srv", ft, Options{})
+	if err := c.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := maxToolPages / 4; pages > want {
+		t.Errorf("read %d pages of the same catalogue over again, want well under %d", pages, maxToolPages)
+	}
+}
+
+// A note that the rest did not fit is goose's own word about a loss, so it is
+// said when there was one and not when there was not.
+func TestTheRestDidNotFitIsSaidOnlyWhenSomethingDidNot(t *testing.T) {
+	text := func(n int) []llm.Part {
+		parts := make([]llm.Part, 0, n)
+		for i := range n {
+			parts = append(parts, &llm.Text{Text: fmt.Sprintf("part %d", i)})
+		}
+		return parts
+	}
+	said := func(blocks []json.RawMessage) bool {
+		return len(blocks) > 0 && strings.Contains(string(blocks[len(blocks)-1]), "did not fit")
+	}
+
+	t.Run("a part that says nothing is not something that did not fit", func(t *testing.T) {
+		parts := append(text(maxBlocks-1), &llm.ToolResult{ID: "t"})
+		if blocks := encodeContent(parts); said(blocks) {
+			t.Errorf("blocks = %d and the last says the rest did not fit, but nothing was left out", len(blocks))
+		}
+	})
+
+	t.Run("a result of exactly the ceiling is carried whole", func(t *testing.T) {
+		blocks := encodeContent(text(maxBlocks))
+		if said(blocks) {
+			t.Errorf("blocks = %d: it fitted and was told it had not", len(blocks))
+		}
+		if len(blocks) != maxBlocks {
+			t.Errorf("blocks = %d, want %d", len(blocks), maxBlocks)
+		}
+	})
+
+	t.Run("and one over it says so", func(t *testing.T) {
+		blocks := encodeContent(text(maxBlocks + 1))
+		if !said(blocks) {
+			t.Errorf("blocks = %d: the rest was dropped and nothing said so", len(blocks))
+		}
+		if len(blocks) > maxBlocks+1 {
+			t.Errorf("blocks = %d, want at most %d", len(blocks), maxBlocks+1)
+		}
+	})
+}
+
+// What a server says while a tool runs reaches the caller that asked to watch,
+// and is its text like any other.
+func TestWhatAServerSaysWhileItWorksIsHeldToALine(t *testing.T) {
+	esc := string([]byte{0x1b})
+	message, err := json.Marshal(esc + "[2K\rall is well" + strings.Repeat("x", 1<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := json.RawMessage(`{"progressToken":"1","progress":1,"total":2,"message":` + string(message) + `}`)
+	p, ok := readProgress(frame, "1")
+	if !ok {
+		t.Fatal("the report was not read")
+	}
+	if len(p.Message) > maxSaid {
+		t.Errorf("message = %d bytes, want at most %d", len(p.Message), maxSaid)
+	}
+	for _, r := range p.Message {
+		if !strconv.IsPrint(r) {
+			t.Fatalf("message carries %q, which rewrites the line it is printed on", r)
+		}
 	}
 }

@@ -22,9 +22,10 @@ const (
 )
 
 func encodeContent(parts []llm.Part) []json.RawMessage {
-	// One block is held back, so that running out of room can be said in the
-	// same breath and the whole still fits.
-	room := &budget{left: maxBlocks - 1}
+	// The ceiling is on what the tool said. The note that some of it was left
+	// out is goose's own word about a loss, and does not come out of the room
+	// kept for what the tool said.
+	room := &budget{left: maxBlocks}
 	out := encodeParts(parts, 0, room)
 	if room.short {
 		out = append(out, mustJSON(map[string]any{"type": "text", "text": "the rest did not fit"}))
@@ -59,10 +60,6 @@ func encodeParts(parts []llm.Part, depth int, room *budget) []json.RawMessage {
 		return true
 	}
 	for _, p := range parts {
-		if room.left <= 0 {
-			room.short = true
-			break
-		}
 		switch v := p.(type) {
 		case *llm.Text:
 			add(mustJSON(map[string]any{"type": "text", "text": v.Text}))
@@ -87,6 +84,13 @@ func encodeParts(parts []llm.Part, depth int, room *budget) []json.RawMessage {
 				add(mustJSON(map[string]any{
 					"type": "text", "text": "nested too deeply to carry",
 				}))
+				continue
+			}
+			// Nothing it holds can be said with no room to say it in, and
+			// walking it to find that out is work a structure goose did not
+			// build gets to choose the amount of.
+			if room.left <= 0 {
+				room.short = room.short || len(v.Content) > 0
 				continue
 			}
 			out = append(out, encodeParts(v.Content, depth+1, room)...)

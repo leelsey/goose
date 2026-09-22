@@ -64,7 +64,9 @@ func readProgress(params json.RawMessage, token string) (Progress, bool) {
 	if text(got) != token {
 		return Progress{}, false
 	}
-	return Progress{Done: body.Progress, Total: body.Total, Message: body.Message}, true
+	// A server chooses these words while a tool of its own runs, and they reach
+	// whoever asked to watch. They are its text like any other.
+	return Progress{Done: body.Progress, Total: body.Total, Message: tame(body.Message)}, true
 }
 
 func requestToken(params json.RawMessage) any {

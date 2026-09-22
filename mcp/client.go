@@ -346,10 +346,13 @@ func (c *Client) initialise(ctx context.Context) error {
 // server is configured, so how much of it there is cannot be the server's to
 // choose. This is far past any catalogue a model could be offered in one call.
 // A name goose will not carry is held too, and on a ceiling of its own: both
-// are bounded, and neither can be spent to leave no room for the other.
+// are bounded, and neither can be spent to leave no room for the other. What is
+// read to decide between them is bounded separately again, high enough that a
+// catalogue listing each of its tools several times over is still read whole.
 const (
 	maxTools     = 2048
 	maxRefused   = 256
+	maxEntries   = 4 * maxTools
 	maxToolPages = 100
 )
 
@@ -442,6 +445,7 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	raw := map[string]json.RawMessage{}
 	cursor := ""
 	truncated, full := false, false
+	examined := 0
 	seen := map[string]bool{}
 	dropped := map[string]bool{}
 	// refuse records a name goose will not carry, whatever it was about the
@@ -479,14 +483,11 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			return nil, err
 		}
 		for _, entry := range result.Tools {
-			// What has to be bounded is what is held, and a name is held from
-			// the moment goose decides it could carry it — whether or not the
-			// tool behind it is one it ends up serving. Counting only what is
-			// served leaves a server whose every schema is unmirrorable holding
-			// every name it can send; counting every entry instead would make a
-			// second copy of a tool cost a tool, and a server is free to list
-			// one twice.
-			if len(seen) >= maxTools {
+			// A catalogue is free to list one tool more than once, so reading
+			// more entries than goose will hold is ordinary. Reading several
+			// times as many is a server that is not going to stop, and the work
+			// of reading them is its to choose otherwise.
+			if examined++; examined > maxEntries {
 				truncated, full = true, true
 				break
 			}
@@ -516,18 +517,27 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			if seen[name] {
 				continue
 			}
-			seen[name] = true
-			t.Name = name
 			schema := t.InputSchema
 			if len(schema) == 0 || string(schema) == "null" {
 				schema = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
-			if c.mirrors {
-				if _, err := annotated(schema); err != nil {
-					refuse(t.Name)
-					continue
-				}
+			// A schema goose cannot read the mirror annotations off is a tool it
+			// can never call, whatever transport it came over: this proxy's own
+			// front door reads them on the way in. Offering it would be offering
+			// a model something that fails every time it is asked for.
+			if _, err := annotated(schema); err != nil {
+				refuse(t.Name)
+				continue
 			}
+			// The name is held from here, and this is where there has to be room
+			// for it. A copy of a tool already held needs none, and a tool goose
+			// will not serve must not stand in the room kept for one it will.
+			if len(seen) >= maxTools {
+				truncated, full = true, true
+				break
+			}
+			seen[name] = true
+			t.Name = name
 			raw[t.Name] = append(json.RawMessage(nil), entry...)
 			out = append(out, llm.Tool{
 				Name: t.Name, Description: t.Description, Schema: schema,
