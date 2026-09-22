@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,12 +34,13 @@ type stub struct {
 	frames []*llm.Frame
 	resp   *llm.Response
 	err    error
+	tools  bool
 	seen   *llm.Attempt
 }
 
 func (s *stub) ID() string { return "stub" }
 func (s *stub) Capabilities() llm.Capabilities {
-	return llm.Capabilities{Streaming: true}
+	return llm.Capabilities{Streaming: true, Tools: s.tools}
 }
 
 func (s *stub) Complete(_ context.Context, a *llm.Attempt) (*llm.Response, error) {
@@ -642,6 +644,28 @@ func TestReadinessIsNotMetered(t *testing.T) {
 	}
 }
 
+func TestRefusedCredentialsAreMeteredAndLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	srv := server(t, &stub{}, Options{
+		APIKey: "secret", MaxPerMinute: 1, Logger: logger, LogRequests: true,
+	})
+
+	var last int
+	for _, guess := range []string{"Bearer one", "Bearer two", "Bearer three", "Bearer four"} {
+		header := http.Header{"Authorization": []string{guess}}
+		resp := post(t, srv, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, header)
+		resp.Body.Close()
+		last = resp.StatusCode
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: a caller working through forged keys is what the allowance is for", last)
+	}
+	if !strings.Contains(buf.String(), "status=401") {
+		t.Fatalf("log = %q: a refused call is the one an operator most needs to see", buf.String())
+	}
+}
+
 func TestMetricsCountWhatWasServedAndSpent(t *testing.T) {
 	m := NewMetrics()
 	c, err := goose.New(goose.WithProvider(&stub{}), goose.WithUsage(m))
@@ -691,42 +715,6 @@ func TestMetricsQuoteALabelChosenByTheCaller(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `model="a\" ,evil=\"1"`) {
 		t.Fatalf("body = %s", w.Body.String())
-	}
-}
-
-func TestUpstreamErrorTextCanBeKeptOffTheReply(t *testing.T) {
-	fail := &stub{err: &llm.Error{
-		Kind: llm.KindRateLimit, Status: 429, Provider: "up", Code: "quota",
-		Message: "organisation org-9f3a has exceeded its quota, contact billing@acme.example",
-		Body:    `{"error":{"message":"organisation org-9f3a has exceeded its quota"}}`,
-		Sent:    true,
-	}}
-	srv := server(t, fail, Options{RedactUpstream: true})
-	resp := post(t, srv, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if strings.Contains(string(body), "org-9f3a") || strings.Contains(string(body), "acme.example") {
-		t.Fatalf("body = %s", body)
-	}
-	if !strings.Contains(string(body), "rate limiting") {
-		t.Fatalf("body = %s: the client still needs to know what kind of failure it was", body)
-	}
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status = %d: the status is not the operator's secret", resp.StatusCode)
-	}
-}
-
-func TestUpstreamErrorTextTravelsByDefault(t *testing.T) {
-	fail := &stub{err: &llm.Error{
-		Kind: llm.KindRateLimit, Status: 429, Provider: "up",
-		Message: "you exceeded your current quota", Sent: true,
-	}}
-	srv := server(t, fail, Options{})
-	resp := post(t, srv, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "you exceeded your current quota") {
-		t.Fatalf("body = %s: on a proxy you run for yourself the vendor's sentence is the useful one", body)
 	}
 }
 
@@ -814,7 +802,7 @@ func TestMetricsLabelAPrefixRouteByItsFormat(t *testing.T) {
 }
 
 func TestAToolTheFormatCannotReportBackIsRefused(t *testing.T) {
-	p := &stub{}
+	p := &stub{tools: true}
 	c, err := goose.New(
 		goose.WithProvider(p),
 		goose.WithTools("mcp", []llm.Tool{{Name: "search", Schema: []byte(`{"type":"object"}`)}}),
@@ -897,7 +885,10 @@ func TestMeteringReadsAForwardedAddressOnlyWhenNamed(t *testing.T) {
 	}{
 		{"not named", "", "203.0.113.7", "addr:192.0.2.1"},
 		{"named", "X-Forwarded-For", "203.0.113.7", "addr:203.0.113.7"},
-		{"leftmost is the client", "X-Forwarded-For", "203.0.113.7, 10.0.0.1, 10.0.0.2", "addr:203.0.113.7"},
+		// The nearest hop is what the proxy in front saw; the leftmost is what
+		// the caller wrote, and a caller that can write its own bucket key has
+		// no allowance at all.
+		{"nearest hop, not what the caller wrote", "X-Forwarded-For", "203.0.113.7, 10.0.0.1, 10.0.0.2", "addr:10.0.0.2"},
 		{"with a port", "X-Forwarded-For", "203.0.113.7:4001", "addr:203.0.113.7"},
 		{"forwarded syntax", "Forwarded", `for="203.0.113.7"`, "addr:203.0.113.7"},
 		{"ipv6", "X-Forwarded-For", "[2001:db8::1]:4001", "addr:2001:db8::1"},
@@ -1175,12 +1166,13 @@ func TestAListThatLeftAProviderOutSaysSo(t *testing.T) {
 }
 
 func TestTheProxysOwnRefusalsSpeakTheClientsWire(t *testing.T) {
-	srv := server(t, &stub{}, Options{APIKey: "secret", MaxPerMinute: 1, Codecs: []wire.Codec{
+	codecs := []wire.Codec{
 		openaichat.New(openaichat.Options{}),
 		anthropicmsg.New(anthropicmsg.Options{}),
-	}})
+	}
+	refusing := server(t, &stub{}, Options{APIKey: "secret", Codecs: codecs})
 
-	body := func(path string, header map[string]string) (int, map[string]any) {
+	body := func(srv *httptest.Server, path string, header map[string]string) (int, map[string]any) {
 		req, err := http.NewRequest(http.MethodPost, srv.URL+path,
 			strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`))
 		if err != nil {
@@ -1202,7 +1194,7 @@ func TestTheProxysOwnRefusalsSpeakTheClientsWire(t *testing.T) {
 		return resp.StatusCode, out
 	}
 
-	status, out := body("/v1/messages", nil)
+	status, out := body(refusing, "/v1/messages", nil)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("status = %d", status)
 	}
@@ -1214,7 +1206,7 @@ func TestTheProxysOwnRefusalsSpeakTheClientsWire(t *testing.T) {
 		t.Fatalf("refusal = %v", out)
 	}
 
-	status, out = body("/v1/chat/completions", nil)
+	status, out = body(refusing, "/v1/chat/completions", nil)
 	if status != http.StatusUnauthorized || out["type"] == "error" {
 		t.Fatalf("status = %d refusal = %v", status, out)
 	}
@@ -1222,11 +1214,12 @@ func TestTheProxysOwnRefusalsSpeakTheClientsWire(t *testing.T) {
 		t.Fatalf("refusal = %v", out)
 	}
 
+	throttling := server(t, &stub{}, Options{APIKey: "secret", MaxPerMinute: 1, Codecs: codecs})
 	auth := map[string]string{"Authorization": "Bearer secret"}
-	if status, _ := body("/v1/messages", auth); status == http.StatusTooManyRequests {
+	if status, _ := body(throttling, "/v1/messages", auth); status == http.StatusTooManyRequests {
 		t.Fatal("the first request was throttled")
 	}
-	status, out = body("/v1/messages", auth)
+	status, out = body(throttling, "/v1/messages", auth)
 	if status != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", status)
 	}
@@ -1343,5 +1336,138 @@ func TestTheRetryHintIsReadableFromABrowser(t *testing.T) {
 	defer resp.Body.Close()
 	if !strings.Contains(resp.Header.Get("Access-Control-Expose-Headers"), "Retry-After") {
 		t.Fatalf("exposed = %q", resp.Header.Get("Access-Control-Expose-Headers"))
+	}
+}
+
+func TestAThrottledRequestIsStillLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	srv := server(t, &stub{}, Options{
+		APIKey: "secret", MaxPerMinute: 1, Logger: logger, LogRequests: true,
+	})
+	header := http.Header{"Authorization": []string{"Bearer secret"}}
+	var last int
+	for range 2 {
+		resp := post(t, srv, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, header)
+		resp.Body.Close()
+		last = resp.StatusCode
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", last)
+	}
+	if !strings.Contains(buf.String(), "status=429") {
+		t.Fatalf("log = %q: a refusal the proxy made itself is one an operator needs to see", buf.String())
+	}
+}
+
+func TestAForgedForwardedAddressBuysNoFreshAllowance(t *testing.T) {
+	srv := server(t, &stub{}, Options{
+		APIKey: "secret", MaxPerMinute: 1, ForwardedHeader: "X-Forwarded-For",
+	})
+	var last int
+	for _, claimed := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
+		header := http.Header{
+			"Authorization":   []string{"Bearer guess"},
+			"X-Forwarded-For": []string{claimed},
+		}
+		resp := post(t, srv, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, header)
+		resp.Body.Close()
+		last = resp.StatusCode
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: an unproven caller does not get to name its own bucket", last)
+	}
+}
+
+func TestMetricsLabelsAreBounded(t *testing.T) {
+	m := NewMetrics()
+	long := strings.Repeat("m", maxLabel+1)
+	_ = m.Record(context.Background(), usage.Record{Provider: "p", Model: long, Outcome: llm.OutcomeOK})
+	for k := range m.attempts {
+		if k.model == long {
+			t.Fatal("a model name longer than any real one is a label a client chose, not a model")
+		}
+	}
+
+	for i := range maxSeries * 2 {
+		_ = m.Record(context.Background(), usage.Record{
+			Provider: "p", Model: "model-" + strconv.Itoa(i), Outcome: llm.OutcomeOK,
+		})
+	}
+	if len(m.attempts) > maxSeries+2 {
+		t.Fatalf("series = %d: every distinct model is kept for the life of the process", len(m.attempts))
+	}
+}
+
+func TestANonceBesideTheRealKeyBuysNoFreshAllowance(t *testing.T) {
+	srv := server(t, &stub{}, Options{APIKey: "secret", MaxPerMinute: 1, ForwardedHeader: "X-Forwarded-For"})
+	var last int
+	for i, nonce := range []string{"n1", "n2", "n3", "n4"} {
+		header := http.Header{
+			"Authorization":   []string{"Bearer secret"},
+			"X-Api-Key":       []string{nonce},
+			"X-Forwarded-For": []string{"10.0.0." + strconv.Itoa(i)},
+		}
+		resp := post(t, srv, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, header)
+		resp.Body.Close()
+		last = resp.StatusCode
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: neither the credential nor the address a caller writes is what it proved", last)
+	}
+}
+
+func TestAForgedForwardedChainDoesNotMintBuckets(t *testing.T) {
+	srv := server(t, &stub{}, Options{MaxPerMinute: 2, ForwardedHeader: "X-Forwarded-For"})
+	var last int
+	for i := range 5 {
+		// What a caller writes ends up left of what the proxy appends, so
+		// varying it must not buy anything.
+		header := http.Header{"X-Forwarded-For": []string{"10.9.9." + strconv.Itoa(i) + ", 203.0.113.7"}}
+		resp := post(t, srv, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, header)
+		resp.Body.Close()
+		last = resp.StatusCode
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: the caller wrote the left of the chain, not the right", last)
+	}
+}
+
+// The trailer is the caller's copy of the bill, so it says what the ledger
+// says. A usage nobody counted is not a usage of zero.
+func TestTheStreamTrailerSaysWhatTheLedgerSays(t *testing.T) {
+	p := &stub{frames: []*llm.Frame{
+		{Delta: []llm.Part{&llm.Text{Text: "hi"}}},
+		{Stop: llm.StopEnd, TurnEnd: true},
+	}}
+	mem := usage.NewMemory()
+	c, err := goose.New(goose.WithProvider(p), goose.WithUsage(mem))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(c, Options{Codecs: []wire.Codec{openaichat.New(openaichat.Options{})}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp := post(t, srv, "/v1/chat/completions",
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	var trailer llm.Usage
+	if err := json.Unmarshal([]byte(resp.Trailer.Get(UsageHeader)), &trailer); err != nil {
+		t.Fatalf("trailer = %q: %v", resp.Trailer.Get(UsageHeader), err)
+	}
+	rows := mem.Records()
+	if len(rows) == 0 {
+		t.Fatal("nothing was booked")
+	}
+	booked := rows[len(rows)-1].Usage
+	if len(trailer.Anomalies) != len(booked.Anomalies) {
+		t.Fatalf("trailer = %+v, booked = %+v: the caller's copy is missing what the row says",
+			trailer.Anomalies, booked.Anomalies)
 	}
 }

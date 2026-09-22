@@ -4,6 +4,7 @@
 package goose
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -43,7 +44,7 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 		})
 	}
 
-	if len(a.Tools) > 0 && a.Renders.Declared() && !a.Renders.ToolCalls {
+	if caps.Tools && len(a.Tools) > 0 && a.Renders.Declared() && !a.Renders.ToolCalls {
 		fail(llm.Diagnostic{
 			Code: llm.DropToolCall, Class: llm.ClassContent, Stage: llm.StagePlan,
 			Severity: llm.SeverityFatal, Provider: a.Provider, Model: a.Model, Format: a.Format,
@@ -87,8 +88,8 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 	if len(req.Tools) > 0 && !caps.Tools {
 		a.Note(llm.Diagnostic{
 			Code: llm.DropToolDefinition, Class: llm.ClassCapability, Stage: llm.StagePlan,
-			Severity: llm.SeverityInfo, Provider: a.Provider, Count: len(req.Tools),
-			Detail: "this backend takes no tool definitions",
+			Severity: llm.SeverityLoss, Provider: a.Provider, Count: len(req.Tools),
+			Detail: "this backend takes no tool definitions, so the model answered without the tools it was offered",
 		})
 		req.Tools = nil
 		a.Tools = nil
@@ -155,7 +156,7 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 		a.Note(llm.Diagnostic{
 			Code: llm.DropExtraField, Class: llm.ClassCapability, Stage: llm.StagePlan,
 			Severity: llm.SeverityLoss, Provider: a.Provider, Count: len(fields),
-			Field:  strings.Join(fields, ","),
+			Field:  named(fields),
 			Detail: extraDetail(req.ExtraFrom, caps),
 		})
 		req.Extra = nil
@@ -215,8 +216,8 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 	if caps.CacheBreakpoints == 0 && hasCacheHint(req) {
 		a.Note(llm.Diagnostic{
 			Code: llm.CapCacheBreakpoint, Class: llm.ClassCapability, Stage: llm.StagePlan,
-			Severity: llm.SeverityInfo, Provider: a.Provider,
-			Detail: "this backend cannot express a cache breakpoint, so the prompt is billed fresh",
+			Severity: llm.SeverityLoss, Provider: a.Provider,
+			Detail: "this backend cannot express a cache breakpoint, so the whole prompt is billed fresh",
 		})
 		clearCacheHints(req)
 	} else if dropped := trimCacheHints(req, caps.CacheBreakpoints); dropped > 0 {
@@ -313,16 +314,48 @@ func hasSystem(req *llm.Request) bool {
 	return false
 }
 
+// foldSystem turns every system turn into an ordinary one. A backend with no
+// system channel has nowhere to put one wherever it stands, and leaving a turn
+// behind while reporting it folded fails a caller who refuses the loss only
+// after the call has been paid for. What a turn carried — its cache
+// breakpoint — travels with it.
 func foldSystem(req *llm.Request) {
-	system, msgs := req.SystemAndMessages()
-	if len(system) == 0 {
-		req.System, req.Messages = nil, msgs
-		return
+	folded := make([]llm.Message, 0, len(req.Messages)+1)
+	if len(req.System) > 0 {
+		folded = append(folded, llm.Message{
+			Role: llm.RoleUser, Content: req.System, Cache: req.SystemCache,
+		})
 	}
-	folded := make([]llm.Message, 0, len(msgs)+1)
-	folded = append(folded, llm.Message{Role: llm.RoleUser, Content: system, Cache: req.SystemCache})
 	req.System, req.SystemCache = nil, nil
-	req.Messages = append(folded, msgs...)
+	for _, m := range req.Messages {
+		if m.Role == llm.RoleSystem || m.Role == llm.RoleDeveloper {
+			m.Role = llm.RoleUser
+		}
+		folded = append(folded, m)
+	}
+	req.Messages = folded
+}
+
+// The keys are the caller's to name and the list is written to the ledger once
+// for every link of a chain, so what it can cost is not the caller's to choose.
+const maxNamedFields = 512
+
+func named(fields []string) string {
+	var b strings.Builder
+	for i, f := range fields {
+		if b.Len()+len(f)+1 > maxNamedFields {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, "… and %d more", len(fields)-i)
+			break
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(f)
+	}
+	return b.String()
 }
 
 func hasParallelTools(req *llm.Request) bool {
@@ -378,10 +411,29 @@ func approxBytes(req *llm.Request) int64 {
 	var n int64
 	n += partBytes(req.System)
 	for _, m := range req.Messages {
-		n += partBytes(m.Content)
+		n += int64(len(m.Name)) + partBytes(m.Content)
 	}
 	for _, t := range req.Tools {
-		n += int64(len(t.Name) + len(t.Description) + len(t.Schema))
+		n += int64(len(t.Name) + len(t.Description) + len(t.Schema) + len(t.OutputSchema))
+	}
+	// Extras and tool servers are the caller's to size too, and a ceiling that
+	// does not weigh them is one a caller can walk past.
+	for k, v := range req.Extra {
+		n += int64(len(k) + len(v))
+	}
+	for _, s := range req.MCPServers {
+		n += int64(len(s.Name) + len(s.URL) + len(s.Connector) + len(s.Description) + len(s.Token))
+		for k, v := range s.Headers {
+			n += int64(len(k) + len(v))
+		}
+		for _, list := range [][]string{s.AllowedTools, s.DeniedTools, s.ApprovalTools} {
+			for _, name := range list {
+				n += int64(len(name))
+			}
+		}
+	}
+	for k, v := range req.Metadata {
+		n += int64(len(k) + len(v))
 	}
 	return n
 }
@@ -395,11 +447,11 @@ func partBytes(parts []llm.Part) int64 {
 		case *llm.Thinking:
 			n += int64(len(v.Text) + len(v.Signature) + len(v.Redacted))
 		case *llm.ToolUse:
-			n += int64(len(v.Name) + len(v.Args))
+			n += int64(len(v.ID) + len(v.Name) + len(v.Args))
 		case *llm.ToolResult:
-			n += int64(len(v.Name)) + partBytes(v.Content)
+			n += int64(len(v.ID)+len(v.Name)) + partBytes(v.Content)
 		case *llm.Image:
-			n += int64(len(v.Data)+len(v.URL)) * 4 / 3
+			n += int64(len(v.MIME)) + int64(len(v.Data)+len(v.URL))*4/3
 		case *llm.Refusal:
 			n += int64(len(v.Text))
 		case *llm.Raw:

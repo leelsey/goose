@@ -6,6 +6,7 @@ package goose
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,7 +23,6 @@ type stub struct {
 	frames  []*llm.Frame
 	seenMod []string
 	calls   int
-	gate    chan struct{}
 	closed  bool
 }
 
@@ -455,5 +455,22 @@ func TestARoutesToolsJoinTheCallersRatherThanReplaceThem(t *testing.T) {
 	}
 	if len(p.seen.Tools) != len(p.seen.Request.Tools) {
 		t.Errorf("attempt tools %d, request tools %d", len(p.seen.Tools), len(p.seen.Request.Tools))
+	}
+}
+
+func TestAnUnboundedModelNameIsRefused(t *testing.T) {
+	c, err := New(WithProvider(&stub{id: "one"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Chat(context.Background(), &llm.Request{
+		Model:    strings.Repeat("a.", 200000),
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}},
+	})
+	if err == nil {
+		t.Fatal("matching a megabyte of separators against every route is work a caller must not be able to ask for")
+	}
+	if e := llm.AsError(err); e.Kind != llm.KindInvalidRequest {
+		t.Fatalf("kind = %q", e.Kind)
 	}
 }

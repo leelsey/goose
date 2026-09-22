@@ -165,19 +165,27 @@ func (s *Server) Routes() []string { return append([]string(nil), s.routes...) }
 func (s *Server) Handler() http.Handler { return s.handler }
 
 func (s *Server) wrap() http.Handler {
+	// Outermost first: the log records every refusal, including the ones the
+	// limiter and the key check make themselves; the rate limiter counts
+	// unauthenticated traffic too, because that is most of what it exists to
+	// shed; and the concurrency gate sits inside the key check, because a slot
+	// is for work that is actually going to happen.
 	var h http.Handler = s.unserved()
 	h = s.limitBody(h)
 	if s.opts.Metrics != nil {
 		h = s.observe(h)
 	}
-	if s.inflight != nil || s.rate != nil {
-		h = s.limit(h)
-	}
-	if s.opts.LogRequests && s.opts.Logger != nil {
-		h = s.logRequests(h)
+	if s.inflight != nil {
+		h = s.gate(h)
 	}
 	if s.opts.APIKey != "" {
 		h = s.authenticate(h)
+	}
+	if s.rate != nil {
+		h = s.rateLimit(h)
+	}
+	if s.opts.LogRequests && s.opts.Logger != nil {
+		h = s.logRequests(h)
 	}
 	if s.opts.CORS {
 		h = s.cors(h)

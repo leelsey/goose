@@ -9,6 +9,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/leelsey/goose/llm"
@@ -29,6 +30,7 @@ type Client struct {
 	breakerPolicy *Breaker
 	abandon       time.Duration
 	breaker       *breakers
+	redact        bool
 }
 
 const DefaultAbandonGrace = 2 * time.Second
@@ -138,6 +140,33 @@ func WithBreaker(b Breaker) Option {
 	}
 }
 
+// WithRedactedErrors keeps an upstream's own words out of the usage ledger. A
+// backend's refusal routinely quotes the request back — the offending message,
+// the filtered passage — so a record meant to say what a call cost can end up
+// holding what it said. The error the caller receives is unaffected.
+func WithRedactedErrors() Option {
+	return func(c *Client) error { c.redact = true; return nil }
+}
+
+// detail is what the ledger is told beyond the error's own message.
+func (c *Client) detail(e *llm.Error) string {
+	if c.redact {
+		return ""
+	}
+	return e.Body
+}
+
+// reason is the ledger's short account of a failure. A message parsed out of an
+// upstream's body is the upstream's own sentence, and for a content filter that
+// sentence is usually the passage it objected to, so redaction covers it too;
+// goose's own words are kept, since nobody's request is in them.
+func (c *Client) reason(e *llm.Error) string {
+	if c.redact && e.Body != "" {
+		return string(e.Kind)
+	}
+	return e.Message
+}
+
 func WithLimits(l llm.Limits) Option {
 	return func(c *Client) error {
 		c.limits = l
@@ -208,6 +237,14 @@ func (c *Client) Record(ctx context.Context, rec llm.Attempted, format string) {
 	c.book(ctx, rec, callConfig{format: format}, nil)
 }
 
+// A provider is someone else's code, and asking several at once puts it on a
+// goroutine of its own where a panic would take the process with it. It is
+// reported as that provider's failure instead, as it was when the call ran on
+// the caller's own goroutine.
+func panicked(provider string, p any) error {
+	return llm.Errorf(llm.KindInternal, "%s panicked: %v", provider, p)
+}
+
 func listFailure(err error) string {
 	if e := llm.AsError(err); e != nil {
 		return e.Message
@@ -216,12 +253,38 @@ func listFailure(err error) string {
 }
 
 func (c *Client) Models(ctx context.Context) ([]llm.Model, llm.Diagnostics) {
+	// Every backend is asked at once, but they are read back in the configured
+	// order, so which one a shared model id belongs to does not depend on
+	// whichever answered first.
+	type listing struct {
+		models []llm.Model
+		err    error
+	}
+	got := make([]listing, len(c.order))
+	var wg sync.WaitGroup
+	for i, id := range c.order {
+		lister, ok := c.providers[id].(llm.Lister)
+		if !ok {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if p := recover(); p != nil {
+					got[i].err = panicked(id, p)
+				}
+			}()
+			got[i].models, got[i].err = lister.Models(ctx)
+		}()
+	}
+	wg.Wait()
+
 	var out []llm.Model
 	var diags llm.Diagnostics
 	seen := map[string]bool{}
-	for _, id := range c.order {
-		lister, ok := c.providers[id].(llm.Lister)
-		if !ok {
+	for i, id := range c.order {
+		if _, ok := c.providers[id].(llm.Lister); !ok {
 			diags = append(diags, llm.Diagnostic{
 				Code: llm.CapNoModelList, Class: llm.ClassCapability, Stage: llm.StageResponse,
 				Severity: llm.SeverityInfo, Provider: id,
@@ -229,16 +292,15 @@ func (c *Client) Models(ctx context.Context) ([]llm.Model, llm.Diagnostics) {
 			})
 			continue
 		}
-		models, err := lister.Models(ctx)
-		if err != nil {
+		if got[i].err != nil {
 			diags = append(diags, llm.Diagnostic{
 				Code: llm.CapNoModelList, Class: llm.ClassCapability, Stage: llm.StageResponse,
 				Severity: llm.SeverityLoss, Provider: id,
-				Detail: "the model list could not be read: " + listFailure(err),
+				Detail: "the model list could not be read: " + listFailure(got[i].err),
 			})
 			continue
 		}
-		for _, m := range models {
+		for _, m := range got[i].models {
 			if seen[m.ID] {
 				continue
 			}
@@ -257,21 +319,36 @@ type Health struct {
 }
 
 func (c *Client) Ready(ctx context.Context) ([]Health, bool) {
-	out := make([]Health, 0, len(c.order))
-	ok := true
-	for _, id := range c.order {
-		h := Health{Provider: id, Ready: true}
+	// One slow backend must not add its wait to every backend after it.
+	out := make([]Health, len(c.order))
+	var wg sync.WaitGroup
+	for i, id := range c.order {
+		out[i] = Health{Provider: id, Ready: true}
 		prober, can := c.providers[id].(llm.Prober)
 		if !can {
-			h.Known = false
-			out = append(out, h)
 			continue
 		}
-		h.Known = true
-		if err := prober.Probe(ctx); err != nil {
-			h.Ready, h.Err, ok = false, llm.AsError(err).Message, false
+		out[i].Known = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if p := recover(); p != nil {
+					out[i].Ready, out[i].Err = false, panicked(id, p).Error()
+				}
+			}()
+			if err := prober.Probe(ctx); err != nil {
+				out[i].Ready, out[i].Err = false, llm.AsError(err).Message
+			}
+		}()
+	}
+	wg.Wait()
+
+	ok := true
+	for _, h := range out {
+		if !h.Ready {
+			ok = false
 		}
-		out = append(out, h)
 	}
 	return out, ok
 }

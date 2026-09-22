@@ -104,15 +104,20 @@ type Rule struct {
 	Tools  []string
 	Sticky bool
 	Policy llm.LossPolicy
-	Limits llm.Limits
+	// PolicySet tells a policy that was chosen from one that was left alone:
+	// "not strict, nothing allowed, nothing denied" is a real answer, and
+	// without this it reads the same as silence.
+	PolicySet bool
+	Limits    llm.Limits
 }
 
 type Decision struct {
-	Rule    string
-	Targets []Target
-	Tools   []string
-	Policy  llm.LossPolicy
-	Limits  llm.Limits
+	Rule      string
+	Targets   []Target
+	Tools     []string
+	Policy    llm.LossPolicy
+	PolicySet bool
+	Limits    llm.Limits
 }
 
 type Table struct {
@@ -129,7 +134,7 @@ func (t *Table) Route(c *Call) (Decision, error) {
 		if targets := t.Selector(c); len(targets) > 0 {
 			return Decision{
 				Rule: "selector", Targets: targets, Tools: t.Defaults.Tools,
-				Policy: t.Defaults.Policy, Limits: t.Defaults.Limits,
+				Policy: t.Defaults.Policy, PolicySet: true, Limits: t.Defaults.Limits,
 			}, nil
 		}
 	}
@@ -162,7 +167,11 @@ func (t *Table) Route(c *Call) (Decision, error) {
 		if len(tools) == 0 {
 			tools = t.Defaults.Tools
 		}
-		if !policy.Strict && len(policy.Allow) == 0 && len(policy.Deny) == 0 {
+		// A rule built by hand says what it means by saying anything at all;
+		// PolicySet is for the one thing a zero value cannot express, which is
+		// choosing not to be strict under a table that is.
+		set := r.PolicySet || policy.Strict || len(policy.Allow) > 0 || len(policy.Deny) > 0
+		if !set {
 			policy = t.Defaults.Policy
 		}
 		if limits == (llm.Limits{}) {
@@ -170,7 +179,7 @@ func (t *Table) Route(c *Call) (Decision, error) {
 		}
 		return Decision{
 			Rule: nameOr(r.Name, "rule"), Targets: chain, Tools: tools,
-			Policy: policy, Limits: limits,
+			Policy: policy, PolicySet: set, Limits: limits,
 		}, nil
 	}
 	return Decision{}, &llm.Error{

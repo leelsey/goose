@@ -189,3 +189,25 @@ func TestPathAndStreamingMatchers(t *testing.T) {
 		t.Fatalf("decision = %+v err = %v", dec, err)
 	}
 }
+
+func TestAHandBuiltRulesPolicyIsNotDiscarded(t *testing.T) {
+	table := &Table{
+		Defaults: Rule{Policy: llm.LossPolicy{Strict: false}},
+		Rules: []Rule{{
+			Name:   "picky",
+			Match:  Always(),
+			Chain:  []Target{{Provider: "one"}},
+			Policy: llm.LossPolicy{Strict: true, Deny: []string{"drop.thinking"}},
+		}},
+	}
+	dec, err := table.Route(&Call{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dec.Policy.Strict || len(dec.Policy.Deny) != 1 {
+		t.Fatalf("policy = %+v: a rule that named a policy chose one", dec.Policy)
+	}
+	if !dec.PolicySet {
+		t.Fatal("the decision must say the policy was chosen, or the client will reach past it")
+	}
+}

@@ -5,6 +5,7 @@ package goose
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"time"
 
@@ -111,22 +112,43 @@ func (c *Client) policyFor(dec route.Decision, cc callConfig) llm.LossPolicy {
 	switch {
 	case cc.policy != nil:
 		return *cc.policy
-	case dec.Policy.Strict || len(dec.Policy.Allow) > 0 || len(dec.Policy.Deny) > 0:
+	case dec.PolicySet:
 		return dec.Policy
 	default:
 		return c.policy
 	}
 }
 
+// A narrower limit is a refinement of the wider one, not a replacement for it:
+// a route that pins a frame size must not thereby lose the client's deadline.
 func (c *Client) limitsFor(dec route.Decision, cc callConfig) llm.Limits {
-	switch {
-	case cc.limits != nil:
-		return *cc.limits
-	case dec.Limits != (llm.Limits{}):
-		return dec.Limits
-	default:
-		return c.limits
+	out := c.limits
+	if dec.Limits != (llm.Limits{}) {
+		out = fillLimits(dec.Limits, out)
 	}
+	if cc.limits != nil {
+		out = fillLimits(*cc.limits, out)
+	}
+	return out
+}
+
+func fillLimits(over, under llm.Limits) llm.Limits {
+	if over.MaxRequestBytes == 0 {
+		over.MaxRequestBytes = under.MaxRequestBytes
+	}
+	if over.MaxResponseBytes == 0 {
+		over.MaxResponseBytes = under.MaxResponseBytes
+	}
+	if over.MaxFrameBytes == 0 {
+		over.MaxFrameBytes = under.MaxFrameBytes
+	}
+	if over.MaxBufferBytes == 0 {
+		over.MaxBufferBytes = under.MaxBufferBytes
+	}
+	if over.Timeout == 0 {
+		over.Timeout = under.Timeout
+	}
+	return over
 }
 
 func (c *Client) attemptFor(dec route.Decision, target route.Target, index int, req *llm.Request, cc callConfig, rec llm.Recorder) *llm.Attempt {
@@ -175,18 +197,24 @@ func mergeTools(own, group []llm.Tool, rec llm.Recorder, provider string) []llm.
 	if len(group) == 0 {
 		return own
 	}
-	named := make(map[string]bool, len(own))
+	byCaller := make(map[string]bool, len(own))
 	for _, t := range own {
-		named[t.Name] = true
+		byCaller[t.Name] = true
 	}
+	named := make(map[string]bool, len(own))
+	maps.Copy(named, byCaller)
 	out := append([]llm.Tool(nil), own...)
 	for _, t := range group {
 		if named[t.Name] {
 			if rec != nil {
+				detail := "the route registers this tool twice, and the first registration is the one that stands"
+				if byCaller[t.Name] {
+					detail = "the route offers a tool the caller named too, and the caller's is the one it wrote the call against"
+				}
 				rec.Note(llm.Diagnostic{
 					Code: llm.DropToolDefinition, Class: llm.ClassCapability, Stage: llm.StagePlan,
 					Severity: llm.SeverityInfo, Provider: provider, Field: t.Name,
-					Detail: "the route offers a tool the caller named too, and the caller's is the one it wrote the call against",
+					Detail: detail,
 				})
 			}
 			continue
@@ -246,18 +274,32 @@ func deadline(ctx context.Context, d time.Duration) (context.Context, context.Ca
 	return context.WithTimeout(ctx, d)
 }
 
+// untilPrimed walls an attempt until its stream is primed, after which the body
+// takes as long as it takes. The wall cancels rather than expires, so it names
+// its own cause: a deadline we set is not the caller hanging up, and a client
+// still on the line is owed 504 rather than 499.
 func untilPrimed(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc, func()) {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := func() { cancel(context.Canceled) }
 	if d <= 0 {
-		return ctx, cancel, func() {}
+		return ctx, stop, func() {}
 	}
-	timer := time.AfterFunc(d, cancel)
-	return ctx, cancel, func() { timer.Stop() }
+	timer := time.AfterFunc(d, func() { cancel(context.DeadlineExceeded) })
+	return ctx, stop, func() { timer.Stop() }
 }
+
+// No backend names a model this long, and the name is matched against every
+// route pattern before anything else happens, so an unbounded one is work a
+// caller can ask for without sending a question at all.
+const maxModelName = 512
 
 func validate(req *llm.Request) error {
 	if len(req.Messages) == 0 && len(req.System) == 0 {
 		return llm.Errorf(llm.KindInvalidRequest, "the request carries no messages")
+	}
+	if len(req.Model) > maxModelName {
+		return llm.Errorf(llm.KindInvalidRequest,
+			"the model name is %d characters; no backend names one longer than %d", len(req.Model), maxModelName)
 	}
 	for i, t := range req.Tools {
 		if t.Name == "" {

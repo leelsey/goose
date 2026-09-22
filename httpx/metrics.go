@@ -57,7 +57,8 @@ func (m *Metrics) Record(_ context.Context, r usage.Record) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.attempts[attemptKey{r.Provider, r.Model, string(r.Outcome)}]++
+	model := m.label(r.Model)
+	m.attempts[attemptKey{r.Provider, model, string(r.Outcome)}]++
 	if r.Sent && !r.Usage.Reported {
 		m.unmeasured[r.Provider]++
 	}
@@ -69,7 +70,7 @@ func (m *Metrics) Record(_ context.Context, r usage.Record) error {
 		"reasoning":   r.Usage.Reasoning,
 	} {
 		if n > 0 {
-			m.tokens[tokenKey{r.Provider, r.Model, kind}] += int64(n)
+			m.tokens[tokenKey{r.Provider, model, kind}] += int64(n)
 		}
 	}
 	return nil
@@ -95,6 +96,33 @@ func (m *Metrics) entered(delta int64) {
 	m.mu.Lock()
 	m.inflight += delta
 	m.mu.Unlock()
+}
+
+// A model name can be whatever the client wrote, and every distinct one is a
+// series kept for the life of the process and rendered into /metrics. Long ones
+// are not model names, and past the cap the rest are counted together rather
+// than each buying a row of their own. Called with m.mu held.
+const (
+	// Long enough for the longest real model id: a Bedrock inference-profile
+	// ARN or a Vertex projects/.../models/... path, both of which run well past
+	// a hundred characters.
+	maxLabel  = 256
+	maxSeries = 512
+)
+
+func (m *Metrics) label(model string) string {
+	if len(model) > maxLabel {
+		return "other"
+	}
+	if len(m.attempts) < maxSeries {
+		return model
+	}
+	for k := range m.attempts {
+		if k.model == model {
+			return model
+		}
+	}
+	return "other"
 }
 
 func (m *Metrics) throttle() {
@@ -252,8 +280,8 @@ func (s *Server) observe(next http.Handler) http.Handler {
 		started := s.client.Env().Clock()
 		o := &observer{ResponseWriter: w}
 		s.opts.Metrics.entered(1)
+		defer s.opts.Metrics.entered(-1)
 		next.ServeHTTP(o, r)
-		s.opts.Metrics.entered(-1)
 		status := o.status
 		if status == 0 {
 			status = http.StatusOK

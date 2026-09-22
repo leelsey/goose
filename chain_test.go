@@ -5,6 +5,7 @@ package goose
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,6 +95,59 @@ func TestAClosedStreamBooksTheFiguresRatherThanTheFallback(t *testing.T) {
 	}
 }
 
+func TestARefusedKeyFallsThroughToTheNextLink(t *testing.T) {
+	first := &stub{id: "first", err: &llm.Error{
+		Kind: llm.KindAuth, Provider: "first", Message: "invalid credentials", Sent: true, Status: 401,
+	}}
+	second := &stub{id: "second"}
+	c, err := New(
+		WithProvider(first), WithProvider(second),
+		WithRoutes(route.Rule{Name: "chain", Match: route.Always(), Chain: []route.Target{
+			{Provider: "first"}, {Provider: "second"},
+		}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.Chat(context.Background(), &llm.Request{
+		Model: "m", Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.calls != 1 {
+		t.Fatal("one backend's credentials say nothing about the next one's, so the chain had somewhere left to go")
+	}
+	if got := llm.TextOf(resp.Choices[0].Message.Content); got != "ok from second" {
+		t.Fatalf("text = %q", got)
+	}
+}
+
+func TestAMalformedRequestStopsTheChain(t *testing.T) {
+	first := &stub{id: "first", err: &llm.Error{
+		Kind: llm.KindInvalidRequest, Provider: "first", Message: "unreadable field",
+		Sent: true, Status: 400, Retryable: true,
+	}}
+	second := &stub{id: "second"}
+	c, err := New(
+		WithProvider(first), WithProvider(second),
+		WithRoutes(route.Rule{Name: "chain", Match: route.Always(), Chain: []route.Target{
+			{Provider: "first"}, {Provider: "second"},
+		}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Chat(context.Background(), &llm.Request{
+		Model: "m", Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}},
+	}); err == nil {
+		t.Fatal("a request no backend can read is not a served one")
+	}
+	if second.calls != 0 {
+		t.Fatal("the request itself is what is wrong, so the next link would refuse it the same way")
+	}
+}
+
 func TestAStreamThatFailsAfterItsFirstFrameIsNotFailedOver(t *testing.T) {
 	boom := &llm.Error{Kind: llm.KindUpstream, Provider: "first", Message: "cut off", Sent: true, Retryable: true}
 	first := &stub{id: "first", frames: []*llm.Frame{
@@ -168,5 +222,110 @@ func TestAStreamThatFailsBeforeItsFirstFrameIsFailedOver(t *testing.T) {
 	}
 	if s.Meta().Provider != "second" {
 		t.Fatalf("provider = %q", s.Meta().Provider)
+	}
+}
+
+func TestADeadCallerStopsTheChainWhereverItGotTo(t *testing.T) {
+	first := &stub{id: "first", err: &llm.Error{
+		Kind: llm.KindOverloaded, Provider: "first", Message: "busy", Sent: true, Retryable: true,
+	}}
+	second := &stub{id: "second"}
+	c, err := New(
+		WithProvider(first), WithProvider(second),
+		WithRoutes(route.Rule{Name: "chain", Match: route.Always(), Chain: []route.Target{
+			{Provider: "first"}, {Provider: "second"},
+		}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Chat(ctx, &llm.Request{
+		Model: "m", Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}},
+	}); err == nil {
+		t.Fatal("a call whose caller has gone is not a served one")
+	}
+	if second.calls != 0 {
+		t.Fatal("the caller's own deadline is blown, so every remaining link would fail the same way")
+	}
+}
+
+type mute struct{ id string }
+
+func (m *mute) ID() string                     { return m.id }
+func (m *mute) Capabilities() llm.Capabilities { return llm.Capabilities{Streaming: true} }
+func (m *mute) Complete(context.Context, *llm.Attempt) (*llm.Response, error) {
+	return nil, retryable("nothing doing")
+}
+
+// Answers with neither a stream nor an error, which is the shape that used to
+// keep the breaker's probe for good.
+func (m *mute) Stream(context.Context, *llm.Attempt) (*llm.Stream, error) { return nil, nil }
+
+func TestAProviderThatAnswersWithNothingGivesTheProbeBack(t *testing.T) {
+	now := time.Now()
+	p := &mute{id: "quiet"}
+	c, err := New(
+		WithProvider(p),
+		WithBreaker(Breaker{Failures: 1, Cooldown: time.Minute}),
+		WithClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := func() *llm.Request {
+		return &llm.Request{Model: "m", Messages: []llm.Message{
+			{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}},
+		}}
+	}
+
+	if _, err := c.Chat(context.Background(), req()); err == nil {
+		t.Fatal("the provider refused, so the call did not succeed")
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := c.Stream(context.Background(), req()); err == nil {
+		t.Fatal("a provider that returns no stream and no error is a failure")
+	}
+	now = now.Add(2 * time.Minute)
+	if !c.breaker.allow("quiet") {
+		t.Fatal("the probe was taken and never given back, so this backend is shut out for good")
+	}
+}
+
+func TestRedactionKeepsTheUpstreamsWordsOutOfTheLedger(t *testing.T) {
+	// An upstream refusal routinely quotes the request back, so this stands in
+	// for a prompt arriving in a file operators treat as billing metadata.
+	boom := &llm.Error{
+		Kind: llm.KindInvalidRequest, Provider: "one", Status: 400, Sent: true,
+		Message: "invalid request",
+		Body:    `{"error":{"message":"messages[0].content: SECRET-PROMPT-BODY"}}`,
+	}
+	for _, redact := range []bool{false, true} {
+		mem := usage.NewMemory()
+		opts := []Option{WithProvider(&stub{id: "one", err: boom}), WithUsage(mem)}
+		if redact {
+			opts = append(opts, WithRedactedErrors())
+		}
+		c, err := New(opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Chat(context.Background(), &llm.Request{
+			Model: "m", Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}},
+		}); err == nil {
+			t.Fatal("the backend refused")
+		}
+		rows := mem.Records()
+		if len(rows) != 1 {
+			t.Fatalf("rows = %d", len(rows))
+		}
+		held := strings.Contains(rows[0].Detail, "SECRET-PROMPT-BODY")
+		if redact && held {
+			t.Fatal("the ledger kept the upstream's own words after being told not to")
+		}
+		if !redact && !held {
+			t.Fatal("without redaction the body is what an operator is diagnosing from")
+		}
 	}
 }

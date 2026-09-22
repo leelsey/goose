@@ -63,6 +63,17 @@ func newLimiter(perMinute int, now func() time.Time) *limiter {
 	}
 }
 
+// A caller has some say in its own key, so the number of them a flood can mint
+// is bounded: past the cap everyone new shares one bucket until the sweep makes
+// room. Sharing is the safe direction — it throttles harder, never less.
+const (
+	maxBuckets = 4096
+
+	// One bucket for everyone who proved the proxy's own key, since that is one
+	// principal however many of them there are.
+	provenBucket = "proven"
+)
+
 func (l *limiter) allow(key string) bool {
 	now := l.now()
 	l.mu.Lock()
@@ -70,6 +81,13 @@ func (l *limiter) allow(key string) bool {
 	l.sweep(now)
 
 	b, ok := l.callers[key]
+	if !ok && len(l.callers) >= maxBuckets && !reserved(key) {
+		// The overflow bucket is per class, so a flood that fills the table
+		// cannot spend an allowance belonging to callers on the other side of
+		// the key check.
+		key = "overflow:" + bucketClass(key)
+		b, ok = l.callers[key]
+	}
 	if !ok {
 		b = &bucket{tokens: l.burst, seen: now}
 		l.callers[key] = b
@@ -84,6 +102,17 @@ func (l *limiter) allow(key string) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// A key the proxy chooses rather than reads is never crowded out: there is one
+// of it, so it cannot be what fills the table.
+func reserved(key string) bool { return key == provenBucket }
+
+func bucketClass(key string) string {
+	if strings.HasPrefix(key, "key:") {
+		return "key"
+	}
+	return "addr"
 }
 
 func (l *limiter) sweep(now time.Time) {
@@ -102,6 +131,10 @@ func caller(r *http.Request, forwarded string) string {
 	if key := presented(r); key != "" {
 		return "key:" + key
 	}
+	return addr(r, forwarded)
+}
+
+func addr(r *http.Request, forwarded string) string {
 	if forwarded != "" {
 		if client := firstForwarded(r.Header.Get(forwarded)); client != "" {
 			return "addr:" + client
@@ -114,8 +147,42 @@ func caller(r *http.Request, forwarded string) string {
 	return "addr:" + host
 }
 
+// A bucket is only as good as what it is keyed on, and a caller has a say in
+// most of what it sends. The key check passes on any credential presented while
+// presented() reads the first, so reading the bucket off the request lets a
+// caller holding the real key mint a fresh allowance with every request by
+// sending a nonce beside it.
+//
+// So the key is what was actually proven. Where the proxy has a key of its own,
+// everyone who holds it is one principal as far as this proxy can tell, and
+// they share one allowance; a deployment that gates tenants with a shared key
+// while they carry their own upstream keys shares it too. Where the proxy has
+// no key, nothing is proven and the credential a caller carries upstream is the
+// only thing telling two of them apart. An unproven caller gets neither, and
+// shares the bucket of the connection it arrived on.
+func (s *Server) bucket(r *http.Request) string {
+	switch {
+	case s.opts.APIKey == "":
+		return caller(r, s.opts.ForwardedHeader)
+	case s.trusted(r):
+		return provenBucket
+	default:
+		return addr(r, "")
+	}
+}
+
+// The nearest hop appended the last entry, so that is the address the proxy in
+// front actually saw. The leftmost is whatever the client wrote, which a caller
+// wanting its own allowance can write afresh every request — precise where the
+// proxy replaces the header, and no limit at all where the proxy appends.
+// Behind a chain this is the nearest proxy rather than the client, so callers
+// behind one hop share an allowance; a deployment wanting them apart needs a
+// front end that replaces the header rather than adding to it.
 func firstForwarded(value string) string {
-	first, _, _ := strings.Cut(value, ",")
+	first := value
+	if i := strings.LastIndex(value, ","); i >= 0 {
+		first = value[i+1:]
+	}
 	first = strings.TrimSpace(first)
 	if first == "" {
 		return ""
@@ -129,27 +196,40 @@ func firstForwarded(value string) string {
 	return strings.Trim(first, "[]")
 }
 
-func (s *Server) limit(next http.Handler) http.Handler {
+// rateLimit counts a caller's requests, and so belongs outside the key check:
+// the flooding it exists to shed is mostly unauthenticated.
+func (s *Server) rateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions || operational(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if s.rate != nil && !s.rate.allow(caller(r, s.opts.ForwardedHeader)) {
+		if !s.rate.allow(s.bucket(r)) {
 			s.opts.Metrics.throttle()
 			w.Header().Set("Retry-After", "1")
 			s.refuse(w, r, llm.Errorf(llm.KindRateLimit, "too many requests"))
 			return
 		}
-		if s.inflight != nil {
-			if !s.inflight.enter() {
-				s.opts.Metrics.refused()
-				w.Header().Set("Retry-After", "1")
-				s.refuse(w, r, llm.Errorf(llm.KindSaturated, "the proxy is at capacity"))
-				return
-			}
-			defer s.inflight.leave()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// gate holds a slot for as long as the request runs, and so belongs inside the
+// key check: a slot is for work the proxy is going to do, and a request with no
+// credentials is not going to reach any.
+func (s *Server) gate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions || operational(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
 		}
+		if !s.inflight.enter() {
+			s.opts.Metrics.refused()
+			w.Header().Set("Retry-After", "1")
+			s.refuse(w, r, llm.Errorf(llm.KindSaturated, "the proxy is at capacity"))
+			return
+		}
+		defer s.inflight.leave()
 		next.ServeHTTP(w, r)
 	})
 }

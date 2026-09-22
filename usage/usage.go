@@ -7,6 +7,7 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -51,10 +52,18 @@ type Memory struct {
 
 func NewMemory() *Memory { return &Memory{} }
 
+// Every row holds the upstream's own words, so a long-running proxy that kept
+// them all would grow without end. The counts stay exact; only the rows
+// themselves are capped, newest kept.
+const maxRecords = 10000
+
 func (m *Memory) Record(_ context.Context, r Record) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.records = append(m.records, r)
+	if len(m.records) > 2*maxRecords {
+		m.records = append(m.records[:0], m.records[len(m.records)-maxRecords:]...)
+	}
 	m.calls++
 	if r.Sent && !r.Usage.Reported {
 		m.unmeasured++
@@ -105,17 +114,39 @@ func (j *JSONL) Record(_ context.Context, r Record) error {
 
 type Multi []Sink
 
+// Record writes the row to every sink at once: a call waits for the slowest
+// ledger rather than for all of them in turn. The error reported is the first
+// in configured order, not whichever failed soonest.
 func (m Multi) Record(ctx context.Context, r Record) error {
-	var first error
-	for _, s := range m {
+	if len(m) == 1 && m[0] != nil {
+		return m[0].Record(ctx, r)
+	}
+	errs := make([]error, len(m))
+	var wg sync.WaitGroup
+	for i, s := range m {
 		if s == nil {
 			continue
 		}
-		if err := s.Record(ctx, r); err != nil && first == nil {
-			first = err
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A sink is someone else's code; on its own goroutine a panic would
+			// take the process down rather than failing this one row.
+			defer func() {
+				if p := recover(); p != nil {
+					errs[i] = fmt.Errorf("usage sink panicked: %v", p)
+				}
+			}()
+			errs[i] = s.Record(ctx, r)
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
-	return first
+	return nil
 }
 
 func FromAttempt(a llm.Attempted, now time.Time, format string, stream bool) Record {

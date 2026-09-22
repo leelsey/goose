@@ -156,6 +156,9 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, codec wire.
 	for _, d := range diags {
 		stream.Note(d)
 	}
+	// A failure after this point is written into the body rather than returned,
+	// so redaction has to reach it where the codec reads it.
+	stream.Redact(s.hide)
 
 	encDiags, encErr := codec.EncodeStream(r.Context(), stream, opts, rw)
 
@@ -193,13 +196,7 @@ func (s *Server) decorate(w http.ResponseWriter, u llm.Usage, provider, session 
 }
 
 func (s *Server) fail(w http.ResponseWriter, codec wire.Codec, opts wire.Options, e *llm.Error) {
-	if s.opts.RedactUpstream && e.Provider != "" {
-		s.log().Debug("upstream failure", "provider", e.Provider, "status", e.Status,
-			"code", e.Code, "error", e.Message, "body", e.Body)
-		redacted := *e
-		redacted.Message = generic(e.Kind)
-		e = &redacted
-	}
+	e = s.hide(e)
 	out := codec.EncodeError(e, opts)
 	if out == nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": e.Message}})
@@ -237,6 +234,20 @@ func schemeOf(r *http.Request, key string) llm.CredentialScheme {
 		return llm.SchemeGoogle
 	}
 	return ""
+}
+
+// hide is what an upstream's failure may be repeated as. Both the message and
+// the code are the vendor's own text, parsed out of a body that routinely
+// quotes the request back, so both are replaced rather than only the sentence.
+func (s *Server) hide(e *llm.Error) *llm.Error {
+	if e == nil || !s.opts.RedactUpstream || e.Provider == "" {
+		return e
+	}
+	s.log().Debug("upstream failure", "provider", e.Provider, "status", e.Status,
+		"code", e.Code, "error", e.Message, "body", e.Body)
+	redacted := *e
+	redacted.Message, redacted.Code, redacted.Body = generic(e.Kind), "", ""
+	return &redacted
 }
 
 func generic(kind llm.ErrorKind) string {
