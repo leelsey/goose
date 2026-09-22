@@ -233,6 +233,17 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 	tools := 0
 	sawText, refusing := false, false
 	var streamErr error
+	// An unmodelled field rides the line its own frame produced, or the next
+	// line out where that frame produced none. The unstreamed answer on this
+	// endpoint carries them, so this one does too.
+	var held wirecore.Held
+	send := func(b generateBody, extra map[string]json.RawMessage) error {
+		raw, err := wire.WithExtra(mustJSON(b), held.Carry(extra))
+		if err != nil {
+			return err
+		}
+		return nd.Send(raw)
+	}
 
 	for fr := range s.Frames() {
 		if err := ctx.Err(); err != nil {
@@ -274,8 +285,16 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 			}
 		}
 		if emit {
-			if err := nd.Send(mustJSON(frame)); err != nil {
+			if err := send(frame, fr.Extra); err != nil {
 				return diags, err
+			}
+		} else if len(fr.Extra) > 0 {
+			if held.Keep(fr.Extra) {
+				diags = append(diags, llm.Diagnostic{
+					Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageEncode,
+					Severity: llm.SeverityLoss, Format: NameGenerate, Field: "extra",
+					Detail: "more fields waited for a line to carry them than one line will hold",
+				})
 			}
 		}
 		if fr.Stop != llm.StopNone {
@@ -317,7 +336,7 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 			Severity: llm.SeverityLoss, Format: NameGenerate, Detail: e.Message,
 		})
 	}
-	if err := nd.Send(mustJSON(final)); err != nil {
+	if err := send(final, nil); err != nil {
 		return diags, err
 	}
 	diags = append(diags, s.Diagnostics()...)

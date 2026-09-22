@@ -198,6 +198,8 @@ were left alone.
   call the vendor may well have billed.
 - A usage sink panicking took the process rather than the row whenever it was
   the only sink configured.
+- Ollama's `/api/generate` carried a backend's own fields on an unstreamed
+  answer and dropped every one of them on a streamed one, with nothing said.
 - Two consecutive frames carrying nothing but fields a wire does not model were
   one set of them by the time the next chunk could carry either, on the OpenAI
   and Ollama streams. They are all carried now, up to what one chunk will hold,

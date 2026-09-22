@@ -451,3 +451,38 @@ func TestFieldsHeldBackFromQuietFramesTravelAndAreBounded(t *testing.T) {
 		}
 	})
 }
+
+// A field this wire has no place for survives an unstreamed answer on this
+// endpoint, so it survives a streamed one too. A backend's own decoration
+// should not depend on which of the two a caller asked for.
+func TestGenerateCarriesFieldsItHasNoPlaceForEitherWay(t *testing.T) {
+	extra := map[string]json.RawMessage{"x_backend_nonce": json.RawMessage(`"aaa"`)}
+
+	t.Run("a whole answer", func(t *testing.T) {
+		resp := &llm.Response{
+			Choices: []llm.Choice{{Message: llm.Message{Content: []llm.Part{&llm.Text{Text: "hi"}}}, Stop: llm.StopEnd}},
+			Extra:   extra,
+		}
+		out, _, err := NewGenerate(Options{}).EncodeResponse(resp, wire.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(out.Body), `"x_backend_nonce":"aaa"`) {
+			t.Fatalf("the field did not survive: %s", out.Body)
+		}
+	})
+
+	t.Run("and a streamed one", func(t *testing.T) {
+		s := llm.StaticStream(llm.StreamMeta{Model: "m"}, []*llm.Frame{
+			{Delta: []llm.Part{&llm.Text{Text: "hi"}}, Extra: extra},
+			{Stop: llm.StopEnd},
+		})
+		w := &wire.BufferWriter{}
+		if _, err := NewGenerate(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, w); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(w.Body.String(), `"x_backend_nonce":"aaa"`) {
+			t.Errorf("the field vanished on the streamed path:\n%s", w.Body.String())
+		}
+	})
+}
