@@ -25,6 +25,9 @@ type Folder struct {
 	block *llm.Block
 	err   *llm.Error
 	diags llm.Diagnostics
+	// own is what the folder noted itself, apart from what the frames it was
+	// given carried.
+	own   llm.Diagnostics
 	extra map[string]json.RawMessage
 }
 
@@ -97,6 +100,7 @@ func NewFolder(opts FoldOptions) *Folder {
 
 func (f *Folder) note(d llm.Diagnostic) {
 	f.diags = append(f.diags, d)
+	f.own = append(f.own, d)
 	if f.recorder != nil {
 		f.recorder.Note(d)
 	}
@@ -398,7 +402,10 @@ func Fold(s *llm.Stream, opts FoldOptions) (*llm.Response, error) {
 		f.Add(fr)
 	}
 	resp := f.Response(s.Meta(), s.Usage())
-	resp.Diagnostics = append(resp.Diagnostics, s.Diagnostics()...)
+	// The stream keeps every frame's notes as well as its own, so the answer
+	// takes those and what the folder noted itself. The folder's copy of the
+	// frames' notes as well counted each of them twice.
+	resp.Diagnostics = append(append(llm.Diagnostics(nil), f.own...), s.Diagnostics()...)
 	resp.Attempts = append(resp.Attempts, s.Attempts()...)
 	err := s.Err()
 	if err == nil && f.Err() != nil {

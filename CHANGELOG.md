@@ -198,6 +198,9 @@ were left alone.
   call the vendor may well have billed.
 - A usage sink panicking took the process rather than the row whenever it was
   the only sink configured.
+- A frame's own notes appeared twice in an answer folded from a stream, once
+  from the folder and once from the stream that had kept them too. Only the
+  agent CLIs fold a stream, so it was their ledger rows that carried each twice.
 - Every OpenAI answer read as one that had lost content, because each choice
   carries a null `logprobs` unless the caller asked for them and a null field was
   counted as a field left behind. And on a stream the same note was raised on

@@ -360,3 +360,39 @@ func TestAFieldWithNothingInItIsNotALoss(t *testing.T) {
 		})
 	}
 }
+
+// What a frame said is said once in the answer it folds into. The stream keeps
+// its own frames' notes as well, so taking both counts each one twice.
+func TestAFramesNoteIsFoldedOnce(t *testing.T) {
+	note := llm.Diagnostic{Code: llm.WireFrameMalformed, Class: llm.ClassTransport, Stage: llm.StageResponse}
+	s := llm.StaticStream(llm.StreamMeta{Provider: "stub", Model: "m"}, []*llm.Frame{
+		{Delta: []llm.Part{&llm.Text{Text: "hi"}}, Diagnostics: llm.Diagnostics{note}},
+		{Stop: llm.StopEnd},
+	})
+	resp, err := Fold(s, FoldOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var said int
+	for _, d := range resp.Diagnostics {
+		if d.Code == llm.WireFrameMalformed {
+			said++
+		}
+	}
+	if said != 1 {
+		t.Errorf("one frame's note appears %d times in the answer", said)
+	}
+}
+
+// A folder used on its own still hands back what its frames said: the answer
+// it builds is the whole of what it was given, whoever else kept a copy.
+func TestAFolderOnItsOwnKeepsWhatItsFramesSaid(t *testing.T) {
+	note := llm.Diagnostic{Code: llm.WireFrameMalformed, Class: llm.ClassTransport, Stage: llm.StageResponse}
+	f := NewFolder(FoldOptions{})
+	f.Add(&llm.Frame{Delta: []llm.Part{&llm.Text{Text: "hi"}}, Diagnostics: llm.Diagnostics{note}})
+	f.Add(&llm.Frame{Stop: llm.StopEnd})
+	resp := f.Response(llm.StreamMeta{Provider: "stub"}, llm.Usage{})
+	if !hasCode(resp.Diagnostics, llm.WireFrameMalformed) {
+		t.Error("a frame's note was lost by a folder used on its own")
+	}
+}
