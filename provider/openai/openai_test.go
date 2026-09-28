@@ -519,3 +519,34 @@ func TestAFlatteningNamesTheBackendThatDidIt(t *testing.T) {
 		t.Fatalf("diagnostics = %+v: a loss with no backend on it names nothing", resp.Diagnostics)
 	}
 }
+
+// Fields beside the answer are a fact about the backend, and a fact is said
+// once. Saying it on every chunk puts a copy in the ledger row for every token
+// of the answer.
+func TestFieldsBesideTheAnswerAreSaidOnceAStream(t *testing.T) {
+	p, _, _ := serve(t, Options{Dialect: OpenAIDialect()}, func(w http.ResponseWriter, r *http.Request) {
+		chunk := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"x"},"logprobs":{"content":[]}}]}`
+		for range 200 {
+			_, _ = w.Write([]byte("data: " + chunk + "\n\n"))
+		}
+		_, _ = w.Write([]byte(`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	s, err := p.Stream(context.Background(), attempt("m", hello()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drained the way the proxy drains it, so what is counted is what reaches
+	// the ledger rather than what a fold of it happens to hold.
+	for range s.Frames() {
+	}
+	var said int
+	for _, d := range s.Diagnostics() {
+		if d.Code == llm.DropExtraField {
+			said++
+		}
+	}
+	if said != 1 {
+		t.Errorf("the backend's decoration was reported %d times for one stream", said)
+	}
+}

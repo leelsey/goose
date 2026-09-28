@@ -348,3 +348,31 @@ func TestTheRequestPathNamesTheCollection(t *testing.T) {
 		}
 	}
 }
+
+// Fields beside the answer are a fact about the backend, and a fact is said
+// once a stream rather than once a chunk.
+func TestFieldsBesideTheAnswerAreSaidOnceAStream(t *testing.T) {
+	p, _, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		chunk := `{"candidates":[{"content":{"role":"model","parts":[{"text":"x"}]},"index":0,` +
+			`"safetyRatings":[{"category":"HARM_CATEGORY_HARASSMENT","probability":"NEGLIGIBLE"}]}]}`
+		for range 200 {
+			_, _ = w.Write([]byte("data: " + chunk + "\n\n"))
+		}
+		_, _ = w.Write([]byte(`data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP","index":0}]}` + "\n\n"))
+	})
+	s, err := p.Stream(context.Background(), attempt(hello()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range s.Frames() {
+	}
+	var said int
+	for _, d := range s.Diagnostics() {
+		if d.Code == llm.DropExtraField {
+			said++
+		}
+	}
+	if said != 1 {
+		t.Errorf("the backend's decoration was reported %d times for one stream", said)
+	}
+}

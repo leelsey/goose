@@ -50,8 +50,11 @@ func Unmodelled(body []byte, known map[string]bool, field string, a *llm.Attempt
 		return nil
 	}
 	var names []string
-	for k := range obj {
-		if !known[k] {
+	for k, v := range obj {
+		// A field that is null carries nothing, so leaving it behind loses
+		// nothing — and OpenAI puts a null logprobs on every choice of every
+		// answer that did not ask for them.
+		if !known[k] && string(v) != "null" {
 			names = append(names, k)
 		}
 	}
@@ -68,4 +71,20 @@ func Unmodelled(body []byte, known map[string]bool, field string, a *llm.Attempt
 		d.Provider, d.Model = a.Provider, a.Model
 	}
 	return llm.Diagnostics{d}
+}
+
+// Beside says, once a stream, which fields a backend puts beside its answer.
+// They are a fact about the backend rather than about any one chunk, and said on
+// every chunk they are a copy in the ledger row for every token of the answer.
+type Beside struct{ said bool }
+
+func (b *Beside) Note(body []byte, known map[string]bool, field string, a *llm.Attempt) llm.Diagnostics {
+	if b.said {
+		return nil
+	}
+	d := Unmodelled(body, known, field, a)
+	if len(d) > 0 {
+		b.said = true
+	}
+	return d
 }

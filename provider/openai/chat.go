@@ -565,6 +565,7 @@ type chatParser struct {
 	queue    []*llm.Frame
 	attempt  *llm.Attempt
 	tools    map[int]*choiceTools
+	beside   wirecore.Beside
 }
 
 // Which tool call is open belongs to the choice that opened it; with more than
@@ -640,7 +641,7 @@ func (c *chatParser) next() (*llm.Frame, error) {
 			f := &llm.Frame{
 				ID: chunk.ID, Model: chunk.Model, Choice: &idx,
 				Delta:       delta.streamParts(c.toolFor(ch.Index)),
-				Diagnostics: wirecore.Unmodelled(ch.raw, chatChoiceKnown, "choice", c.attempt),
+				Diagnostics: c.beside.Note(ch.raw, chatChoiceKnown, "choice", c.attempt),
 			}
 			if delta.Role != "" {
 				f.Role = llm.Role(delta.Role)

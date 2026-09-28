@@ -338,3 +338,25 @@ func TestTheBufferCeilingIsSaidOnceAndNotOncePerDelta(t *testing.T) {
 			"the note costs more than the text it refused", said, deltas)
 	}
 }
+
+// A field whose value is null carries nothing, so leaving it behind loses
+// nothing. Reporting it as a loss makes every OpenAI answer read as one: each
+// choice carries a logprobs of null unless the caller asked for them.
+func TestAFieldWithNothingInItIsNotALoss(t *testing.T) {
+	known := map[string]bool{"index": true, "message": true, "finish_reason": true}
+	for _, tc := range []struct {
+		what string
+		body string
+		loss bool
+	}{
+		{"null", `{"index":0,"message":{},"finish_reason":"stop","logprobs":null}`, false},
+		{"and something in it", `{"index":0,"message":{},"finish_reason":"stop","logprobs":{"content":[]}}`, true},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			got := len(Unmodelled([]byte(tc.body), known, "choice", nil)) > 0
+			if got != tc.loss {
+				t.Errorf("reported = %v, want %v", got, tc.loss)
+			}
+		})
+	}
+}

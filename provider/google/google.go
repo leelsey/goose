@@ -515,6 +515,7 @@ type parser struct {
 	attempt  *llm.Attempt
 	toolIdx  map[int]*int
 	toolSeen map[int]bool
+	beside   wirecore.Beside
 }
 
 // Whether a candidate has called a tool is that candidate's own business; a
@@ -602,7 +603,7 @@ func (g *parser) next() (*llm.Frame, error) {
 			frames = append(frames, &llm.Frame{
 				ID: out.ResponseID, Model: out.ModelVersion, Choice: &idx, Delta: parts,
 				Stop:        decodeFinish(c.FinishReason, called),
-				Diagnostics: wirecore.Unmodelled(c.raw, candidateKnown, "candidate", g.attempt),
+				Diagnostics: g.beside.Note(c.raw, candidateKnown, "candidate", g.attempt),
 			})
 		}
 		if len(frames) == 0 {
