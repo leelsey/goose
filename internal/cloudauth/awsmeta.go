@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,9 @@ const (
 type expiring struct {
 	fetch func(ctx context.Context) (Creds, time.Time, error)
 	now   func() time.Time
+	// timeout bounds one fetch: metadataTimeout where zero, since a metadata
+	// service is near, and longer for STS across the network.
+	timeout time.Duration
 
 	mu       sync.Mutex
 	creds    Creds
@@ -34,10 +38,11 @@ type expiring struct {
 	inFlight chan struct{}
 }
 
-// A refresh already under way is waited on rather than repeated, and a waiter
-// waits on its own context. Holding the lock across the fetch instead would
-// queue every caller behind one slow exchange with no way to give up, and would
-// let whichever of them started it cancel the answer they are all waiting for.
+// A refresh already under way is waited on rather than repeated, and every
+// caller, the one that started it included, waits on its own context. Holding
+// the lock across the fetch instead would queue every caller behind one slow
+// exchange with no way to give up, and would let whichever of them started it
+// cancel the answer they are all waiting for.
 func (e *expiring) Get(ctx context.Context) (Creds, error) {
 	for {
 		e.mu.Lock()
@@ -59,11 +64,39 @@ func (e *expiring) Get(ctx context.Context) (Creds, error) {
 		e.inFlight = done
 		e.mu.Unlock()
 
-		creds, err := e.refresh(ctx, done)
-		if err != nil {
-			return Creds{}, err
+		return detach(ctx, func() (Creds, error) { return e.refresh(ctx, done) })
+	}
+}
+
+// detach runs a refresh apart from the caller that started it, which then gives
+// up at its own deadline as a waiter does while the exchange finishes for the
+// rest. On a goroutine of its own a panic would take the process down rather
+// than failing this one call, so it comes back as the caller's error.
+func detach[T any](ctx context.Context, refresh func() (T, error)) (T, error) {
+	type outcome struct {
+		val T
+		err error
+	}
+	out := make(chan outcome, 1)
+	go func() {
+		var o outcome
+		defer func() {
+			if p := recover(); p != nil {
+				o.err = fmt.Errorf("credential refresh panicked: %v", p)
+			}
+			out <- o
+		}()
+		o.val, o.err = refresh()
+	}()
+	var zero T
+	select {
+	case o := <-out:
+		if o.err != nil {
+			return zero, o.err
 		}
-		return creds, nil
+		return o.val, nil
+	case <-ctx.Done():
+		return zero, ctx.Err()
 	}
 }
 
@@ -86,7 +119,11 @@ func (e *expiring) refresh(parent context.Context, done chan struct{}) (creds Cr
 		close(done)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), metadataTimeout)
+	timeout := e.timeout
+	if timeout == 0 {
+		timeout = metadataTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
 	defer cancel()
 	creds, expires, err = e.fetch(ctx)
 	return creds, err
@@ -111,7 +148,10 @@ func (c containerCreds) creds() (Creds, time.Time) {
 	}, expires
 }
 
-func ContainerCredentials(client *http.Client, relative, full, token string, now func() time.Time) CredentialSource {
+// A token file, where one is named, wins over the token itself and is read at
+// every refresh: EKS Pod Identity hands a pod only the file, and rotates the
+// token in it under the running process.
+func ContainerCredentials(client *http.Client, relative, full, token, tokenFile string, now func() time.Time) CredentialSource {
 	url := full
 	if relative != "" {
 		if !strings.HasPrefix(relative, "/") {
@@ -130,8 +170,16 @@ func ContainerCredentials(client *http.Client, relative, full, token string, now
 		if err != nil {
 			return Creds{}, time.Time{}, err
 		}
-		if token != "" {
-			req.Header.Set("Authorization", token)
+		auth := token
+		if tokenFile != "" {
+			data, err := os.ReadFile(tokenFile)
+			if err != nil {
+				return Creds{}, time.Time{}, fmt.Errorf("aws container credentials: authorization token: %w", err)
+			}
+			auth = strings.TrimSpace(string(data))
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
 		}
 		body, err := read(ctx, client, req)
 		if err != nil {

@@ -94,10 +94,11 @@ type saSource struct {
 	inFlight chan struct{}
 }
 
-// A token exchange already under way is waited on rather than repeated, and a
-// waiter waits on its own context. Holding the lock across the exchange would
-// queue every request behind it with no way to give up, and would let whichever
-// one started it cancel the token they are all waiting for.
+// A token exchange already under way is waited on rather than repeated, and
+// every caller, the one that started it included, waits on its own context.
+// Holding the lock across the exchange would queue every request behind it with
+// no way to give up, and would let whichever one started it cancel the token
+// they are all waiting for.
 func (s *saSource) Token(ctx context.Context) (string, error) {
 	for {
 		s.mu.Lock()
@@ -119,12 +120,10 @@ func (s *saSource) Token(ctx context.Context) (string, error) {
 		s.inFlight = done
 		s.mu.Unlock()
 
-		token, _, err := s.refresh(ctx, done)
-
-		if err != nil {
-			return "", err
-		}
-		return token, nil
+		return detach(ctx, func() (string, error) {
+			token, _, err := s.refresh(ctx, done)
+			return token, err
+		})
 	}
 }
 
@@ -231,9 +230,16 @@ func parsePrivateKey(pemKey string) (*rsa.PrivateKey, error) {
 	return x509.ParsePKCS1PrivateKey(block.Bytes)
 }
 
+// host is spelt the way GCE_METADATA_HOST is, as Google's own libraries read
+// it: a host and an optional port, with the scheme left to the reader. A full
+// URL is still taken as one.
 func MetadataSource(client *http.Client, host string, now func() time.Time) TokenSource {
 	if host == "" {
-		host = "http://metadata.google.internal"
+		host = "metadata.google.internal"
+	}
+	host = strings.TrimRight(host, "/")
+	if !strings.Contains(host, "://") {
+		host = "http://" + host
 	}
 	if now == nil {
 		now = time.Now
@@ -273,11 +279,10 @@ func (m *metaSource) Token(ctx context.Context) (string, error) {
 		m.inFlight = done
 		m.mu.Unlock()
 
-		token, _, err := m.refresh(ctx, done)
-		if err != nil {
-			return "", err
-		}
-		return token, nil
+		return detach(ctx, func() (string, error) {
+			token, _, err := m.refresh(ctx, done)
+			return token, err
+		})
 	}
 }
 

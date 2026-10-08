@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +28,7 @@ func TestContainerCredentialsAreReadAndCached(t *testing.T) {
 	defer srv.Close()
 
 	clock := time.Now()
-	src := ContainerCredentials(srv.Client(), "", srv.URL, "tok", func() time.Time { return clock })
+	src := ContainerCredentials(srv.Client(), "", srv.URL, "tok", "", func() time.Time { return clock })
 	for range 3 {
 		creds, err := src(context.Background())
 		if err != nil {
@@ -41,8 +43,49 @@ func TestContainerCredentialsAreReadAndCached(t *testing.T) {
 	}
 }
 
+func TestAContainerTokenFileIsReadAtEveryRefresh(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "eks-pod-identity-token")
+	if err := os.WriteFile(file, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"AccessKeyId":"AK","SecretAccessKey":"SK","Token":"ST",
+			"Expiration":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `"}`))
+	}))
+	defer srv.Close()
+
+	clock := time.Now()
+	src := ContainerCredentials(srv.Client(), "", srv.URL, "fixed", file, func() time.Time { return clock })
+	if _, err := src(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * time.Hour)
+	if _, err := src(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || seen[0] != "first" || seen[1] != "second" {
+		t.Fatalf("tokens sent = %q: the file wins over the fixed token, and a rotated one is sent at the next refresh", seen)
+	}
+
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * time.Hour)
+	if _, err := src(context.Background()); err == nil {
+		t.Fatal("a token file that cannot be read is not a reason to ask without one")
+	}
+	if len(seen) != 2 {
+		t.Fatalf("requests = %d: the endpoint was asked without its token", len(seen))
+	}
+}
+
 func TestContainerCredentialsAreAbsentWithoutAnEndpoint(t *testing.T) {
-	if ContainerCredentials(nil, "", "", "", nil) != nil {
+	if ContainerCredentials(nil, "", "", "", "", nil) != nil {
 		t.Fatal("a process that is not in a task offered container credentials")
 	}
 }
@@ -114,7 +157,7 @@ func TestARelativeURICannotMoveTheHostItIsJoinedTo(t *testing.T) {
 			Header: http.Header{},
 		}, nil
 	})}
-	src := ContainerCredentials(client, "@elsewhere.example/creds", "", "token", time.Now)
+	src := ContainerCredentials(client, "@elsewhere.example/creds", "", "token", "", time.Now)
 	if _, err := src(context.Background()); err != nil {
 		t.Fatal(err)
 	}

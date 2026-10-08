@@ -184,6 +184,25 @@ func TestAStaticTokenRefusesToBeEmpty(t *testing.T) {
 	}
 }
 
+func TestAMetadataHostIsSpeltAsGoogleSpellsIt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/computeMetadata/v1/instance/service-accounts/default/token" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"tok","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	hostPort := strings.TrimPrefix(srv.URL, "http://")
+	for _, host := range []string{hostPort, srv.URL, srv.URL + "/"} {
+		token, err := MetadataSource(srv.Client(), host, nil).Token(context.Background())
+		if err != nil || token != "tok" {
+			t.Fatalf("host %q: token = %q, err = %v: GCE_METADATA_HOST is a host and a port", host, token, err)
+		}
+	}
+}
+
 func TestAMetadataTokenIsCachedAcrossCallers(t *testing.T) {
 	var reads int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
