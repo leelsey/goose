@@ -48,6 +48,41 @@ type Transport interface {
 	Close() error
 }
 
+// errGone is a transport that can carry nothing more: the child exited, the
+// stream ended, or the server no longer holds the session. What was asked of it
+// was never acted on, so it can be asked again of the server dialled afresh.
+var errGone = errors.New("the connection to the tool server has ended")
+
+func gone(cause error) error {
+	if cause == nil {
+		return errGone
+	}
+	return fmt.Errorf("%w: %w", errGone, cause)
+}
+
+var errClosed = errors.New("the client is closed")
+
+// turn lets one call at a time use a transport whose answers all arrive on one
+// channel, and lets a call waiting for its turn give up when its caller does.
+type turn chan struct{}
+
+func (t turn) take(ctx context.Context) error {
+	select {
+	case t <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// The turn can come up in the same instant the caller gives up, and the
+	// request sent then runs a tool for a caller already told it failed.
+	if err := ctx.Err(); err != nil {
+		<-t
+		return err
+	}
+	return nil
+}
+
+func (t turn) give() { <-t }
+
 type ServerInfo struct {
 	Name            string
 	Version         string
@@ -63,6 +98,13 @@ type Client struct {
 	probe         time.Duration
 	handshakeOnly bool
 	mirrors       bool
+
+	// dial opens the transport again once the one in use has ended, and the
+	// transport is replaced under mu when it does. Without it a server that
+	// goes away stays away.
+	dial    func(context.Context) (Transport, error)
+	dialing turn
+	closed  bool
 
 	seq     atomic.Int64
 	mu      sync.Mutex
@@ -83,9 +125,11 @@ type Options struct {
 	Mirrors   bool
 }
 
+const defaultTimeout = 30 * time.Second
+
 func newClient(name string, t Transport, o Options) *Client {
 	if o.Timeout <= 0 {
-		o.Timeout = 30 * time.Second
+		o.Timeout = defaultTimeout
 	}
 	if o.Probe <= 0 {
 		o.Probe = 5 * time.Second
@@ -95,7 +139,7 @@ func newClient(name string, t Transport, o Options) *Client {
 	}
 	return &Client{
 		name: name, transport: t, timeout: o.Timeout, probe: o.Probe,
-		handshakeOnly: o.Handshake, mirrors: o.Mirrors,
+		handshakeOnly: o.Handshake, mirrors: o.Mirrors, dialing: make(turn, 1),
 	}
 }
 
@@ -107,12 +151,84 @@ func (c *Client) Info() ServerInfo {
 	return c.info
 }
 
-func (c *Client) Close() error { return c.transport.Close() }
+func (c *Client) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	t := c.transport
+	c.mu.Unlock()
+	return t.Close()
+}
+
+func (c *Client) current() Transport {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.transport
+}
 
 func (c *Client) call(ctx context.Context, method string, params map[string]any, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
+	t := c.current()
+	err := c.exchange(ctx, t, method, params, out)
+	if !errors.Is(err, errGone) || c.dial == nil {
+		return err
+	}
+	// Nothing sent on a transport that has ended was acted on, so the request
+	// goes again to the server dialled afresh. A server that restarted or let
+	// its session lapse is not one to give up on for the life of the process.
+	if err := c.redial(ctx, t); err != nil {
+		return err
+	}
+	// What the first attempt stamped on the request was for the server it
+	// went to, and the one dialled afresh may speak another revision.
+	delete(params, "_meta")
+	return c.exchange(ctx, c.current(), method, params, out)
+}
+
+// redial replaces a transport that has ended with a fresh one, handshake and
+// all. Calls that found the same one ended wait for whichever of them dials.
+func (c *Client) redial(ctx context.Context, was Transport) error {
+	if err := c.dialing.take(ctx); err != nil {
+		return fmt.Errorf("mcp %s: %w", c.name, err)
+	}
+	defer c.dialing.give()
+	c.mu.Lock()
+	closed, now := c.closed, c.transport
+	c.mu.Unlock()
+	switch {
+	case closed:
+		return fmt.Errorf("mcp %s: %w", c.name, errClosed)
+	case now != was:
+		return nil
+	}
+	t, err := c.dial(ctx)
+	if err != nil {
+		return fmt.Errorf("mcp %s: %w", c.name, err)
+	}
+	fresh := newClient(c.name, t, Options{
+		Timeout: c.timeout, Probe: c.probe, Handshake: c.handshakeOnly, Mirrors: c.mirrors,
+	})
+	if err := fresh.connect(ctx); err != nil {
+		_ = t.Close()
+		return err
+	}
+	info, modern := fresh.Info(), fresh.modern
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = t.Close()
+		return fmt.Errorf("mcp %s: %w", c.name, errClosed)
+	}
+	c.transport, c.info, c.modern = t, info, modern
+	c.mu.Unlock()
+	// What it replaces has already ended, and closing it only reaps what is
+	// left: no reason to keep the call that dialled waiting on it.
+	go func() { _ = was.Close() }()
+	return nil
+}
+
+func (c *Client) exchange(ctx context.Context, t Transport, method string, params map[string]any, out any) error {
 	c.mu.Lock()
 	modern, version := c.modern, c.info.ProtocolVersion
 	c.mu.Unlock()
@@ -161,7 +277,7 @@ func (c *Client) call(ctx context.Context, method string, params map[string]any,
 		}
 		send.Params = headers
 	}
-	resp, err := c.transport.Call(ctx, send)
+	resp, err := t.Call(ctx, send)
 	if err != nil {
 		return fmt.Errorf("mcp %s: %s: %w", c.name, method, err)
 	}
@@ -337,7 +453,7 @@ func (c *Client) initialise(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.transport.Notify(ctx, Outbound{
+	return c.current().Notify(ctx, Outbound{
 		Method: "notifications/initialized", Version: result.ProtocolVersion, Payload: payload,
 	})
 }
@@ -440,6 +556,15 @@ func quoted(name string) (string, bool) {
 	return fmt.Sprintf("a name of %d bytes", len(name)), false
 }
 
+// unreachable tells a server that is not there from one that answered, even
+// with a refusal, and from one that was only slow: a server busy with a long
+// call is still there, and its tools are not taken away for it.
+func unreachable(err error) bool {
+	var answered *rpcError
+	return !errors.As(err, &answered) &&
+		!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)
+}
+
 func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 	var out []llm.Tool
 	var refused []string
@@ -481,6 +606,13 @@ func (c *Client) Tools(ctx context.Context) ([]llm.Tool, error) {
 			params["cursor"] = cursor
 		}
 		if err := c.call(ctx, "tools/list", params, &result); err != nil {
+			if unreachable(err) {
+				// A server that is not there serves none of its tools, and
+				// offering them sends every call to one that fails.
+				c.mu.Lock()
+				c.tools, c.raw, c.refused, c.truncated = nil, nil, nil, false
+				c.mu.Unlock()
+			}
 			return nil, err
 		}
 		for _, entry := range result.Tools {

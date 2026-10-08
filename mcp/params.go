@@ -4,9 +4,11 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -167,7 +169,9 @@ func walk(values map[string]json.RawMessage, path []string) (json.RawMessage, bo
 
 func headerScalar(raw json.RawMessage) (string, bool) {
 	var value any
-	if json.Unmarshal(raw, &value) != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
 		return "", false
 	}
 	switch v := value.(type) {
@@ -175,12 +179,29 @@ func headerScalar(raw json.RawMessage) (string, bool) {
 		return v, true
 	case bool:
 		return strconv.FormatBool(v), true
-	case float64:
-		if v == float64(int64(v)) {
-			return strconv.FormatInt(int64(v), 10), true
-		}
-		return "", false
+	case json.Number:
+		return integerText(v)
 	default:
 		return "", false
 	}
+}
+
+// integerText says an integer as the body wrote it. Read through a float, one
+// past 2^53 comes out as its neighbour, and a header naming a different number
+// from the body is the very mismatch the mirror is there to refuse. A number
+// written with a fraction or an exponent is a float to every reader, however
+// exactly it keeps its integers, so that one is read as a float too.
+func integerText(n json.Number) (string, bool) {
+	text := n.String()
+	if !strings.ContainsAny(text, ".eE") {
+		if text == "-0" {
+			return "0", true
+		}
+		return text, true
+	}
+	f, err := n.Float64()
+	if err != nil || f != math.Trunc(f) || f < -1<<63 || f >= 1<<63 {
+		return "", false
+	}
+	return strconv.FormatInt(int64(f), 10), true
 }

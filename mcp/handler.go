@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/leelsey/goose/internal/httpcore"
 )
 
 func (m *Manager) Handler() http.Handler {
@@ -61,7 +63,7 @@ func (m *Manager) rpc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req request
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := readExact(body, &req); err != nil {
 		writeRPCError(w, nil, &rpcError{Code: -32700, Message: "the request is not valid JSON", status: http.StatusBadRequest})
 		return
 	}
@@ -193,6 +195,27 @@ func (m *Manager) answerStreamed(w http.ResponseWriter, r *http.Request, req *re
 
 const heartbeat = 25 * time.Second
 
+// A listening stream gives back the concurrency slot that admitted it, and
+// then holds a connection and a goroutine for as long as its client keeps it
+// open. How many are open at once is bounded here instead.
+const maxListeners = 256
+
+func (m *Manager) listen() bool {
+	m.subs.Lock()
+	defer m.subs.Unlock()
+	if m.listening >= maxListeners {
+		return false
+	}
+	m.listening++
+	return true
+}
+
+func (m *Manager) unlisten() {
+	m.subs.Lock()
+	m.listening--
+	m.subs.Unlock()
+}
+
 func (m *Manager) streamOver(w http.ResponseWriter, r *http.Request, id any, want filter) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -201,6 +224,14 @@ func (m *Manager) streamOver(w http.ResponseWriter, r *http.Request, id any, wan
 		})
 		return
 	}
+	if !m.listen() {
+		writeRPCError(w, id, &rpcError{
+			Code: -32603, Message: "as many streams are listening as this server keeps open",
+			status: http.StatusServiceUnavailable,
+		})
+		return
+	}
+	defer m.unlisten()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -219,12 +250,15 @@ func (m *Manager) streamOver(w http.ResponseWriter, r *http.Request, id any, wan
 		return true
 	}
 
-	name := fmt.Sprint(id)
-	s := m.subscribe(name, want)
+	s := m.subscribe(id, want)
 	defer m.unsubscribe(s)
-	if !event(acknowledged(name, want)) {
+	if !event(acknowledged(id, want)) {
 		return
 	}
+	// From here the stream waits rather than works, and whatever admitted the
+	// request is given back: a concurrency slot held for as long as a client
+	// listens lets a few listeners shut out every other request.
+	httpcore.Release(r.Context())
 	ticker := time.NewTicker(heartbeat)
 	defer ticker.Stop()
 	for {
@@ -232,7 +266,7 @@ func (m *Manager) streamOver(w http.ResponseWriter, r *http.Request, id any, wan
 		case <-r.Context().Done():
 			return
 		case <-m.stop:
-			event(map[string]any{"jsonrpc": jsonrpcVersion, "id": id, "result": closed(name)})
+			event(map[string]any{"jsonrpc": jsonrpcVersion, "id": id, "result": closed(id)})
 			return
 		case frame := <-s.frames:
 			if !event(frame) {

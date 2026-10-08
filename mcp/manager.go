@@ -57,21 +57,15 @@ func Connect(ctx context.Context, cfg ServerConfig, client *http.Client) (*Clien
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("mcp: server has no name")
 	}
-	var (
-		t   Transport
-		err error
-	)
 	opts := Options{Timeout: cfg.Timeout}
 	switch cfg.kind() {
 	case Stdio:
-		t, err = startStdio(ctx, cfg, cfg.MaxFrame)
 	case SSE:
-		t, err = startSSE(ctx, cfg, client, cfg.MaxFrame)
 		opts.Handshake = true
 	default:
-		t, err = newHTTPTransport(cfg, client, cfg.MaxFrame)
 		opts.Mirrors = true
 	}
+	t, err := openTransport(ctx, cfg, client)
 	if err != nil {
 		return nil, fmt.Errorf("mcp %s: %w", cfg.Name, err)
 	}
@@ -80,7 +74,34 @@ func Connect(ctx context.Context, cfg ServerConfig, client *http.Client) (*Clien
 		_ = t.Close()
 		return nil, err
 	}
+	// Only a server that has been greeted is dialled again. Dialling inside
+	// the greeting would greet the fresh server twice, once to replace the
+	// transport and once more when the interrupted greeting is sent again.
+	c.dial = func(ctx context.Context) (Transport, error) { return openTransport(ctx, cfg, client) }
 	return c, nil
+}
+
+func openTransport(ctx context.Context, cfg ServerConfig, client *http.Client) (Transport, error) {
+	switch cfg.kind() {
+	case Stdio:
+		t, err := startStdio(ctx, cfg, cfg.MaxFrame)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	case SSE:
+		t, err := startSSE(ctx, cfg, client, cfg.MaxFrame)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	default:
+		t, err := newHTTPTransport(cfg, client, cfg.MaxFrame)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	}
 }
 
 const DefaultRefresh = 30 * time.Second
@@ -106,9 +127,10 @@ type Manager struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 
-	subs    subscribers
-	streams map[*subscriber]struct{}
-	tools   string
+	subs      subscribers
+	streams   map[*subscriber]struct{}
+	listening int
+	tools     string
 }
 
 // indexed is a tool as the index offers it: the source that serves it, and the
@@ -309,14 +331,21 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	m.mu.RLock()
 	sources := append([]source(nil), m.sources...)
 	m.mu.RUnlock()
-	var first error
-	for _, c := range sources {
-		if _, err := c.Tools(ctx); err != nil && first == nil {
-			first = err
+	// Each server is asked on its own, so one that has stopped answering costs
+	// its own refresh rather than that of every server listed after it.
+	errs := make([]error, len(sources))
+	var wg sync.WaitGroup
+	for i, c := range sources {
+		wg.Go(func() { _, errs[i] = c.Tools(ctx) })
+	}
+	wg.Wait()
+	m.reindex()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
-	m.reindex()
-	return first
+	return nil
 }
 
 func (m *Manager) Call(ctx context.Context, name string, args json.RawMessage) (*Result, error) {

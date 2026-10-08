@@ -37,7 +37,7 @@ func (m *Manager) modern(ctx context.Context, req *request, agreement meta, seen
 		}), nil
 
 	case "tools/list":
-		return answer(map[string]any{"tools": m.toolList()}), nil
+		return answer(map[string]any{"tools": m.toolList(seen.Present)}), nil
 
 	case "tools/call":
 		// Arguments nobody could read are arguments the mirror check cannot
@@ -48,10 +48,15 @@ func (m *Manager) modern(ctx context.Context, req *request, agreement meta, seen
 				return nil, &rpcError{Code: -32602, status: 400, Message: errNotAnObject.Error()}
 			}
 			// The tool's own schema is what could not be read, which is not
-			// something the caller can put right or needs the detail of.
-			return nil, &rpcError{
-				Code: -32603, status: 500,
-				Message: "this tool's schema cannot be checked against what was sent",
+			// something the caller can put right or needs the detail of. Where
+			// nothing is mirrored there is nothing to check it against, and a
+			// tool from a server that mirrors nothing is callable whatever its
+			// annotations ask for.
+			if seen.Present {
+				return nil, &rpcError{
+					Code: -32603, status: 500,
+					Message: "this tool's schema cannot be checked against what was sent",
+				}
 			}
 		}
 		if bad := seen.checkParams(expected); bad != nil {
@@ -130,7 +135,7 @@ func (m *Manager) legacy(ctx context.Context, method string, params json.RawMess
 		}, nil
 
 	case "tools/list":
-		return map[string]any{"tools": m.toolList()}, nil
+		return map[string]any{"tools": m.toolList(false)}, nil
 
 	case "tools/call":
 		var p struct {
@@ -177,10 +182,18 @@ func (m *Manager) schemaOf(name string) json.RawMessage {
 	return nil
 }
 
-func (m *Manager) toolList() []map[string]any {
+// toolList is the catalogue as served. A client that mirrors reads the
+// annotations to know what to send, and every call it makes to a tool whose
+// annotations goose cannot read is refused, so that client is not offered it.
+func (m *Manager) toolList(mirrors bool) []map[string]any {
 	tools := m.Tools()
 	out := make([]map[string]any, 0, len(tools))
 	for _, t := range tools {
+		if mirrors {
+			if _, err := annotated(t.Schema); err != nil {
+				continue
+			}
+		}
 		if entry := m.rawTool(t.Name); entry != nil {
 			out = append(out, entry)
 			continue
@@ -317,7 +330,7 @@ func (m *Manager) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) e
 	}()
 	pushLegacy := func() {
 		armLegacy.Do(func() {
-			s := m.subscribe("", filter{Tools: true})
+			s := m.subscribe(nil, filter{Tools: true})
 			unarmMu.Lock()
 			unarm = func() { m.unsubscribe(s) }
 			unarmMu.Unlock()
@@ -340,18 +353,29 @@ func (m *Manager) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) e
 	inFlight := &running{calls: map[string]context.CancelFunc{}}
 	var wg sync.WaitGroup
 	defer func() { cancel() }()
+	// Whoever called this reads what a call leaves behind as it ends, a billed
+	// call's row among it, once this returns. So it does not return while a
+	// call is still settling, for as long as grace allows.
+	settle := func() bool {
+		settled := make(chan struct{})
+		go func() { wg.Wait(); close(settled) }()
+		select {
+		case <-settled:
+			return true
+		case <-time.After(grace):
+			return false
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			settle()
 			return failed()
 		case frame, open := <-frames:
 			if !open {
-				settled := make(chan struct{})
-				go func() { wg.Wait(); close(settled) }()
-				select {
-				case <-settled:
-				case <-time.After(grace):
+				if !settle() {
 					cancel()
+					settle()
 				}
 				if err := failed(); err != nil {
 					return err
@@ -359,7 +383,7 @@ func (m *Manager) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) e
 				return readErr
 			}
 			var req request
-			if err := json.Unmarshal(frame, &req); err != nil {
+			if err := readExact(frame, &req); err != nil {
 				send(map[string]any{
 					"jsonrpc": jsonrpcVersion, "id": nil,
 					"error": map[string]any{"code": -32700, "message": "the request is not valid JSON"},
@@ -373,21 +397,22 @@ func (m *Manager) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) e
 				continue
 			}
 			wg.Add(1)
-			go func(req request) {
+			// Registered before the next frame is read, so that a cancellation
+			// right behind the request finds it.
+			within, done := inFlight.start(ctx, fmt.Sprint(req.ID))
+			go func(req request, within context.Context) {
 				defer wg.Done()
-				answer := map[string]any{"jsonrpc": jsonrpcVersion, "id": req.ID}
-				id := fmt.Sprint(req.ID)
-				within, done := inFlight.start(ctx, id)
 				defer done()
+				answer := map[string]any{"jsonrpc": jsonrpcVersion, "id": req.ID}
 				if want, rerr, ok := m.listens(&req, mirrored{}); ok {
 					if rerr != nil {
 						answer["error"] = map[string]any{"code": rerr.Code, "message": rerr.Message}
 						send(answer)
 						return
 					}
-					m.stream(within, id, want, send)
+					m.stream(within, req.ID, want, send)
 					if ctx.Err() == nil {
-						answer["result"] = closed(id)
+						answer["result"] = closed(req.ID)
 						send(answer)
 					}
 					return
@@ -414,7 +439,7 @@ func (m *Manager) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) e
 					answer["result"] = result
 				}
 				send(answer)
-			}(req)
+			}(req, within)
 		}
 	}
 }
@@ -460,7 +485,7 @@ func cancelledID(params json.RawMessage) string {
 		return ""
 	}
 	var id any
-	if json.Unmarshal(body.RequestID, &id) != nil {
+	if readExact(body.RequestID, &id) != nil {
 		return ""
 	}
 	return fmt.Sprint(id)

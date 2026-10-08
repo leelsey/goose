@@ -31,7 +31,13 @@ type httpTransport struct {
 
 	mu      sync.Mutex
 	session string
+	// lost says the server no longer holds the session. Nothing more is sent
+	// on this transport: sent without the session, a request is refused for
+	// lacking one, which is not an answer that says to greet the server again.
+	lost bool
 }
+
+var errSessionLost = errors.New("the server no longer holds the session")
 
 func newHTTPTransport(cfg ServerConfig, client *http.Client, frame int) (*httpTransport, error) {
 	if cfg.URL == "" {
@@ -60,6 +66,12 @@ func (e *refusal) Error() string {
 }
 
 func (t *httpTransport) post(ctx context.Context, out Outbound) (*http.Response, error) {
+	t.mu.Lock()
+	session, lost := t.session, t.lost
+	t.mu.Unlock()
+	if lost {
+		return nil, gone(errSessionLost)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(out.Payload))
 	if err != nil {
 		return nil, err
@@ -69,9 +81,6 @@ func (t *httpTransport) post(ctx context.Context, out Outbound) (*http.Response,
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
-	t.mu.Lock()
-	session := t.session
-	t.mu.Unlock()
 	if session != "" {
 		req.Header.Set("Mcp-Session-Id", session)
 	}
@@ -97,6 +106,18 @@ func (t *httpTransport) post(ctx context.Context, out Outbound) (*http.Response,
 		t.mu.Lock()
 		t.session = id
 		t.mu.Unlock()
+	}
+	if resp.StatusCode == http.StatusNotFound && session != "" {
+		// A server answers this to a session it no longer holds, having
+		// restarted or let it lapse, and acts on nothing sent under it.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
+		resp.Body.Close()
+		t.mu.Lock()
+		if t.session == session {
+			t.lost = true
+		}
+		t.mu.Unlock()
+		return nil, gone(errSessionLost)
 	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
@@ -152,10 +173,10 @@ func (t *httpTransport) Notify(ctx context.Context, out Outbound) error {
 
 func (t *httpTransport) Close() error {
 	t.mu.Lock()
-	session := t.session
+	session, lost := t.session, t.lost
 	t.session = ""
 	t.mu.Unlock()
-	if session == "" {
+	if session == "" || lost {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -232,14 +253,16 @@ type sseTransport struct {
 	headers   map[string]string
 	frame     int
 
-	mu      sync.Mutex
+	turn    turn
 	postURL string
 	body    io.ReadCloser
+	stop    context.CancelFunc
 	scanner *wirecore.Scanner
 
-	frames chan []byte
-	done   chan struct{}
-	once   sync.Once
+	frames   chan []byte
+	done     chan struct{}
+	once     sync.Once
+	closeErr error
 
 	errMu sync.Mutex
 	err   error
@@ -259,7 +282,35 @@ func startSSE(ctx context.Context, cfg ServerConfig, client *http.Client, frame 
 	if frame <= 0 {
 		frame = defaultHTTPFrame
 	}
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodGet, cfg.URL, nil)
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	// The stream outlives whoever opened it, so it is not bound to their
+	// context. Opening it is: a server that takes the connection and never
+	// names an endpoint would otherwise hold them for ever.
+	stream, stop := context.WithCancel(context.WithoutCancel(ctx))
+	opening, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	watch := context.AfterFunc(opening, stop)
+	t, err := openSSE(stream, cfg, client, frame)
+	if !watch() {
+		if t != nil {
+			t.body.Close()
+		}
+		err = fmt.Errorf("mcp: the stream named no endpoint in time: %w", opening.Err())
+	}
+	if err != nil {
+		stop()
+		return nil, err
+	}
+	t.stop = stop
+	go t.read()
+	return t, nil
+}
+
+func openSSE(ctx context.Context, cfg ServerConfig, client *http.Client, frame int) (*sseTransport, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.URL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -290,29 +341,36 @@ func startSSE(ctx context.Context, cfg ServerConfig, client *http.Client, frame 
 	}
 	t := &sseTransport{
 		streamURL: streamURL, client: client, headers: cfg.Headers, frame: frame,
-		body: resp.Body, scanner: wirecore.NewScanner(resp.Body, frame, frame),
+		turn: make(turn, 1), body: resp.Body, scanner: wirecore.NewScanner(resp.Body, frame, frame),
+		frames: make(chan []byte), done: make(chan struct{}),
 	}
 	// The endpoint event must be read before anything can be sent.
 	if err := t.readEndpoint(); err != nil {
 		resp.Body.Close()
 		return nil, err
 	}
-	t.frames = make(chan []byte)
-	t.done = make(chan struct{})
-	go t.read()
 	return t, nil
 }
 
 func (t *sseTransport) read() {
 	defer close(t.frames)
+	// A stream that has ended carries nothing more, and the next call opens a
+	// fresh one. What ended it is kept for the call that was waiting on it.
+	defer t.end()
 	for t.scanner.Scan() {
 		data := bytes.TrimSpace(t.scanner.Event().Data)
 		if len(data) == 0 {
 			continue
 		}
 		frame := append([]byte(nil), data...)
+		// A frame is for the call that holds the turn. One that arrives while
+		// no call holds it, a late answer or a log line, is for nobody, and
+		// holding it for the next call would stop the stream being read: its
+		// end, which is what says to open a fresh one, would go unseen.
 		select {
 		case t.frames <- frame:
+		case t.turn <- struct{}{}:
+			t.turn.give()
 		case <-t.done:
 			return
 		}
@@ -407,8 +465,10 @@ func withPort(u *url.URL) string {
 }
 
 func (t *sseTransport) Call(ctx context.Context, out Outbound) (*response, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if err := t.turn.take(ctx); err != nil {
+		return nil, err
+	}
+	defer t.turn.give()
 	if err := t.send(ctx, out.Payload); err != nil {
 		return nil, err
 	}
@@ -439,12 +499,19 @@ func (t *sseTransport) Call(ctx context.Context, out Outbound) (*response, error
 }
 
 func (t *sseTransport) Notify(ctx context.Context, out Outbound) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if err := t.turn.take(ctx); err != nil {
+		return err
+	}
+	defer t.turn.give()
 	return t.send(ctx, out.Payload)
 }
 
 func (t *sseTransport) send(ctx context.Context, payload []byte) error {
+	select {
+	case <-t.done:
+		return gone(t.readErr())
+	default:
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.postURL, bytes.NewReader(payload))
 	if err != nil {
 		return err
@@ -460,18 +527,32 @@ func (t *sseTransport) send(ctx context.Context, payload []byte) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		refused := fmt.Errorf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		if resp.StatusCode == http.StatusNotFound {
+			// The server no longer knows the endpoint its stream named, having
+			// restarted or dropped the session, and acts on nothing sent to it.
+			// It can say so before the end of the stream has been read, and a
+			// stream that stays open would have every later call sent here too.
+			t.setErr(refused)
+			t.end()
+			return gone(refused)
+		}
+		return refused
 	}
 	return nil
 }
 
-func (t *sseTransport) Close() error {
+func (t *sseTransport) end() {
 	t.once.Do(func() {
-		if t.done != nil {
-			close(t.done)
-		}
+		close(t.done)
+		t.stop()
+		t.closeErr = t.body.Close()
 	})
-	return t.body.Close()
+}
+
+func (t *sseTransport) Close() error {
+	t.end()
+	return t.closeErr
 }
 
 func serverError(body []byte) string {

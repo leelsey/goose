@@ -15,13 +15,19 @@ import (
 
 const defaultStdioFrame = 16 << 20
 
+var errNotReading = errors.New("the server stopped reading its input")
+
 type stdioTransport struct {
-	mu   sync.Mutex
+	turn turn
 	proc *spawn.Process
 
 	frames chan []byte
-	done   chan struct{}
-	once   sync.Once
+	// done says the transport can carry nothing more, and closed that the
+	// child behind it has been shut down.
+	done     chan struct{}
+	once     sync.Once
+	closed   chan struct{}
+	closeErr error
 
 	errMu sync.Mutex
 	err   error
@@ -38,9 +44,11 @@ func startStdio(ctx context.Context, cfg ServerConfig, maxFrame int) (*stdioTran
 		return nil, err
 	}
 	t := &stdioTransport{
+		turn:   make(turn, 1),
 		proc:   proc,
 		frames: make(chan []byte),
 		done:   make(chan struct{}),
+		closed: make(chan struct{}),
 	}
 	go t.read(wirecore.NewLines(proc.Stdout(), maxFrame))
 	return t, nil
@@ -48,6 +56,10 @@ func startStdio(ctx context.Context, cfg ServerConfig, maxFrame int) (*stdioTran
 
 func (t *stdioTransport) read(lines *wirecore.Lines) {
 	defer close(t.frames)
+	// Once nothing reads the child's output it is shut down rather than left
+	// to fill a pipe nobody empties, and the next call dials a fresh one. What
+	// stopped the reading is kept for the call that was waiting on it.
+	defer t.end()
 	for lines.Scan() {
 		frame := append([]byte(nil), lines.Bytes()...)
 		select {
@@ -74,9 +86,11 @@ func (t *stdioTransport) readErr() error {
 }
 
 func (t *stdioTransport) Call(ctx context.Context, out Outbound) (*response, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if err := t.write(out.Payload); err != nil {
+	if err := t.turn.take(ctx); err != nil {
+		return nil, err
+	}
+	defer t.turn.give()
+	if err := t.write(ctx, out.Payload); err != nil {
 		return nil, err
 	}
 	id := out.ID
@@ -109,19 +123,66 @@ func (t *stdioTransport) Call(ctx context.Context, out Outbound) (*response, err
 }
 
 func (t *stdioTransport) Notify(ctx context.Context, out Outbound) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.write(out.Payload)
-}
-
-func (t *stdioTransport) write(payload []byte) error {
-	if _, err := t.proc.Write(append(payload, '\n')); err != nil {
+	if err := t.turn.take(ctx); err != nil {
 		return err
 	}
-	return nil
+	defer t.turn.give()
+	return t.write(ctx, out.Payload)
+}
+
+func (t *stdioTransport) write(ctx context.Context, payload []byte) error {
+	select {
+	case <-t.done:
+		return gone(t.readErr())
+	default:
+	}
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := t.proc.Write(append(payload, '\n'))
+		wrote <- err
+	}()
+	select {
+	case err := <-wrote:
+		return t.wrote(err)
+	case <-ctx.Done():
+	}
+	select {
+	case err := <-wrote:
+		return t.wrote(err)
+	default:
+	}
+	// A child that has stopped reading holds the write for as long as it
+	// likes, and part of the frame may already be in the pipe, where whatever
+	// is written next would be read as the rest of it. It is treated as gone:
+	// shutting it down releases the write, and the next call dials afresh.
+	t.setErr(errNotReading)
+	t.end()
+	return ctx.Err()
+}
+
+func (t *stdioTransport) wrote(err error) error {
+	if err == nil {
+		return nil
+	}
+	// A child that has closed its input has exited or is about to, and what
+	// was written to it was never read.
+	t.setErr(err)
+	t.end()
+	return gone(err)
+}
+
+func (t *stdioTransport) end() {
+	t.once.Do(func() {
+		close(t.done)
+		go func() {
+			t.closeErr = t.proc.Close()
+			close(t.closed)
+		}()
+	})
 }
 
 func (t *stdioTransport) Close() error {
-	t.once.Do(func() { close(t.done) })
-	return t.proc.Close()
+	t.end()
+	<-t.closed
+	return t.closeErr
 }

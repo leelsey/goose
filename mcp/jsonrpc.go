@@ -5,8 +5,11 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"sync/atomic"
 )
@@ -86,6 +89,21 @@ func idText(raw json.RawMessage) string {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+// readExact decodes what a client sent with its numbers kept as they were
+// written. An id or a token read as a float comes back rounded past 2^53, and
+// the client matches what it gets back against what it sent.
+func readExact(raw []byte, into any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(into); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("invalid character after top-level value")
+	}
+	return nil
 }
 
 func newRequest(id string, method string, params any) ([]byte, error) {

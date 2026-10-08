@@ -5,7 +5,6 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
@@ -29,12 +28,12 @@ func (f filter) agreed() map[string]any {
 }
 
 type subscriber struct {
-	id     string
+	id     any
 	want   filter
 	frames chan map[string]any
 }
 
-func (m *Manager) subscribe(id string, want filter) *subscriber {
+func (m *Manager) subscribe(id any, want filter) *subscriber {
 	s := &subscriber{id: id, want: want, frames: make(chan map[string]any, 8)}
 	m.subs.Lock()
 	if m.streams == nil {
@@ -64,7 +63,7 @@ func (m *Manager) announceTools() {
 		frame := map[string]any{
 			"jsonrpc": jsonrpcVersion,
 			"method":  "notifications/tools/list_changed",
-			"params":  map[string]any{"_meta": map[string]any{metaSubscription: idValue(s.id)}},
+			"params":  map[string]any{"_meta": map[string]any{metaSubscription: s.id}},
 		}
 		select {
 		case s.frames <- frame:
@@ -73,39 +72,30 @@ func (m *Manager) announceTools() {
 	}
 }
 
-func acknowledged(id string, want filter) map[string]any {
+// A subscription is named by the id of the request that opened it, spelled as
+// the client spelled it.
+func acknowledged(id any, want filter) map[string]any {
 	return map[string]any{
 		"jsonrpc": jsonrpcVersion,
 		"method":  "notifications/subscriptions/acknowledged",
 		"params": map[string]any{
-			"_meta":         map[string]any{metaSubscription: idValue(id)},
+			"_meta":         map[string]any{metaSubscription: id},
 			"notifications": want.agreed(),
 		},
 	}
 }
 
-func closed(id string) map[string]any {
+func closed(id any) map[string]any {
 	return map[string]any{
 		"resultType": "complete",
 		"_meta": map[string]any{
-			metaSubscription: idValue(id),
+			metaSubscription: id,
 			metaServerInfo:   implementation(),
 		},
 	}
 }
 
-func idValue(id string) any {
-	var out any
-	if json.Unmarshal([]byte(id), &out) == nil {
-		switch out.(type) {
-		case float64, string:
-			return out
-		}
-	}
-	return id
-}
-
-func (m *Manager) stream(ctx context.Context, id string, want filter, send func(map[string]any)) {
+func (m *Manager) stream(ctx context.Context, id any, want filter, send func(map[string]any)) {
 	s := m.subscribe(id, want)
 	defer m.unsubscribe(s)
 	send(acknowledged(id, want))

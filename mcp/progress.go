@@ -92,11 +92,11 @@ func requestToken(params json.RawMessage) any {
 		return nil
 	}
 	var token any
-	if json.Unmarshal(envelope.Meta.Token, &token) != nil {
+	if readExact(envelope.Meta.Token, &token) != nil {
 		return nil
 	}
 	switch token.(type) {
-	case string, float64:
+	case string, json.Number:
 		return token
 	default:
 		return nil
