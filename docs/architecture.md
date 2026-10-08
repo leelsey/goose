@@ -39,9 +39,17 @@ None of these are fixed by care. They are fixed by making the lossy shape unrepr
 - **A drop is a value.** Every seam returns `[]Diagnostic` with a stable code. The site that emits one
   chooses its severity, because only it knows whether output was destroyed or a field merely re-spelled;
   a loss marked fatal there fails the call under any policy. `LossPolicy` then raises or lowers by code,
-  and `Strict` promotes every content loss to fatal — which is how a caller asks goose to refuse to be
-  lossy at all. Policy is keyed by code, so modelling a new loss later cannot change what an existing
-  caller already accepts.
+  and `Strict` promotes every content loss to fatal, whatever severity its site chose — which is how a
+  caller asks goose to refuse to be lossy at all. The one note it leaves alone is the round-trip tier:
+  a `drop.unknown_block` at info says a block was carried through whole, and a site that could not
+  keep one reports it at loss. Whether the destination can write such a block out is a separate
+  question, answered by `Renders.Raw`: `Renders.Unrendered` reports a carried block the destination
+  has no shape for as a loss, as it does reasoning, an image or a tool call the destination declares
+  no field for, and `Strict` refuses it. A stream answers to the same policy, for the same
+  destination, through `Stream.Enforce`, which weighs those parts before any of the frame carrying
+  them is delivered, and an encoder holds to it what it drops in writing the stream out through
+  `Stream.Check`. Policy is keyed by code, so modelling a new loss later cannot change what an
+  existing caller already accepts.
 - **Failure carries its evidence.** `Complete` may return a non-nil `*Response` beside a non-nil error,
   and a failed `*Stream` still answers `Usage()`, `Err()` and whatever frames it delivered. The upstream
   has already been paid; a cancelled call is recorded, not forgotten.
@@ -55,7 +63,11 @@ No `*http.Request`, no `http.ResponseWriter`, no server type crosses it, so a fo
 from a byte slice and an embedder can decode a request it never received over a socket. The query
 string is part of the input because Gemini selects its transport with `?alt=sse` and carries a
 credential in `?key=`. Every codec method also returns `[]Diagnostic`, including `Decode`: a request
-whose translation lost something must say so before the call is made, not after it is billed.
+whose translation lost something must say so before the call is made, not after it is billed. What
+`Decode` loses reaches the call through `goose.WithDiagnostics` and is held to the policy before any
+link is tried. What `EncodeResponse` loses is held to `Response.Policy` before the answer is written.
+What `EncodeStream` drops it holds to the stream's policy through `Stream.Check` as it goes, and a
+codec written outside goose must call `Stream.Check` too if it is to be held to the policy.
 
 ### B. Streams pull, and commit exactly once
 
@@ -68,21 +80,28 @@ goroutine and no channel; a `break` is honoured and the accounting survives it.
 created time on its opening event, and because a session id has to reach a response header that is
 written before any frame.
 
-The commit point is structural: the router pulls and holds the first frame before it returns the
-stream. Failing over is possible while nothing has been written and impossible afterwards, because
-after that a `*Stream` exists and there is no API that re-routes one.
+The commit point is structural: the router holds what arrives before the first frame of content — a
+backend's opening, its counts — and that frame, before it returns the stream, so the commit point is
+the first content delivered. A failure before it, in-band or not, is one before anything was written.
+Failing over is possible while nothing has been written and impossible afterwards, because after
+that a `*Stream` exists and there is no API that re-routes one.
 
 ### C. Providers declare capabilities; nothing switches on a name
 
 `Provider` is `ID`, `Capabilities`, `Complete`, `Stream`. Everything else is an optional interface:
 `Closer` (a CLI provider owns child process groups and 0600 temp files and must be able to reap them),
 `Binder` (receives the injected environment), `Passer` (opaque passthrough), `Gated` (per-provider
-concurrency), `Lister` (model enumeration).
+concurrency), `Precheck` (what a request will lose, or that it will not be sent, found before the
+gate), `Lister` (model enumeration).
 
 `Capabilities` replaces hardcoded name-string switches: whether streamed usage exists, which
 output-ceiling field the backend accepts, how many cache breakpoints it will carry, whether it tolerates
-extension fields, whether it honours a session id, whether it can take a system prompt at all. A
-capability is consulted; a name never is.
+extension fields, which vendor family's signatures it verifies, whether it honours a session id,
+whether it can take a system prompt at all. A capability is consulted; a name never is. A signature
+records the family that minted it — Claude wherever it runs, OpenAI with Azure OpenAI, Gemini
+wherever it runs — so one bound for a backend of another family is stripped before the call rather
+than refused by it, and a client's wire, which has no field for who minted a signature, is handed a
+foreign one marked with its family.
 
 ### D. Routes are data, with one function escape hatch
 
@@ -98,12 +117,27 @@ separator is taken as asking about the whole name, so `gpt-4.1` still matches on
 Stickiness matters because a session id is provider-bound: a `previous_response_id` minted by one
 provider is meaningless to another, so a request carrying one pins to the provider that issued it.
 
+A chain is walked in the operator's order, with one exception: a request that offers the model tools,
+and does not forbid it to call one, goes first to the links whose capabilities carry every one of
+them, and a link that would have to strip some is reached only once those have failed, been skipped
+or been refused. An answer without the tools answers a different question. Each attempt keeps its
+link's place in the route, so the ledger's rows follow the order tried and still say where each link
+stood. The breaker a chain consults is shared by every caller, so it counts only what a backend did:
+a failure the caller brought with it — a malformed or oversized request, a model the caller named
+that the backend does not have, a refused key the backend was handed on the caller's behalf — gives
+the probe slot back without counting. An attempt's deadline is fixed before it waits for a slot at a
+gated backend, so the wait and the send share one budget, and a send that runs out of what the wait
+left it is not held against the backend. A stream is judged when it ends rather than when it is
+handed over, since a backend can fail after its first content as surely as before it, and a probe
+that streams holds the probe slot until then. When every link fails, the caller is given the
+failure that reached a backend over a refusal made before anything was sent.
+
 ### E. Usage is one carrier, three combinators
 
-`llm.Usage` carries counts, cache read/write with the five-minute split, reasoning, cost, service tier,
-speed, turn count, duration, the `Reported` flag and any anomalies — and every field serialises. Marking
-half of them `json:"-"` is a trap: any hop that re-encodes usage then loses the price and turns
-"measured" into "unmeasured".
+`llm.Usage` carries counts, cache read/write with the five-minute and one-hour split where the backend
+measured one, reasoning, cost, service tier, speed, turn count, duration, the `Reported` flag and any
+anomalies — and every field serialises. Marking half of them `json:"-"` is a trap: any hop that
+re-encodes usage then loses the price and turns "measured" into "unmeasured".
 
 The convention is fixed and every adapter normalises into it: **`Prompt` includes both cache figures;
 `Completion` includes `Reasoning`.** Vendors disagree — Anthropic and Bedrock report cache beside the
@@ -134,6 +168,9 @@ third-party provider that mutates what it is handed cannot poison the next attem
 attempt is a different copy. This closes off a common structural defect: an adapter that writes
 `req.Model = provider.model` directly onto the shared request makes a fallback chain silently wrong.
 
+An adapter notes what building its request loses through `Attempt.Note` and calls `Attempt.Check`
+before it sends, so a loss the policy refuses costs nothing and the chain walks on.
+
 ### G. One core package, thin layers around it
 
 ```
@@ -150,7 +187,8 @@ goose/mcp        tool servers: stdio, SSE, streamable HTTP, both protocol eras;
                  the protocol served back over HTTP and over a pipe, with
                  goose's own tools on it
 goose/httpx      the proxy: mux, SSE/NDJSON writer, auth, rate limiting, the
-                 concurrency gate, CORS, health, models, metrics, passthrough
+                 concurrency gate, CORS and the browser origin and host checks,
+                 health, models, metrics, passthrough
 goose/internal/httpcore  the retry loop, the client whose timeout does not kill a stream
 goose/internal/* scanners, frame folding, subprocess lifetime, cloud auth, the AWS
                  event stream, globs
@@ -166,9 +204,13 @@ panel's observability proposal acquired an import cycle. The graph above is acyc
 - **Reject** — the request cannot be expressed at all: a typed `*llm.Error` before any spend.
 - **Report** — the translation proceeds and something is lost: a `Diagnostic` on the returned value and
   on the ledger row, at the severity the emitting site chose. `LossPolicy{Strict: true}` turns every
-  content loss into a refusal instead.
+  content loss into a refusal instead, on a stream as on an unstreamed answer, and one known before
+  the request is sent, whether once it is planned, while the proxy decodes it, or while the adapter
+  builds it, is refused before it is sent, and the chain walks on.
 - **Round-trip** — goose does not understand it but does not need to: `Raw` parts and `Extra` fields
-  carry it through untouched.
+  carry it through untouched. Nothing was lost in carrying it, so `Strict` does not refuse it where the
+  destination can write it out. A destination that cannot, as its `Renders.Raw` says, loses it, and
+  `Strict` refuses that.
 
 Nothing is logged from library code. The injected `*slog.Logger` is optional and additive; it is never
 the only place a fact appears.
