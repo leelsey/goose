@@ -158,3 +158,22 @@ func TestAnApprovalPolicyIsNotHalfApplied(t *testing.T) {
 		t.Fatalf("%+v: an empty exemption list exempts nothing", server)
 	}
 }
+
+// A tool_choice naming a hosted MCP server is this backend's own shape, not a
+// provider-specific tool goose must refuse: it travels as written, exactly
+// as an unmodelled tool_choice of any other kind does. Regression test for
+// r3-wire-5.
+func TestAToolChoiceNamingAnMCPServerIsCarriedNotRefused(t *testing.T) {
+	r, _ := decode(t, `{"model":"gpt-5","input":"hi","tools":[
+		{"type":"mcp","server_label":"dice","server_url":"https://tools.test/mcp"}],
+		"tool_choice":{"type":"mcp","server_label":"dice"}}`)
+	if r.ToolChoice != nil {
+		t.Fatalf("choice = %+v: an mcp choice is not a modelled function choice", r.ToolChoice)
+	}
+	if string(r.Extra["tool_choice"]) != `{"type":"mcp","server_label":"dice"}` {
+		t.Fatalf("carried = %s: it must reach the backend that can act on it", r.Extra["tool_choice"])
+	}
+	if r.ExtraFrom != Name {
+		t.Fatalf("extra from = %q", r.ExtraFrom)
+	}
+}

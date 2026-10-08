@@ -20,6 +20,7 @@ import (
 
 	"github.com/leelsey/goose"
 	"github.com/leelsey/goose/llm"
+	"github.com/leelsey/goose/provider/anthropic"
 	"github.com/leelsey/goose/provider/openai"
 	"github.com/leelsey/goose/route"
 	"github.com/leelsey/goose/usage"
@@ -223,6 +224,22 @@ func TestWildcardCORSNeedsAKey(t *testing.T) {
 	_, err = New(c, Options{Codecs: []wire.Codec{openaichat.New(openaichat.Options{})}, CORS: true, CORSOrigin: "*"})
 	if err == nil {
 		t.Fatal("an open proxy with a wildcard origin lets any page spend the operator's credit")
+	}
+}
+
+// A browser sends the origin "null" for a sandboxed frame on any site, so
+// naming it admits every page as the wildcard does.
+func TestANullCORSOriginNeedsAKey(t *testing.T) {
+	c, err := goose.New(goose.WithProvider(&stub{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	codecs := []wire.Codec{openaichat.New(openaichat.Options{})}
+	if _, err := New(c, Options{Codecs: codecs, CORS: true, CORSOrigin: "null"}); err == nil {
+		t.Fatal("an open proxy that serves the origin \"null\" serves any site that frames a sandbox")
+	}
+	if _, err := New(c, Options{Codecs: codecs, CORS: true, CORSOrigin: "null", APIKey: "secret"}); err != nil {
+		t.Fatalf("behind a key: %v", err)
 	}
 }
 
@@ -615,17 +632,20 @@ func (b *blocking) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 func TestRateLimitMetersOneCallerAtATime(t *testing.T) {
 	now := time.Now()
 	l := newLimiter(2, func() time.Time { return now })
-	if !l.allow("a") || !l.allow("a") {
-		t.Fatal("the allowance is spendable")
+	allow := func(key string) bool { ok, _ := l.allow(key); return ok }
+	for range 2 {
+		if !allow("a") {
+			t.Fatal("the allowance is spendable")
+		}
 	}
-	if l.allow("a") {
+	if allow("a") {
 		t.Fatal("past the allowance the caller waits")
 	}
-	if !l.allow("b") {
+	if !allow("b") {
 		t.Fatal("one caller's spending is not another's")
 	}
 	now = now.Add(30 * time.Second)
-	if !l.allow("a") {
+	if !allow("a") {
 		t.Fatal("half a minute is half the allowance back")
 	}
 }
@@ -901,20 +921,10 @@ func TestMeteringReadsAForwardedAddressOnlyWhenNamed(t *testing.T) {
 			if c.value != "" {
 				r.Header.Set(cmp.Or(c.header, "X-Forwarded-For"), c.value)
 			}
-			if got := caller(r, c.header); got != c.want {
-				t.Fatalf("caller = %q, want %q", got, c.want)
+			if got := addr(r, c.header); got != c.want {
+				t.Fatalf("addr = %q, want %q", got, c.want)
 			}
 		})
-	}
-}
-
-func TestMeteringPrefersTheCredential(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	r.RemoteAddr = "192.0.2.1:1234"
-	r.Header.Set("Authorization", "Bearer tenant-key")
-	r.Header.Set("X-Forwarded-For", "203.0.113.7")
-	if got := caller(r, "X-Forwarded-For"); got != "key:tenant-key" {
-		t.Fatalf("caller = %q", got)
 	}
 }
 
@@ -1357,6 +1367,145 @@ func TestAThrottledRequestIsStillLogged(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "status=429") {
 		t.Fatalf("log = %q: a refusal the proxy made itself is one an operator needs to see", buf.String())
+	}
+}
+
+func TestPassthroughRejectsAnEncodedPathThatClimbsOutOfBaseURL(t *testing.T) {
+	calls := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	p, err := anthropic.New(anthropic.Options{BaseURL: backend.URL + "/tenant-a", APIKey: "operator-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := goose.New(goose.WithProvider(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(c, Options{
+		Codecs:      []wire.Codec{openaichat.New(openaichat.Options{})},
+		Passthrough: "anthropic",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	for _, path := range []string{
+		"/v1/..%2F..%2Ftenant-b%2Fadmin",
+		"/v1/%2E%2E/%2E%2E/tenant-b/admin",
+	} {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("path %q: status = %d, want 400", path, resp.StatusCode)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("the backend was reached %d times: an encoded \"..\" must never leave the proxy on the operator's key", calls)
+	}
+}
+
+func TestPassthroughDoesNotSmuggleAQueryPastAnEncodedQuestionMark(t *testing.T) {
+	var gotPath, gotRawQuery string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotRawQuery = r.URL.Path, r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	p, err := anthropic.New(anthropic.Options{BaseURL: backend.URL, APIKey: "operator-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := goose.New(goose.WithProvider(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(c, Options{
+		Codecs:      []wire.Codec{openaichat.New(openaichat.Options{})},
+		Passthrough: "anthropic",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/models%3Fkey=AIzaCALLER", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if gotRawQuery != "" {
+		t.Fatalf("upstream query = %q: an encoded \"?\" in the path must not open a second query string", gotRawQuery)
+	}
+	if !strings.Contains(gotPath, "key=AIzaCALLER") {
+		t.Fatalf("upstream path = %q: the caller's text must still reach the backend, just not as a query", gotPath)
+	}
+}
+
+func TestPassthroughDoesNotDuplicateTheUpstreamsOwnAllowOrigin(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	p, err := anthropic.New(anthropic.Options{BaseURL: backend.URL, APIKey: "operator-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := goose.New(goose.WithProvider(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(c, Options{
+		Codecs:      []wire.Codec{openaichat.New(openaichat.Options{})},
+		Passthrough: "anthropic",
+		CORS:        true,
+		CORSOrigin:  "http://localhost:5173",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/anything", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Origin", "http://localhost:5173")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	got := resp.Header.Values("Access-Control-Allow-Origin")
+	if len(got) != 1 || got[0] != "http://localhost:5173" {
+		t.Fatalf("Access-Control-Allow-Origin = %v, want exactly one value", got)
 	}
 }
 

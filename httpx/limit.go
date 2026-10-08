@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/leelsey/goose/internal/httpcore"
 	"github.com/leelsey/goose/llm"
 )
 
@@ -74,7 +75,9 @@ const (
 	provenBucket = "proven"
 )
 
-func (l *limiter) allow(key string) bool {
+// allow spends one of the caller's allowance, or says how long it is until
+// there is one to spend.
+func (l *limiter) allow(key string) (bool, time.Duration) {
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,10 +85,7 @@ func (l *limiter) allow(key string) bool {
 
 	b, ok := l.callers[key]
 	if !ok && len(l.callers) >= maxBuckets && !reserved(key) {
-		// The overflow bucket is per class, so a flood that fills the table
-		// cannot spend an allowance belonging to callers on the other side of
-		// the key check.
-		key = "overflow:" + bucketClass(key)
+		key = "overflow"
 		b, ok = l.callers[key]
 	}
 	if !ok {
@@ -98,22 +98,16 @@ func (l *limiter) allow(key string) bool {
 	}
 	b.seen = now
 	if b.tokens < 1 {
-		return false
+		return false, time.Duration((1 - b.tokens) * float64(time.Minute) / l.perMinute)
 	}
 	b.tokens--
-	return true
+	return true, 0
 }
 
 // A key the proxy chooses rather than reads is never crowded out: there is one
-// of it, so it cannot be what fills the table.
+// of it, so it cannot be what fills the table, and a flood that does fill it
+// cannot spend the allowance of the callers who proved the key.
 func reserved(key string) bool { return key == provenBucket }
-
-func bucketClass(key string) string {
-	if strings.HasPrefix(key, "key:") {
-		return "key"
-	}
-	return "addr"
-}
 
 func (l *limiter) sweep(now time.Time) {
 	if now.Sub(l.swept) < time.Minute {
@@ -127,16 +121,11 @@ func (l *limiter) sweep(now time.Time) {
 	}
 }
 
-func caller(r *http.Request, forwarded string) string {
-	if key := presented(r); key != "" {
-		return "key:" + key
-	}
-	return addr(r, forwarded)
-}
-
 func addr(r *http.Request, forwarded string) string {
 	if forwarded != "" {
-		if client := firstForwarded(r.Header.Get(forwarded)); client != "" {
+		// The lines of a header are one list, and a front proxy that appends
+		// may do so on a line of its own, below the one the caller wrote.
+		if client := firstForwarded(strings.Join(r.Header.Values(forwarded), ",")); client != "" {
 			return "addr:" + client
 		}
 	}
@@ -156,14 +145,16 @@ func addr(r *http.Request, forwarded string) string {
 // So the key is what was actually proven. Where the proxy has a key of its own,
 // everyone who holds it is one principal as far as this proxy can tell, and
 // they share one allowance; a deployment that gates tenants with a shared key
-// while they carry their own upstream keys shares it too. Where the proxy has
-// no key, nothing is proven and the credential a caller carries upstream is the
-// only thing telling two of them apart. An unproven caller gets neither, and
-// shares the bucket of the connection it arrived on.
+// while they carry their own upstream keys shares it too. An unproven caller
+// shares the bucket of the connection it arrived on. Where the proxy has no
+// key, nothing is proven: a credential is judged, if at all, by a backend after
+// the limiter has let it through, and never where the backend authenticates
+// with the operator's own, so one written afresh each request would be a fresh
+// allowance each request. Every caller is metered by where it came from.
 func (s *Server) bucket(r *http.Request) string {
 	switch {
 	case s.opts.APIKey == "":
-		return caller(r, s.opts.ForwardedHeader)
+		return addr(r, s.opts.ForwardedHeader)
 	case s.trusted(r):
 		return provenBucket
 	default:
@@ -200,14 +191,17 @@ func firstForwarded(value string) string {
 // the flooding it exists to shed is mostly unauthenticated.
 func (s *Server) rateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions || operational(r.URL.Path) {
+		if s.operational(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !s.rate.allow(s.bucket(r)) {
+		if ok, wait := s.rate.allow(s.bucket(r)); !ok {
 			s.opts.Metrics.throttle()
-			w.Header().Set("Retry-After", "1")
-			s.refuse(w, r, llm.Errorf(llm.KindRateLimit, "too many requests"))
+			e := llm.Errorf(llm.KindRateLimit, "too many requests")
+			// Rounded up: a client that honours a hint which comes back early
+			// is only refused again.
+			e.RetryAfter = (wait + time.Second - 1).Truncate(time.Second)
+			s.refuse(w, r, e)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -219,7 +213,7 @@ func (s *Server) rateLimit(next http.Handler) http.Handler {
 // credentials is not going to reach any.
 func (s *Server) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions || operational(r.URL.Path) {
+		if s.operational(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -229,15 +223,28 @@ func (s *Server) gate(next http.Handler) http.Handler {
 			s.refuse(w, r, llm.Errorf(llm.KindSaturated, "the proxy is at capacity"))
 			return
 		}
-		defer s.inflight.leave()
-		next.ServeHTTP(w, r)
+		// A handler whose answer goes on waiting after its work is done — a
+		// tool server's notification stream — gives the slot back early.
+		var once sync.Once
+		leave := func() { once.Do(s.inflight.leave) }
+		defer leave()
+		next.ServeHTTP(w, r.WithContext(httpcore.WithRelease(r.Context(), leave)))
 	})
 }
 
-func operational(path string) bool {
-	switch path {
-	case "/health", "/ready", "/metrics":
+// operational is a request for one of the endpoints an orchestrator or a
+// scraper polls. It is read off what the request is routed to rather than off
+// its path, because the passthrough takes every other method on those same
+// paths and sends it upstream.
+func (s *Server) operational(r *http.Request) bool {
+	switch s.served(r) {
+	case "GET /health", "GET /ready", "GET /metrics":
 		return true
 	}
 	return false
+}
+
+func (s *Server) served(r *http.Request) string {
+	_, pattern := s.mux.Handler(r)
+	return pattern
 }

@@ -5,6 +5,7 @@ package agentcli
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -64,8 +65,8 @@ func (p *Provider) prepare(a *llm.Attempt) (invocation, llm.Diagnostics, error) 
 		Session: a.Session,
 		Stream:  true,
 	}
-	if prompt == "" {
-		return in, diags, llm.Errorf(llm.KindInvalidRequest, "no prompt survived translation")
+	if err := refused(prompt, in.Model); err != nil {
+		return in, diags, err
 	}
 	diags = append(diags, llm.UnsentSampling(a.Request, p.ID())...)
 	if p.toolsUnrestricted() {
@@ -157,9 +158,43 @@ func systemFolded(id string) llm.Diagnostic {
 	}
 }
 
+// refused is a request this binary is never run for, whatever the policy: one
+// with nothing left to ask it, and one whose model could read as a flag. The
+// model can come from a request body, and it goes into the child's argument
+// list after --model, where whether a leading dash is read as the value or as
+// another flag is up to each binary's own parser.
+func refused(prompt, model string) error {
+	if prompt == "" {
+		return llm.Errorf(llm.KindInvalidRequest, "no prompt survived translation")
+	}
+	if strings.HasPrefix(model, "-") {
+		return llm.Errorf(llm.KindInvalidRequest, "a model name cannot begin with a dash")
+	}
+	return nil
+}
+
+// Precheck finds what flattening the request into a prompt will lose, and a
+// request the binary is never run for, ahead of the queue for a slot: either
+// costs the queue nothing found here first, where a call that waited for a
+// slot it could not use would come back as the wait running out. It does not
+// cover every loss prepare finds, such as one tied to the session or the
+// system prompt mode, since those need nothing this cheap.
+func (p *Provider) Precheck(a *llm.Attempt) (llm.Diagnostics, error) {
+	_, prompt, diags := flatten(a.Request, p.ID())
+	return diags, refused(prompt, p.model(a))
+}
+
 func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, error) {
 	in, diags, err := p.prepare(a)
+	// Noted before a refusal too, so the row it leaves says what the request
+	// lost on the way, such as the turn that left no prompt.
+	for _, d := range diags {
+		a.Note(d)
+	}
 	if err != nil {
+		return nil, err
+	}
+	if err := a.Check(); err != nil {
 		return nil, err
 	}
 	spec := kinds[p.opts.Kind]
@@ -173,14 +208,25 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 		}
 	}
 
-	runCtx, release := context.WithTimeout(ctx, p.opts.Timeout)
+	// Named, so a call this timeout ends is not read as the caller's deadline.
+	runCtx, release := context.WithTimeoutCause(ctx, p.opts.Timeout,
+		fmt.Errorf("%s: the agent binary ran past its timeout of %s: %w", p.ID(), p.opts.Timeout, context.DeadlineExceeded))
 
 	proc, err := spawn.Start(runCtx, spawn.Options{
 		Binary: p.opts.Binary, Args: args, Dir: p.opts.Dir, Env: p.opts.Env,
 		Stdin: []byte(in.Prompt), Grace: p.opts.Grace,
 	})
 	if err != nil {
+		// exec.Cmd.Start reports a context that ended before or during the
+		// spawn as that context's own error, not a fault of the binary or the
+		// machine, and it must be read as the timeout or cancellation it is.
+		// Read before release, which would end runCtx itself and make every
+		// failure here look like one.
+		done := runCtx.Err() != nil
 		release()
+		if done {
+			return nil, doneErr(p.ID(), runCtx)
+		}
 		return nil, &llm.Error{Kind: llm.KindTransport, Provider: p.ID(), Message: err.Error(), Err: err}
 	}
 	p.track(proc)
@@ -191,15 +237,15 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 		lines:   wirecore.NewLines(httpcore.Capped(proc.Stdout(), a.Limits.MaxResponseBytes, p.ID()), a.Limits.MaxFrameBytes),
 		release: release,
 	}
+	// The prepare diagnostics were already noted on a above (with the caller's
+	// loss policy applied), and the chain notes the same copy onto this stream
+	// once it holds it; noting them here too would deliver each one twice, the
+	// second time with no policy applied at all.
 	stream := llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: in.Model, Requested: a.Request.Model, Created: p.now()},
 		pr.next,
 		pr.close,
 	)
-	for _, d := range diags {
-		stream.Note(d)
-		a.Note(d)
-	}
 	return stream, nil
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/leelsey/goose"
 	"github.com/leelsey/goose/llm"
+	"github.com/leelsey/goose/provider/openai"
 	"github.com/leelsey/goose/usage"
 	"github.com/leelsey/goose/wire"
 	"github.com/leelsey/goose/wire/openaichat"
@@ -142,5 +143,32 @@ func TestRedactingTheReplyDoesNotRedactTheLedger(t *testing.T) {
 	last := rows[len(rows)-1]
 	if !strings.Contains(last.Err+last.Detail, "org-9f3a") {
 		t.Fatalf("the operator's own record says %q: the ledger has its own switch", last.Err)
+	}
+}
+
+// A passthrough failure is the proxy's to write, and a transport error's own
+// sentence names the upstream's address, path and query in full.
+func TestAPassthroughFailureIsRedactedToo(t *testing.T) {
+	gone := httptest.NewServer(http.NotFoundHandler())
+	base := gone.URL + "/internal/tenant-42"
+	gone.Close()
+	p, err := openai.New(openai.Options{ID: "up", BaseURL: base, APIKey: "operator-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server(t, p, Options{Passthrough: "up", RedactUpstream: true})
+	resp, err := srv.Client().Get(srv.URL + "/v1/files?purpose=x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	for _, leak := range []string{"tenant-42", strings.TrimPrefix(gone.URL, "http://"), "purpose=x"} {
+		if strings.Contains(string(body), leak) {
+			t.Fatalf("%q reached the client: %s", leak, body)
+		}
 	}
 }

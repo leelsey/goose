@@ -94,6 +94,10 @@ func Always() Matcher { return MatchFunc(func(*Call) bool { return true }) }
 type Target struct {
 	Provider string
 	Model    string
+	// FromCall says Model is the one the call asked for, passed on because
+	// neither the target nor its rule named one. A backend that has no such
+	// model is refusing the caller rather than failing.
+	FromCall bool
 }
 
 type Rule struct {
@@ -148,7 +152,7 @@ func (t *Table) Route(c *Call) (Decision, error) {
 				tgt.Model = r.Model
 			}
 			if tgt.Model == "" {
-				tgt.Model = c.Model
+				tgt.Model, tgt.FromCall = c.Model, true
 			}
 			chain = append(chain, tgt)
 		}

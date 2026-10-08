@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 )
 
@@ -326,6 +327,51 @@ func TestAMessageDeliveredWholeIsNotAnEmptyAnswer(t *testing.T) {
 		s.Close()
 		if got := text.String(); got != "hello there" {
 			t.Errorf("%s: text = %q, want the whole answer exactly once", name, got)
+		}
+	}
+}
+
+func TestAFunctionCallDeliveredWholeKeepsItsArguments(t *testing.T) {
+	const (
+		created   = `{"type":"response.created","response":{"id":"r","model":"m","status":"in_progress"}}`
+		added     = `{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"search","arguments":""}}`
+		done      = `{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"search","arguments":"{\"q\":\"goose\"}"}}`
+		completed = `{"type":"response.completed","response":{"id":"r","model":"m","status":"completed"}}`
+	)
+	for name, events := range map[string][]string{
+		"nothing streamed": {created, added, done, completed},
+		"half streamed": {created, added,
+			`{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"q\":"}`,
+			done, completed},
+		"all streamed": {created, added,
+			`{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"q\":\"goose\"}"}`,
+			done, completed},
+		"never announced": {created, done, completed},
+	} {
+		p, _, _ := serve(t, Options{Dialect: OpenAIDialect()}, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, ev := range events {
+				_, _ = w.Write([]byte("data: " + ev + "\n\n"))
+			}
+		})
+		a := attempt("m", &llm.Request{Model: "m", Messages: []llm.Message{
+			{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}},
+		}})
+		a.Format = "openai-responses"
+		s, err := p.Stream(context.Background(), a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := wirecore.Fold(s, wirecore.FoldOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tu := llm.ToolUses(resp.Choices[0].Message.Content)
+		if len(tu) != 1 || tu[0].ID != "call_1" || tu[0].Name != "search" || string(tu[0].Args) != `{"q":"goose"}` {
+			t.Errorf("%s: calls = %+v, want the whole call exactly once", name, tu)
+		}
+		if resp.Choices[0].Stop != llm.StopToolUse {
+			t.Errorf("%s: stop = %q", name, resp.Choices[0].Stop)
 		}
 	}
 }

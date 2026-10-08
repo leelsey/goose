@@ -91,6 +91,7 @@ func (b *parser) exception(msg awsstream.Message) *llm.Error {
 	if body.Message == "" {
 		body.Message = msg.Headers[":error-message"]
 	}
+	said := body.Message
 	if body.Message == "" {
 		body.Message = "the stream failed part-way"
 	}
@@ -110,7 +111,7 @@ func (b *parser) exception(msg awsstream.Message) *llm.Error {
 	}
 	return &llm.Error{
 		Kind: kind, Provider: b.provider, Sent: true, Retryable: retryable,
-		Code: code, Message: body.Message,
+		Code: code, Message: body.Message, Body: httpcore.ErrorBody([]byte(said)),
 	}
 }
 
@@ -188,7 +189,7 @@ func (b *parser) event(name string, payload []byte) (*llm.Frame, error) {
 				data := []byte(r.RedactedContent)
 				return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Redacted: data}}}, nil
 			}
-			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: r.Text, Signature: r.Signature}}}, nil
+			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: r.Text, Signature: r.Signature, Signer: llm.FamilyAnthropic}}}, nil
 		case m.Delta.Text != "":
 			return &llm.Frame{Delta: []llm.Part{&llm.Text{Text: m.Delta.Text}}}, nil
 		}
@@ -229,7 +230,7 @@ func (b *parser) event(name string, payload []byte) (*llm.Frame, error) {
 	default:
 		return &llm.Frame{Diagnostics: llm.Diagnostics{{
 			Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageResponse,
-			Severity: llm.SeverityInfo, Provider: b.provider, Field: name,
+			Severity: llm.SeverityLoss, Provider: b.provider, Field: name,
 			Detail: "stream event not modelled by this adapter",
 		}}}, nil
 	}

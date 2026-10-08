@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/wire"
 )
@@ -29,6 +30,37 @@ type item struct {
 	Result        string `json:"result,omitempty"`
 	OutputFormat  string `json:"output_format,omitempty"`
 	RevisedPrompt string `json:"revised_prompt,omitempty"`
+
+	EncryptedContent string `json:"encrypted_content,omitempty"`
+
+	// raw is an item this wire does not model, written as the backend wrote
+	// it: read into the fields above it would lose every one they do not name.
+	raw json.RawMessage
+}
+
+// rawItem is a backend's own item on this wire, carried whole.
+func rawItem(v *llm.Raw) (item, bool) {
+	if v.Vendor != Name {
+		return item{}, false
+	}
+	var it item
+	if json.Unmarshal(v.JSON, &it) != nil || it.Type == "" {
+		return item{}, false
+	}
+	it.raw = v.JSON
+	return it, true
+}
+
+// mintedReasoning starts the id goose gives a reasoning item the backend did
+// not name. Read back as the backend's, it would reach OpenAI as the name of an
+// item it never stored.
+const mintedReasoning = "rs_goose"
+
+// sameReasoning says whether a thinking part belongs to the reasoning item
+// already open. A signature closes its block, and a backend that names its
+// items says where one ends; merging two would keep only one signature.
+func sameReasoning(named, signature string, v *llm.Thinking) bool {
+	return signature == "" && (v.ID == "" || named == "" || v.ID == named)
 }
 
 func imageFormat(mime string) string {
@@ -81,6 +113,9 @@ func (c contentPart) MarshalJSON() ([]byte, error) {
 
 // MarshalJSON writes what this item's own type requires, for the same reason.
 func (i item) MarshalJSON() ([]byte, error) {
+	if i.raw != nil {
+		return i.raw, nil
+	}
 	type plain item
 	out := plain(i)
 	switch i.Type {
@@ -149,6 +184,8 @@ func (c *Codec) items(parts []llm.Part, idFor func(string) string) ([]item, llm.
 	var out []item
 	var msg *item
 	var reason *item
+	var named string
+	unsigned := 0
 
 	closeAll := func() {
 		if reason != nil {
@@ -162,6 +199,9 @@ func (c *Codec) items(parts []llm.Part, idFor func(string) string) ([]item, llm.
 	}
 
 	for _, p := range parts {
+		if sig, _ := wirecore.Signed(p); sig != "" && p.Kind() != llm.KindThinking {
+			unsigned++
+		}
 		switch v := p.(type) {
 		case *llm.Thinking:
 			if msg != nil {
@@ -171,13 +211,30 @@ func (c *Codec) items(parts []llm.Part, idFor func(string) string) ([]item, llm.
 				diags = append(diags, drop(llm.DropThinking, "redacted thinking has no item on this wire"))
 				continue
 			}
+			if reason != nil && !sameReasoning(named, reason.EncryptedContent, v) {
+				out = append(out, *reason)
+				reason = nil
+			}
 			if reason == nil {
-				reason = &item{Type: "reasoning", ID: idFor("rs"), Summary: []summaryPart{}}
+				named = v.ID
+				id := v.ID
+				if id == "" {
+					id = idFor(mintedReasoning)
+				}
+				reason = &item{Type: "reasoning", ID: id, Summary: []summaryPart{}}
 			}
 			if v.Text != "" {
 				reason.Summary = append(reason.Summary, summaryPart{Type: "summary_text", Text: v.Text})
 			}
+			if v.Signature != "" {
+				reason.EncryptedContent = wirecore.SealSignature(llm.FamilyOpenAI, v.Signer, v.Signature)
+			}
 		case *llm.Text:
+			// A part carrying nothing but a signature has nothing for a message
+			// to hold, and the stream leaves it out too.
+			if v.Text == "" {
+				continue
+			}
 			if reason != nil {
 				out = append(out, *reason)
 				reason = nil
@@ -212,19 +269,28 @@ func (c *Codec) items(parts []llm.Part, idFor func(string) string) ([]item, llm.
 		case *llm.ToolResult:
 			diags = append(diags, drop(llm.DropToolResult, "a tool result cannot ride on an assistant turn here"))
 		case *llm.Raw:
-			if v.Vendor == Name && json.Valid(v.JSON) {
-				var it item
-				if json.Unmarshal(v.JSON, &it) == nil && it.Type != "" {
-					closeAll()
-					out = append(out, it)
-					continue
-				}
+			if it, ok := rawItem(v); ok {
+				closeAll()
+				out = append(out, it)
+				continue
 			}
 			diags = append(diags, drop(llm.DropUnknownBlock, "content block "+v.Type+" has no shape on this wire"))
 		}
 	}
 	closeAll()
+	if unsigned > 0 {
+		diags = append(diags, unsignedParts(unsigned))
+	}
 	return out, diags
+}
+
+// unsignedParts says Gemini's signatures on calls, text or images did not
+// travel: this wire signs only a reasoning item, and the model's reasoning
+// before those parts is lost to the next turn.
+func unsignedParts(n int) llm.Diagnostic {
+	d := drop(llm.DropSignature, "this wire signs only a reasoning item, so the reasoning signed onto a call, a text or an image did not travel with it")
+	d.Count = n
+	return d
 }
 
 func (c *Codec) EncodeResponse(resp *llm.Response, opts wire.Options) (*wire.Outbound, llm.Diagnostics, error) {
@@ -262,7 +328,10 @@ func (c *Codec) EncodeResponse(resp *llm.Response, opts wire.Options) (*wire.Out
 			Detail: "this wire carries one candidate",
 		})
 	}
-	state, incomplete := status(stop, false)
+	state, incomplete, clean := status(stop, false, false)
+	if !clean {
+		diags = append(diags, unknownStop(stop))
+	}
 	if resp.Block != nil {
 		state, incomplete = "incomplete", "content_filter"
 	}

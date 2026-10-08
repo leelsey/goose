@@ -189,16 +189,27 @@ type LossPolicy struct {
 	Deny   []string
 }
 
+// Apply is the severity a diagnostic has under the policy. Strict promotes
+// every content loss, whatever severity its site chose, but not a block that
+// was carried through whole: nothing was lost in carrying it, and whether the
+// destination can write it out is weighed against what it renders, as
+// Renders.Unrendered says.
 func (p LossPolicy) Apply(d Diagnostic) Diagnostic {
 	switch {
 	case slices.Contains(p.Deny, d.Code):
 		d.Severity = SeverityFatal
 	case slices.Contains(p.Allow, d.Code):
 		d.Severity = SeverityInfo
-	case p.Strict && d.Class == ClassContent && d.Severity < SeverityFatal:
+	case p.Strict && d.Class == ClassContent && d.Severity < SeverityFatal && !d.carried():
 		d.Severity = SeverityFatal
 	}
 	return d
+}
+
+// carried says an unknown block was kept as Raw rather than dropped. Every site
+// that keeps one reports it at info, and one it could not keep at loss.
+func (d Diagnostic) carried() bool {
+	return d.Code == DropUnknownBlock && d.Severity == SeverityInfo
 }
 
 func (p LossPolicy) Check(ds []Diagnostic) error {

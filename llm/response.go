@@ -52,6 +52,9 @@ type Response struct {
 	Usage       Usage
 	Attempts    []Attempted
 	Diagnostics Diagnostics
+	// Policy is the loss policy the answer was held to, so that whoever
+	// translates it further holds what that loses to the same one.
+	Policy LossPolicy
 
 	Extra map[string]json.RawMessage
 }

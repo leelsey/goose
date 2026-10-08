@@ -47,11 +47,14 @@ type Reader struct {
 	done bool
 }
 
+// Both checksums in the framing are CRC-32 over the IEEE polynomial, the one
+// zlib uses. Castagnoli is the other CRC-32 in the standard library, and a
+// reader built on it refuses every frame AWS sends.
 func NewReader(r io.Reader, max int) *Reader {
 	if max <= 0 {
 		max = maxMessage
 	}
-	return &Reader{r: r, max: max, crc: crc32.MakeTable(crc32.Castagnoli)}
+	return &Reader{r: r, max: max, crc: crc32.IEEETable}
 }
 
 func (r *Reader) Message() Message { return r.last }
@@ -194,7 +197,7 @@ func Encode(headers map[string]string, payload []byte) []byte {
 		hb = append(hb, v...)
 	}
 	total := uint32(preludeLen + len(hb) + len(payload) + 4)
-	table := crc32.MakeTable(crc32.Castagnoli)
+	table := crc32.IEEETable
 
 	msg := make([]byte, 0, total)
 	msg = binary.BigEndian.AppendUint32(msg, total)

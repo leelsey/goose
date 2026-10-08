@@ -18,11 +18,12 @@ import (
 type state struct {
 	session     string
 	owner       string
-	id          string
 	toolIdx     int
 	openTool    bool
 	finished    bool
 	turnOpen    bool
+	streamed    bool
+	msg         string
 	sawContent  bool
 	lastWasTool bool
 }
@@ -118,6 +119,12 @@ func (pr *parser) exit() error {
 	pr.owner.untrack(pr.proc)
 	if err == nil {
 		return nil
+	}
+	// The child was stopped for the call's own context: the caller's deadline,
+	// the caller going or this provider's timeout. How it exited then says
+	// nothing about the binary.
+	if pr.ctx.Err() != nil {
+		return httpcore.ReadError(pr.ctx, pr.provider, err)
 	}
 	detail := pr.proc.Stderr()
 	if detail == "" {

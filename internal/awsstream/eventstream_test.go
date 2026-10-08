@@ -5,6 +5,7 @@ package awsstream
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"testing"
 )
@@ -24,6 +25,35 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if len(types) != 2 || types[0] != "messageStart" || types[1] != "contentBlockDelta" {
 		t.Fatalf("types = %v", types)
+	}
+}
+
+// The empty message from the test vectors AWS publishes for this framing
+// (aws-c-event-stream's empty_message): a twelve-byte prelude and its checksum,
+// no headers, no payload, and the message checksum.
+func TestAWSReferenceFrameIsRead(t *testing.T) {
+	vector, _ := hex.DecodeString("00000010" + "00000000" + "05c248eb" + "7d98c8ff")
+	r := NewReader(bytes.NewReader(vector), 0)
+	if !r.Next() {
+		t.Fatalf("the reference frame was refused: %v", r.Err())
+	}
+	if m := r.Message(); len(m.Headers) != 0 || len(m.Payload) != 0 {
+		t.Fatalf("message = %+v", m)
+	}
+	if r.Next() || r.Err() != nil {
+		t.Fatalf("one frame, then a clean end: %v", r.Err())
+	}
+	if got := Encode(nil, nil); !bytes.Equal(got, vector) {
+		t.Fatalf("encoded = %x, want %x: the tests would agree with a reader AWS does not", got, vector)
+	}
+
+	castagnoli, _ := hex.DecodeString("00000010" + "00000000" + "030ad359" + "6d16a789")
+	r = NewReader(bytes.NewReader(castagnoli), 0)
+	if r.Next() {
+		t.Fatal("a frame checksummed with CRC-32C was accepted")
+	}
+	if !errors.Is(r.Err(), ErrPreludeCRC) {
+		t.Fatalf("err = %v", r.Err())
 	}
 }
 

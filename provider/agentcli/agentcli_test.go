@@ -60,6 +60,9 @@ func TestClaudeTurnsAddAndFramesMerge(t *testing.T) {
 	if !ok || th.Text != "considering" || th.Signature != "sig-1" {
 		t.Fatalf("thinking = %+v", parts[0])
 	}
+	if th.Signer != llm.FamilyAnthropic {
+		t.Fatalf("thinking = %+v: Claude's signature is Anthropic's, and no backend of another family is sent it", th)
+	}
 	tu := llm.ToolUses(parts)
 	if len(tu) != 1 || string(tu[0].Args) != `{"q":1}` {
 		t.Fatalf("tool call = %+v", tu)
@@ -130,6 +133,43 @@ func TestFailedInvocationKeepsItsAccounting(t *testing.T) {
 	}
 	if resp == nil || resp.Usage.Prompt != 33 {
 		t.Fatalf("usage = %+v: the turn ran and was billed before it was rejected", resp)
+	}
+}
+
+// A context that has already ended by the time the binary is spawned is not
+// the binary's fault, or the machine's: it is the timeout or cancellation the
+// caller already has, and the caller reads it as one.
+func TestADoneContextAtSpawnIsTimeoutOrCancelledNotTransport(t *testing.T) {
+	p := provider(t, Claude, "fake-claude.sh", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	cancel()
+	<-ctx.Done()
+	_, err := p.Stream(ctx, attempt(hello()))
+	if e := llm.AsError(err); e == nil || e.Kind != llm.KindTimeout {
+		t.Fatalf("err = %v: a deadline that had already passed before the spawn was reported as a transport failure", err)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	_, err = p.Stream(ctx, attempt(hello()))
+	if e := llm.AsError(err); e == nil || e.Kind != llm.KindCancelled {
+		t.Fatalf("err = %v: a caller that had already gone before the spawn was reported as a transport failure", err)
+	}
+}
+
+// The other side of the same fix: a spawn that fails for a real reason, with
+// a context nowhere near ending, must still read as the transport failure it
+// is. Releasing the attempt's own timeout context as part of handling the
+// spawn error must not make every such failure look like a cancellation.
+func TestARealSpawnFailureWithALiveContextIsStillTransport(t *testing.T) {
+	p := provider(t, Claude, "does-not-exist-anywhere", nil)
+	_, err := p.Stream(context.Background(), attempt(hello()))
+	e := llm.AsError(err)
+	if e == nil || e.Kind != llm.KindTransport {
+		t.Fatalf("err = %v: a binary that does not exist was reported as a cancellation", err)
+	}
+	if e.Sent {
+		t.Fatalf("err = %v: a call that never spawned was booked as sent", err)
 	}
 }
 
@@ -247,20 +287,61 @@ func TestEnvironmentIsScrubbed(t *testing.T) {
 	}
 }
 
-func TestConcurrencyGateShedsRatherThanQueues(t *testing.T) {
+func TestConcurrencyGateQueuesRatherThanSheds(t *testing.T) {
 	p := provider(t, Claude, "fake-claude.sh", func(o *Options) { o.MaxConcurrent = 1 })
 	release, err := p.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Acquire(context.Background()); err == nil {
-		t.Fatal("a saturated subscription backend must refuse rather than pile up")
-	} else if llm.AsError(err).Kind != llm.KindSaturated {
-		t.Fatalf("err = %v", err)
+	got := make(chan error, 1)
+	go func() {
+		next, err := p.Acquire(context.Background())
+		if err == nil {
+			next()
+		}
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		t.Fatalf("err = %v: a call past the limit waits for a slot, since for a subscription backend there is often no next link to shed it to", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 	release()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatalf("the queued call was not given the slot that came free: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the slot was not returned")
+	}
 	if _, err := p.Acquire(context.Background()); err != nil {
 		t.Fatalf("the slot was not returned: %v", err)
+	}
+}
+
+func TestAQueuedCallEndsWithItsContext(t *testing.T) {
+	p := provider(t, Claude, "fake-claude.sh", func(o *Options) { o.MaxConcurrent = 1 })
+	release, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := p.Acquire(ctx); err == nil {
+		t.Fatal("a call whose deadline passed in the queue was given a slot that was never free")
+	} else if e := llm.AsError(err); e.Kind != llm.KindTimeout || e.Sent {
+		t.Fatalf("err = %+v: the caller is still there, its deadline is what ran out", e)
+	}
+
+	gone, hangUp := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, hangUp)
+	if _, err := p.Acquire(gone); err == nil {
+		t.Fatal("a caller that has gone was given a slot that was never free")
+	} else if e := llm.AsError(err); e.Kind != llm.KindCancelled || e.Sent {
+		t.Fatalf("err = %+v", e)
 	}
 }
 
@@ -362,6 +443,40 @@ func TestUnrestrictableAgentIsReportedOnEveryCall(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("diagnostics = %+v: an agent goose cannot restrain is a fact the caller needs", diags)
+	}
+}
+
+// Stream notes each prepare diagnostic onto a with the caller's loss policy
+// applied, and the chain notes that same, already-applied copy onto the
+// stream once it holds it (chain.go). Stream must not also note the raw
+// diagnostic onto the stream itself, or the chain's copy lands beside an
+// unpolicied duplicate. Regression test for r3-agentcli-2.
+func TestPrepareDiagnosticsReachTheStreamOnlyOnce(t *testing.T) {
+	p := provider(t, Antigravity, "fake-echo-args.sh", nil)
+	var noted llm.Diagnostics
+	a := attempt(hello())
+	a.Recorder = &noted
+	s, err := p.Stream(context.Background(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	// This is the chain's own step (chain.go), replayed here so the test does
+	// not need the whole routing client to catch a duplicate that only shows
+	// up once both sinks are merged, as a real call merges them.
+	for _, d := range noted {
+		s.Note(d)
+	}
+	for range s.Frames() {
+	}
+	n := 0
+	for _, d := range s.Diagnostics() {
+		if d.Code == llm.PolicyAgentUnrestricted {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("policy.agent_unrestricted noted %d times on the stream, want 1", n)
 	}
 }
 
@@ -721,6 +836,35 @@ func TestARestatedTurnStillCarriesWhatTheDeltasCouldNot(t *testing.T) {
 	}
 }
 
+func TestAServerToolsStreamedInputIsNotTheClientsCall(t *testing.T) {
+	p := provider(t, Claude, "fake-claude.sh", nil)
+	st := &state{}
+	var args strings.Builder
+	for _, line := range []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"search"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":1}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"goose\"}"}}}`,
+	} {
+		frames, err := claudeParse(p, []byte(line), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range frames {
+			for _, tu := range llm.ToolUses(f.Delta) {
+				if *tu.Index != 0 {
+					t.Fatalf("call %d = %+v: a server tool's input opened a call for the client to run", *tu.Index, tu)
+				}
+				args.Write(tu.Args)
+			}
+		}
+	}
+	if args.String() != `{"q":1}` {
+		t.Fatalf("args = %s: a server tool's input was written into the client's call", args.String())
+	}
+}
+
 func TestAgentsAreGatedByDefault(t *testing.T) {
 	p, err := New(Options{Kind: Claude, Binary: fake(t, "fake-claude.sh"), Env: os.Environ()})
 	if err != nil {
@@ -753,6 +897,49 @@ func TestASessionHandleMustLookLikeOne(t *testing.T) {
 	for _, good := range []string{"sess-42", "t1", "01JABC.def:ghi", "a_b-c"} {
 		if !safeSession(good) {
 			t.Fatalf("%q was refused: this is what the binaries actually issue", good)
+		}
+	}
+}
+
+func TestAModelThatReadsAsAFlagIsRefused(t *testing.T) {
+	for _, kind := range []Kind{Claude, Codex, Antigravity, Copilot} {
+		t.Run(string(kind), func(t *testing.T) {
+			record := filepath.Join(t.TempDir(), "record")
+			p := provider(t, kind, "fake-echo-args.sh", func(o *Options) {
+				o.Env = append(os.Environ(), "GOOSE_TEST_RECORD="+record)
+				o.TempDir = t.TempDir()
+			})
+			req := hello()
+			req.Model = "--yolo"
+			a := attempt(req)
+			a.Model = ""
+			_, err := p.Complete(context.Background(), a)
+			if e := llm.AsError(err); e == nil || e.Kind != llm.KindInvalidRequest || e.Sent {
+				t.Fatalf("err = %v: a request's model goes into the child's argument list", err)
+			}
+			if _, err := os.Stat(record); !os.IsNotExist(err) {
+				t.Fatal("the binary was run with a model that could read as one of its flags")
+			}
+
+			if _, err := p.Complete(context.Background(), attempt(hello())); err != nil {
+				t.Fatalf("a model named as models are named must still reach the binary: %v", err)
+			}
+		})
+	}
+}
+
+// Tools is false because none of these binaries takes a caller's tool
+// definitions: they run their own, and a caller that offers tools is told they
+// were dropped. Thinking is false because none of them is given a thinking
+// setting, so a caller that asks for one is told rather than ignored.
+func TestTheCapabilitiesAreWhatTheBinariesTake(t *testing.T) {
+	for _, kind := range []Kind{Claude, Codex, Antigravity, Copilot} {
+		caps := provider(t, kind, "fake-echo-args.sh", nil).Capabilities()
+		if caps.Tools || caps.ToolChoice || caps.MCPServers {
+			t.Errorf("%s: caps = %+v: no tool definition reaches the binary", kind, caps)
+		}
+		if caps.Thinking || caps.Effort {
+			t.Errorf("%s: caps = %+v: no thinking setting reaches the binary", kind, caps)
 		}
 	}
 }

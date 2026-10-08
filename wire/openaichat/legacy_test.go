@@ -71,3 +71,27 @@ func TestEveryKnownFieldIsReadBySomething(t *testing.T) {
 		t.Fatal("function_call was neither decoded nor carried")
 	}
 }
+
+// A tool or function message's name says which call it answers, and the
+// result holds it. Copied onto the message as well, it reads as a participant
+// name, which every other backend has no field for: strict then refuses an
+// ordinary tool loop. Regression test for r4-seam-2.
+func TestAToolResultsNameIsNotAParticipantName(t *testing.T) {
+	req, _, _ := decode(t, `{"model":"m","messages":[
+		{"role":"user","name":"alice","content":"hi"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","name":"f","content":"42"},
+		{"role":"function","name":"f","content":"43"}]}`)
+	if req.Messages[0].Name != "alice" {
+		t.Fatalf("user name = %q: a participant's name is still read", req.Messages[0].Name)
+	}
+	for _, m := range req.Messages[2:] {
+		if m.Name != "" {
+			t.Fatalf("message = %+v: the name belongs to the result, not to a participant", m)
+		}
+		result, ok := m.Content[0].(*llm.ToolResult)
+		if !ok || result.Name != "f" {
+			t.Fatalf("result = %#v: the result keeps the name of the call it answers", m.Content[0])
+		}
+	}
+}

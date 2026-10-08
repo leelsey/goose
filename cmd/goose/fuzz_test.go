@@ -37,7 +37,7 @@ func FuzzLoadConfig(f *testing.F) {
 		if cfg == nil {
 			t.Fatal("load returned no configuration and no error")
 		}
-		cfg.resolveSecrets(func(string) string { return "" })
-		_ = cfg.validate()
+		_ = cfg.validate(true)
+		_, _ = cfg.resolveSecrets(func(string) string { return "" }, true)
 	})
 }

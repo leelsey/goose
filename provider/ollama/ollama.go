@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/leelsey/goose/internal/httpcore"
@@ -46,7 +47,7 @@ func New(o Options) (*Provider, error) {
 		o.BaseURL = defaultBaseURL
 	}
 	p := &Provider{opts: o}
-	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout)}
+	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout), Refine: refine}
 	return p, nil
 }
 
@@ -143,15 +144,27 @@ func (p *Provider) body(a *llm.Attempt, stream bool) ([]byte, llm.Diagnostics, e
 			Detail: "this backend has no field to name the end user, so the name was not sent",
 		})
 	}
+	// This backend takes a tool result only as a message of its own, named by
+	// the tool rather than the call, whichever turn it arrived in. A result
+	// that does not name its tool takes the name of the call it answers.
+	called := map[string]string{}
 	for _, m := range rest {
-		if m.Role == llm.RoleTool {
-			for _, part := range m.Content {
-				if tr, ok := part.(*llm.ToolResult); ok {
-					msgs = append(msgs, map[string]any{"role": "tool", "tool_name": tr.Name, "content": llm.TextOf(tr.Content)})
-					diags = append(diags, llm.Flattened(tr.Content, p.ID(),
-						"this backend takes a tool result as text, so what was not text did not travel")...)
-				}
+		results := false
+		for _, part := range m.Content {
+			tr, ok := part.(*llm.ToolResult)
+			if !ok {
+				continue
 			}
+			results = true
+			name := tr.Name
+			if name == "" {
+				name = called[tr.ID]
+			}
+			msgs = append(msgs, map[string]any{"role": "tool", "tool_name": name, "content": llm.TextOf(tr.Content)})
+			diags = append(diags, llm.Flattened(tr.Content, p.ID(),
+				"this backend takes a tool result as text, so what was not text did not travel")...)
+		}
+		if m.Role == llm.RoleTool {
 			continue
 		}
 		entry := map[string]any{"role": string(m.Role)}
@@ -183,6 +196,7 @@ func (p *Provider) body(a *llm.Attempt, stream bool) ([]byte, llm.Diagnostics, e
 					Severity: llm.SeverityLoss, Provider: p.ID(), Detail: "this backend takes image bytes, not a URL",
 				})
 			case *llm.ToolUse:
+				called[v.ID] = v.Name
 				args := wirecore.ObjectArgs(v.Args)
 				calls = append(calls, map[string]any{"function": map[string]any{"name": v.Name, "arguments": args}})
 			case *llm.Raw:
@@ -191,6 +205,9 @@ func (p *Provider) body(a *llm.Attempt, stream bool) ([]byte, llm.Diagnostics, e
 					Severity: llm.SeverityLoss, Provider: p.ID(), Field: v.Type,
 				})
 			}
+		}
+		if results && content == "" && thinking == "" && len(images) == 0 && len(calls) == 0 {
+			continue
 		}
 		entry["content"] = content
 		if thinking != "" {
@@ -299,6 +316,9 @@ func (p *Provider) body(a *llm.Attempt, stream bool) ([]byte, llm.Diagnostics, e
 
 	for _, x := range diags {
 		a.Note(x)
+	}
+	if err := a.Check(); err != nil {
+		return nil, diags, err
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -414,7 +434,9 @@ func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "malformed response: " + err.Error(), Err: err}
 	}
 	if out.Error != "" {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200, Message: out.Error}
+		return nil, &llm.Error{
+			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200, Message: out.Error, Body: httpcore.ErrorBody(raw),
+		}
 	}
 	idx := 0
 	parts := out.parts(&idx, wirecore.NewIDMinter())
@@ -488,7 +510,9 @@ func (o *parser) next() (*llm.Frame, error) {
 		}
 		if f.Error != "" {
 			o.done = true
-			return &llm.Frame{Err: &llm.Error{Kind: llm.KindUpstream, Provider: o.provider, Sent: true, Status: 200, Message: f.Error}}, nil
+			return &llm.Frame{Err: &llm.Error{
+				Kind: llm.KindUpstream, Provider: o.provider, Sent: true, Status: 200, Message: f.Error, Body: httpcore.ErrorBody(data),
+			}}, nil
 		}
 		frame := &llm.Frame{
 			Model: f.Model, Delta: f.parts(&o.toolIdx, o.mint),
@@ -516,16 +540,30 @@ func (o *parser) next() (*llm.Frame, error) {
 	}
 }
 
+// refine reads what the status does not say. A model that lacks tools or
+// thinking is refused with the 400 a malformed request gets, though another
+// model may well have what this one does not.
+func refine(e *llm.Error) {
+	if e.Kind == llm.KindInvalidRequest && strings.Contains(e.Message, " does not support ") {
+		e.Kind = llm.KindUnsupported
+	}
+}
+
 func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassResponse, error) {
 	u := httpcore.JoinURL(p.opts.BaseURL, r.Path)
-	if r.Query != "" {
-		u += "?" + r.Query
+	q, err := httpcore.PassQuery(p.ID(), r.Query)
+	if err != nil {
+		return nil, err
+	}
+	if q != "" {
+		u += "?" + q
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, u, r.Body)
 	if err != nil {
 		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(), Message: err.Error()}
 	}
 	httpcore.ForwardPassthrough(req.Header, r.Header)
+	httpcore.Overlay(req.Header, p.opts.Header)
 	if p.opts.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.opts.APIKey)
 	}

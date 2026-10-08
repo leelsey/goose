@@ -30,7 +30,9 @@ func (c *capped) Complete(_ context.Context, a *llm.Attempt) (*llm.Response, err
 
 func (c *capped) Stream(_ context.Context, a *llm.Attempt) (*llm.Stream, error) {
 	c.seen = a
-	return llm.StaticStream(llm.StreamMeta{Provider: c.id}, []*llm.Frame{{Stop: llm.StopEnd}}), nil
+	return llm.StaticStream(llm.StreamMeta{Provider: c.id}, []*llm.Frame{
+		{Delta: []llm.Part{&llm.Text{Text: "ok"}}}, {Stop: llm.StopEnd},
+	}), nil
 }
 
 func full() llm.Capabilities {
@@ -109,7 +111,7 @@ func TestWhatWillNotBeHonouredIsStrippedAndReported(t *testing.T) {
 	c, _ := New(WithProvider(p))
 	r := req()
 	r.Tools = []llm.Tool{{Name: "search", Schema: json.RawMessage(`{}`)}}
-	r.ToolChoice = &llm.ToolChoice{Mode: llm.ToolRequired}
+	r.ToolChoice = &llm.ToolChoice{Mode: llm.ToolAuto}
 	r.ResponseFormat = &llm.ResponseFormat{Type: "json_object"}
 	r.Thinking = &llm.ThinkingConfig{Enabled: true}
 	r.Effort = llm.EffortHigh
@@ -202,6 +204,11 @@ type failing struct {
 func (f *failing) Complete(_ context.Context, a *llm.Attempt) (*llm.Response, error) {
 	f.seen = a
 	return nil, &llm.Error{Kind: llm.KindOverloaded, Message: "busy", Sent: true, Retryable: true}
+}
+
+func (f *failing) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, error) {
+	_, err := f.Complete(ctx, a)
+	return nil, err
 }
 
 func TestClientKeyDoesNotFollowAFailover(t *testing.T) {
@@ -747,6 +754,61 @@ func TestAToolChoiceNamingNoToolIsReported(t *testing.T) {
 	}
 	if p.seen.Request.ToolChoice == nil {
 		t.Fatal("a choice that names a tool must reach the backend")
+	}
+}
+
+// A backend that takes no tools cannot answer a request that offers them as
+// well as one that can. While a later link takes them, the request is left to
+// it rather than stripped here; a tool call the caller insists on is never
+// stripped, since an answer without one is an answer to another question.
+func TestToolsAreLeftToALinkThatCanOfferThem(t *testing.T) {
+	cli := &capped{id: "cli", caps: llm.Capabilities{Streaming: true, SystemPrompt: true}}
+	api := &capped{id: "api", caps: full()}
+	c, err := New(
+		WithProvider(cli), WithProvider(api),
+		WithRoutes(route.Rule{Name: "chain", Match: route.Always(), Chain: []route.Target{
+			{Provider: "cli"}, {Provider: "api"},
+		}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, choice := range []*llm.ToolChoice{
+		{Mode: llm.ToolSpecific, Name: "act"}, {Mode: llm.ToolRequired}, {Mode: llm.ToolAuto}, nil,
+	} {
+		cli.seen, api.seen = nil, nil
+		r := req()
+		r.Tools = []llm.Tool{{Name: "act", Schema: []byte(`{"type":"object"}`)}}
+		r.ToolChoice = choice
+		resp, err := c.Chat(context.Background(), r)
+		if err != nil {
+			t.Fatalf("choice %+v: %v", choice, err)
+		}
+		if cli.seen != nil || resp.Provider != "api" {
+			t.Fatalf("choice %+v: served by %q with the tools stripped, and the link that has them was not tried",
+				choice, resp.Provider)
+		}
+		if len(api.seen.Request.Tools) != 1 {
+			t.Fatalf("choice %+v: tools = %+v", choice, api.seen.Request.Tools)
+		}
+	}
+}
+
+func TestAToolCallTheCallerInsistsOnIsNotStripped(t *testing.T) {
+	cli := &capped{id: "cli", caps: llm.Capabilities{Streaming: true}}
+	c, err := New(WithProvider(cli))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := req()
+	r.Tools = []llm.Tool{{Name: "act", Schema: []byte(`{"type":"object"}`)}}
+	r.ToolChoice = &llm.ToolChoice{Mode: llm.ToolSpecific, Name: "act"}
+	_, err = c.Chat(context.Background(), r)
+	if e := llm.AsError(err); e == nil || e.Kind != llm.KindUnsupported || e.Sent {
+		t.Fatalf("err = %v: a backend with no tools cannot make the call the caller insists on", err)
+	}
+	if cli.seen != nil {
+		t.Fatal("the request reached the backend anyway")
 	}
 }
 

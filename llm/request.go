@@ -119,6 +119,14 @@ type ToolChoice struct {
 type ThinkingConfig struct {
 	Enabled bool
 	Budget  int
+	// Adaptive is Anthropic's mode by name: the model sizes its own thinking,
+	// and that vendor's current models take no budget at all. Budget is -1
+	// beside it, for a backend whose only way of saying so is a dynamic budget.
+	Adaptive bool
+	// Hidden asks for thinking without the thoughts being handed back, as
+	// Gemini does unless it is asked to show them. A backend that cannot hide
+	// them shows them.
+	Hidden bool
 }
 
 type Effort string
@@ -167,6 +175,10 @@ type Request struct {
 
 	Extra     map[string]json.RawMessage
 	ExtraFrom string
+	// Betas are the vendor feature flags the caller asked for, such as
+	// Anthropic's anthropic-beta values. A backend of that vendor sends them
+	// beside its own, and any other has nothing to send them to.
+	Betas []string
 }
 
 func (r *Request) Clone() *Request {
@@ -227,6 +239,7 @@ func (r *Request) Clone() *Request {
 	c.PresencePenalty = clonePtr(r.PresencePenalty)
 	c.Thinking = clonePtr(r.Thinking)
 	c.Stop = append([]string(nil), r.Stop...)
+	c.Betas = append([]string(nil), r.Betas...)
 	if r.ResponseFormat != nil {
 		f := *r.ResponseFormat
 		f.Schema = append(json.RawMessage(nil), r.ResponseFormat.Schema...)

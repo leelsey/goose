@@ -6,6 +6,7 @@ package agentcli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -27,8 +28,6 @@ const (
 
 // Every call forks a whole agent CLI, which costs hundreds of megabytes while
 // it runs, so what bounds this is the host's memory rather than its cores.
-// A request past the limit is shed, which is what the route's next link is for.
-// A zero MaxConcurrent takes this default; a negative one removes the gate.
 const DefaultMaxConcurrent = 4
 
 type SystemMode string
@@ -49,6 +48,19 @@ func (m SystemMode) known() bool {
 	return false
 }
 
+// MaxConcurrent bounds the invocations running at once, and a call past it
+// waits for a slot until its context ends rather than failing. Shedding it
+// would hand it to the route's next link, which for a CLI on its own
+// subscription login is either no link at all or one billed per call that the
+// operator chose this one to avoid. A zero MaxConcurrent takes
+// DefaultMaxConcurrent and a negative one removes the gate.
+//
+// MaxQueued bounds the calls waiting at once. Each of them holds whatever
+// admitted it while it waits, a proxy's own concurrency slot among them, so a
+// backlog here would otherwise turn away calls to every other backend. A call
+// that finds the queue full is shed as saturated, which the route's next link
+// takes up or a proxy answers with 503. A zero MaxQueued takes MaxConcurrent
+// and a negative one queues nothing, so every call past the limit is shed.
 type Options struct {
 	ID            string
 	Kind          Kind
@@ -61,6 +73,7 @@ type Options struct {
 	MaxTurns      int
 	Sandbox       string
 	MaxConcurrent int
+	MaxQueued     int
 	Timeout       time.Duration
 	Grace         time.Duration
 	TempDir       string
@@ -68,9 +81,10 @@ type Options struct {
 }
 
 type Provider struct {
-	opts Options
-	env  llm.Env
-	gate chan struct{}
+	opts  Options
+	env   llm.Env
+	gate  chan struct{}
+	queue chan struct{}
 
 	mu       sync.Mutex
 	live     map[*spawn.Process]struct{}
@@ -138,9 +152,15 @@ func New(o Options) (*Provider, error) {
 	if o.MaxConcurrent == 0 {
 		o.MaxConcurrent = DefaultMaxConcurrent
 	}
+	if o.MaxQueued == 0 {
+		o.MaxQueued = o.MaxConcurrent
+	}
 	p := &Provider{opts: o, live: map[*spawn.Process]struct{}{}}
 	if o.MaxConcurrent > 0 {
 		p.gate = make(chan struct{}, o.MaxConcurrent)
+	}
+	if o.MaxConcurrent > 0 && o.MaxQueued > 0 {
+		p.queue = make(chan struct{}, o.MaxQueued)
 	}
 	return p, nil
 }
@@ -162,7 +182,7 @@ func (p *Provider) Capabilities() llm.Capabilities {
 		ToolResults:  true,
 		SystemPrompt: p.opts.SystemMode != SystemOff,
 		Sessions:     k.sessions,
-		Thinking:     true,
+		Thinking:     false,
 		Candidates:   1,
 		Ceiling:      llm.CeilingNone,
 	}
@@ -172,18 +192,54 @@ func (p *Provider) Acquire(ctx context.Context) (func(), error) {
 	if p.gate == nil {
 		return func() {}, nil
 	}
+	// A context that has already ended is not given a slot even when one is
+	// free: the call it belongs to is not going to be sent, and a slot handed
+	// to it is a slot withheld from a call that could have used it.
+	if err := ctx.Err(); err != nil {
+		return func() {}, doneErr(p.ID(), ctx)
+	}
 	select {
 	case p.gate <- struct{}{}:
-		var once sync.Once
-		return func() { once.Do(func() { <-p.gate }) }, nil
-	case <-ctx.Done():
-		return func() {}, &llm.Error{Kind: llm.KindCancelled, Provider: p.ID(), Message: ctx.Err().Error()}
+		return p.leave(), nil
 	default:
-		return func() {}, &llm.Error{
-			Kind: llm.KindSaturated, Provider: p.ID(), Retryable: true,
-			Message: fmt.Sprintf("%s: all %d slots are busy", p.ID(), p.opts.MaxConcurrent),
-		}
 	}
+	select {
+	case p.queue <- struct{}{}:
+	default:
+		return func() {}, p.saturated()
+	}
+	defer func() { <-p.queue }()
+	select {
+	case p.gate <- struct{}{}:
+		return p.leave(), nil
+	case <-ctx.Done():
+		// A deadline that ran out in the queue is not the caller having gone.
+		return func() {}, doneErr(p.ID(), ctx)
+	}
+}
+
+// doneErr reports a context that has already ended as the timeout or
+// cancellation it is, never as a transport failure: nothing was ever going
+// to be sent for it.
+func doneErr(provider string, ctx context.Context) *llm.Error {
+	cause, kind := context.Cause(ctx), llm.KindCancelled
+	if errors.Is(cause, context.DeadlineExceeded) {
+		kind = llm.KindTimeout
+	}
+	return &llm.Error{Kind: kind, Provider: provider, Message: cause.Error(), Err: cause}
+}
+
+func (p *Provider) leave() func() {
+	var once sync.Once
+	return func() { once.Do(func() { <-p.gate }) }
+}
+
+func (p *Provider) saturated() *llm.Error {
+	msg := fmt.Sprintf("%s: all %d slots are busy", p.ID(), cap(p.gate))
+	if p.queue != nil {
+		msg += fmt.Sprintf(" and %d calls are already waiting for one", cap(p.queue))
+	}
+	return &llm.Error{Kind: llm.KindSaturated, Provider: p.ID(), Retryable: true, Message: msg}
 }
 
 func (p *Provider) Close(context.Context) error {

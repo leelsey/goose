@@ -27,11 +27,7 @@ func (rw *responseWriter) Open(status int, header http.Header) error {
 		return nil
 	}
 	rw.opened = true
-	for k, vs := range header {
-		for _, v := range vs {
-			rw.w.Header().Add(k, v)
-		}
-	}
+	overlay(rw.w.Header(), header)
 	rw.w.WriteHeader(status)
 	rw.Flush()
 	return nil
@@ -75,6 +71,9 @@ func (s *Server) handle(codec wire.Codec) http.HandlerFunc {
 			goose.WithRenders(renders),
 			goose.WithPath(r.URL.Path),
 			goose.WithHeader(r.Header),
+			// What decoding lost is the request's own loss, so the call holds
+			// it to the policy before anything is sent.
+			goose.WithDiagnostics(diags),
 		}
 		if opts.Session != "" {
 			callOpts = append(callOpts,
@@ -82,22 +81,22 @@ func (s *Server) handle(codec wire.Codec) http.HandlerFunc {
 				goose.WithSessionProvider(r.Header.Get(ProviderHeader)),
 			)
 		}
-		if opts.Key != "" && opts.Key != s.opts.APIKey {
+		if key := s.handedOn(r, opts.Key); key != "" {
 			callOpts = append(callOpts, goose.WithCredential(llm.Credential{
-				Key: opts.Key, Scheme: schemeOf(r, opts.Key),
+				Key: key, Scheme: schemeOf(r, key),
 			}))
 		}
 
 		if opts.Stream {
-			s.serveStream(w, r, codec, req, opts, diags, callOpts)
+			s.serveStream(w, r, codec, req, opts, callOpts)
 			return
 		}
-		s.serveUnary(w, r, codec, req, opts, diags, callOpts)
+		s.serveUnary(w, r, codec, req, opts, callOpts)
 	}
 }
 
 func (s *Server) serveUnary(w http.ResponseWriter, r *http.Request, codec wire.Codec,
-	req *llm.Request, opts wire.Options, diags llm.Diagnostics, callOpts []goose.CallOption) {
+	req *llm.Request, opts wire.Options, callOpts []goose.CallOption) {
 
 	resp, err := s.client.Chat(r.Context(), req, callOpts...)
 	if err != nil {
@@ -108,25 +107,40 @@ func (s *Server) serveUnary(w http.ResponseWriter, r *http.Request, codec wire.C
 		s.fail(w, codec, opts, e)
 		return
 	}
-	resp.Diagnostics = append(resp.Diagnostics, diags...)
 	out, encDiags, encErr := codec.EncodeResponse(resp, opts)
 	if encErr != nil {
 		s.fail(w, codec, opts, llm.AsError(encErr))
 		return
 	}
+	// What the encoding lost is held to the policy the answer was, and nothing
+	// has been written yet, so a loss it refuses is refused whole. The call was
+	// served and billed all the same, and its row says so.
+	if lerr := resp.Policy.Check(encDiags); lerr != nil {
+		e := llm.AsError(lerr)
+		e.Provider, e.Model, e.Sent, e.Usage = resp.Provider, resp.Model, true, &resp.Usage
+		s.fail(w, codec, opts, e)
+		return
+	}
 	all := append(append(llm.Diagnostics{}, resp.Diagnostics...), encDiags...)
 	s.decorate(w, resp.Usage, resp.Provider, resp.Session, all)
-	for k, vs := range out.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
+	overlay(w.Header(), out.Header)
 	w.WriteHeader(out.Status)
 	_, _ = w.Write(out.Body)
 }
 
+// overlay writes a codec's headers over the ones the server set first, so a
+// header both of them carry, such as the session, is sent once.
+func overlay(dst, src http.Header) {
+	for k, vs := range src {
+		dst.Del(k)
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
 func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, codec wire.Codec,
-	req *llm.Request, opts wire.Options, diags llm.Diagnostics, callOpts []goose.CallOption) {
+	req *llm.Request, opts wire.Options, callOpts []goose.CallOption) {
 
 	stream, err := s.client.Stream(r.Context(), req, callOpts...)
 	if err != nil {
@@ -134,6 +148,16 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, codec wire.
 		return
 	}
 	defer stream.Close()
+	// A stream the policy refused as it was handed over has delivered nothing,
+	// so it is answered as the failed call it is rather than as a 200 carrying
+	// only the failure.
+	if e := llm.AsError(stream.Err()); e != nil && !stream.Committed() {
+		refused, u := *e, stream.Usage()
+		refused.Usage = &u
+		refused.Diagnostics = append(append(llm.Diagnostics{}, stream.Diagnostics()...), e.Diagnostics...)
+		s.fail(w, codec, opts, &refused)
+		return
+	}
 
 	meta := stream.Meta()
 	rw := &responseWriter{w: w}
@@ -152,9 +176,6 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, codec wire.
 	w.Header().Set(ProviderHeader, meta.Provider)
 	if meta.Session != "" {
 		w.Header().Set(SessionHeader, meta.Session)
-	}
-	for _, d := range diags {
-		stream.Note(d)
 	}
 	// A failure after this point is written into the body rather than returned,
 	// so redaction has to reach it where the codec reads it.
@@ -212,6 +233,11 @@ func (s *Server) fail(w http.ResponseWriter, codec wire.Codec, opts wire.Options
 			w.Header().Set(UsageHeader, string(b))
 		}
 	}
+	// A refusal is the answer that most needs saying why, and the codes name
+	// only goose's own findings, never an upstream's words.
+	if codes := llm.Diagnostics(e.Diagnostics).Codes(); len(codes) > 0 {
+		w.Header().Set(DiagnosticsHeader, strings.Join(codes, ","))
+	}
 	w.WriteHeader(out.Status)
 	_, _ = w.Write(out.Body)
 }
@@ -240,7 +266,7 @@ func schemeOf(r *http.Request, key string) llm.CredentialScheme {
 // the code are the vendor's own text, parsed out of a body that routinely
 // quotes the request back, so both are replaced rather than only the sentence.
 func (s *Server) hide(e *llm.Error) *llm.Error {
-	if e == nil || !s.opts.RedactUpstream || e.Provider == "" {
+	if e == nil || !s.opts.RedactUpstream || e.Provider == "" || refusal(e) {
 		return e
 	}
 	s.log().Debug("upstream failure", "provider", e.Provider, "status", e.Status,
@@ -248,6 +274,18 @@ func (s *Server) hide(e *llm.Error) *llm.Error {
 	redacted := *e
 	redacted.Message, redacted.Code, redacted.Body = generic(e.Kind), "", ""
 	return &redacted
+}
+
+// refusal says a failure is goose's own, naming what it refused by goose's own
+// code: a loss the policy would not take, whether before sending or in the
+// answer, or a capability a backend lacks, refused before sending. Nothing in
+// it came from a backend, and a caller told only that the upstream failed
+// cannot fix what it asked.
+func refusal(e *llm.Error) bool {
+	if e.Body != "" || !llm.KnownCode(e.Code) {
+		return false
+	}
+	return !e.Sent || e.Kind == llm.KindLoss
 }
 
 func generic(kind llm.ErrorKind) string {

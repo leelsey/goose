@@ -59,7 +59,7 @@ func New(o Options) (*Provider, error) {
 		o.Prefix = defaultPrefix
 	}
 	p := &Provider{opts: o}
-	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout)}
+	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout), Refine: refine}
 	return p, nil
 }
 
@@ -76,6 +76,7 @@ func (p *Provider) Bind(env llm.Env) error {
 func (p *Provider) Capabilities() llm.Capabilities {
 	return llm.Capabilities{
 		KeyScheme:          p.opts.KeyScheme,
+		ClientKey:          p.opts.AllowClientKey && p.opts.APIKey == "" && p.opts.Sign == nil,
 		Extensions:         []string{geminiapi.Name},
 		Streaming:          true,
 		Usage:              llm.UsageShape{StreamUsage: true},
@@ -87,6 +88,7 @@ func (p *Provider) Capabilities() llm.Capabilities {
 		ImageIn:            true,
 		Thinking:           true,
 		ThinkingSignatures: true,
+		Signer:             llm.FamilyGoogle,
 		ResponseFormat:     true,
 		Candidates:         8,
 		Ceiling:            llm.CeilingMaxTokens,
@@ -181,7 +183,10 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 			Detail: "this backend has no field to name the end user, so the name was not sent",
 		})
 	}
-	for _, m := range msgs {
+	calls := callNames{}
+	turn := currentTurn(msgs)
+	placeheld, owed := 0, false
+	for i, m := range msgs {
 		role := "user"
 		if m.Role == llm.RoleAssistant {
 			role = "model"
@@ -193,7 +198,24 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 				Detail: "this backend has no field to name a participant, so the name was not sent",
 			})
 		}
-		parts, d := geminiapi.EncodeParts(m.Content)
+		// A step is one content of the model's, which the turns coalescing
+		// below may build from several messages; its first call is the one
+		// that must be signed.
+		var pending *bool
+		if role == "model" {
+			if len(contents) == 0 || contents[len(contents)-1]["role"] != role {
+				owed = i >= turn
+			}
+			pending = &owed
+		}
+		content, n, err := calls.fill(m.Content, pending)
+		if err != nil {
+			e := llm.AsError(err)
+			e.Provider = p.ID()
+			return nil, diags, e
+		}
+		placeheld += n
+		parts, d := geminiapi.EncodeParts(content)
 		diags = append(diags, d...)
 		if len(parts) == 0 {
 			diags = append(diags, llm.DroppedMessage(m.Role, p.ID(),
@@ -208,6 +230,13 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 	}
 	if len(contents) == 0 {
 		return nil, diags, llm.Errorf(llm.KindInvalidRequest, "no contents survived translation")
+	}
+	if placeheld > 0 {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropSignature, Class: llm.ClassCapability, Stage: llm.StageRequest,
+			Severity: llm.SeverityInfo, Provider: p.ID(), Field: "thoughtSignature", Count: placeheld,
+			Detail: "a call in this turn came back without the signature for the model's reasoning before it, so that reasoning was not carried and Google's placeholder went in its place",
+		})
 	}
 	body["contents"] = contents
 
@@ -252,7 +281,16 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 		}
 	}
 	if req.Thinking != nil {
-		th := map[string]any{"includeThoughts": true}
+		// A caller on this wire can say more than the neutral request holds,
+		// such as a thinking level. What it said is kept, and what the neutral
+		// request holds is written over it.
+		th := map[string]any{}
+		for k, v := range wirecore.NestedFrom(wirecore.NestedFrom(req.Extra, "generationConfig"), "thinkingConfig") {
+			th[k] = v
+		}
+		if !req.Thinking.Hidden {
+			th["includeThoughts"] = true
+		}
 		if req.Thinking.Budget != 0 {
 			th["thinkingBudget"] = req.Thinking.Budget
 		}
@@ -304,6 +342,9 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 
 	for _, x := range diags {
 		a.Note(x)
+	}
+	if err := a.Check(); err != nil {
+		return nil, diags, err
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -397,7 +438,10 @@ func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "malformed response: " + err.Error(), Err: err}
 	}
 	if out.Error != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: out.Error.Code, Code: out.Error.Status, Message: out.Error.Message}
+		return nil, &llm.Error{
+			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true,
+			Status: out.Error.Code, Code: out.Error.Status, Message: out.Error.Message, Body: httpcore.ErrorBody(raw),
+		}
 	}
 	if len(out.Candidates) == 0 && out.PromptFeedback == nil {
 		return nil, &llm.Error{
@@ -496,7 +540,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 	if err != nil {
 		return nil, err
 	}
-	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
+	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxFrameBytes)
 	st := &parser{ctx: ctx, provider: p.ID(), sc: sc, attempt: a}
 	return llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: p.model(a), Requested: a.Request.Model, Created: p.now()},
@@ -588,7 +632,7 @@ func (g *parser) next() (*llm.Frame, error) {
 			g.done = true
 			return &llm.Frame{Err: &llm.Error{
 				Kind: llm.KindUpstream, Provider: g.provider, Sent: true,
-				Status: out.Error.Code, Code: out.Error.Status, Message: out.Error.Message,
+				Status: out.Error.Code, Code: out.Error.Status, Message: out.Error.Message, Body: httpcore.ErrorBody(data),
 			}}, nil
 		}
 		var frames []*llm.Frame
@@ -632,6 +676,47 @@ func (g *parser) next() (*llm.Frame, error) {
 	}
 }
 
+// refine reads what the status does not say. Gemini answers a key that is not
+// valid, and a region or an account it will not serve, with the 400 it gives a
+// malformed request, and only a malformed request fails the same everywhere.
+func refine(e *llm.Error) {
+	if e.Kind != llm.KindInvalidRequest {
+		return
+	}
+	var body struct {
+		Error map[string]json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(e.Body), &body) != nil {
+		return
+	}
+	var details []json.RawMessage
+	_ = json.Unmarshal(body.Error["details"], &details)
+	for _, raw := range details {
+		var d struct {
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(raw, &d) != nil {
+			continue
+		}
+		switch d.Reason {
+		case "API_KEY_INVALID", "API_KEY_EXPIRED":
+			e.Kind = llm.KindAuth
+			return
+		}
+	}
+	// The same status names a request that is not ready, such as one naming a
+	// file still being processed, so only a region or billing refusal is the
+	// account's.
+	var status string
+	if json.Unmarshal(body.Error["status"], &status) != nil || status != "FAILED_PRECONDITION" {
+		return
+	}
+	said := strings.ToLower(e.Message)
+	if strings.Contains(said, "user location") || strings.Contains(said, "billing") {
+		e.Kind = llm.KindPermission
+	}
+}
+
 func (p *Provider) passKey(r *llm.PassRequest) string {
 	if p.opts.APIKey != "" {
 		return p.opts.APIKey
@@ -644,14 +729,19 @@ func (p *Provider) passKey(r *llm.PassRequest) string {
 
 func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassResponse, error) {
 	u := httpcore.JoinURL(p.opts.BaseURL, r.Path)
-	if r.Query != "" {
-		u += "?" + r.Query
+	q, err := httpcore.PassQuery(p.ID(), r.Query)
+	if err != nil {
+		return nil, err
+	}
+	if q != "" {
+		u += "?" + q
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, u, r.Body)
 	if err != nil {
 		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(), Message: err.Error()}
 	}
 	httpcore.ForwardPassthrough(req.Header, r.Header)
+	httpcore.Overlay(req.Header, p.opts.Header)
 	if key := p.passKey(r); key != "" && p.opts.Sign == nil {
 		req.Header.Set("x-goog-api-key", key)
 	}

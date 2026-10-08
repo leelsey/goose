@@ -4,13 +4,19 @@
 package goose
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 )
 
+// negotiate fits an attempt to what its backend can take. A link that would
+// have to strip the tools a request offers is reached only once every link
+// that carries them has been tried, so stripping them here is the chain's last
+// resort rather than its first.
 func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 	req := a.Request
 	var fatal llm.Diagnostics
@@ -49,6 +55,19 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 			Code: llm.DropToolCall, Class: llm.ClassContent, Stage: llm.StagePlan,
 			Severity: llm.SeverityFatal, Provider: a.Provider, Model: a.Model, Format: a.Format,
 			Detail: "this format has no field for a tool call, so a tool the model reached for could not be reported back",
+		})
+	}
+
+	if unheld(req, caps) {
+		detail := "the caller insists on a tool call, and the tools it could be made with do not reach this backend"
+		if forced(req.ToolChoice) && !caps.ToolChoice && offerOf(req).keptBy(caps, req.ExtraFrom).any() {
+			detail = "the caller insists on a tool call, and this backend cannot be told to make one"
+		}
+		fail(llm.Diagnostic{
+			Code: llm.DropToolDefinition, Class: llm.ClassCapability, Stage: llm.StagePlan,
+			Severity: llm.SeverityFatal, Provider: a.Provider, Model: a.Model,
+			Count: len(req.Tools), Field: "tool_choice",
+			Detail: detail,
 		})
 	}
 
@@ -103,10 +122,13 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 		})
 		req.MCPServers = nil
 	}
-	if req.ToolChoice != nil && (!caps.ToolChoice || len(req.Tools) == 0) {
+	// A tool server the backend dials is as much a tool as a definition is, and
+	// a choice over its tools alone governs them the same.
+	reached := offerOf(req).keptBy(caps, req.ExtraFrom).any()
+	if req.ToolChoice != nil && (!caps.ToolChoice || !reached) {
 		detail := "this backend does not honour a tool choice"
-		if len(req.Tools) == 0 {
-			detail = "no tool definition reached this backend, so the tool choice had nothing to name"
+		if !reached {
+			detail = "no tool reached this backend, so the tool choice had nothing to name"
 		}
 		a.Note(llm.Diagnostic{
 			Code: llm.DropToolDefinition, Class: llm.ClassCapability, Stage: llm.StagePlan,
@@ -177,11 +199,14 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 		})
 		req.Effort = ""
 	}
-	if !caps.ThinkingSignatures && stripSignatures(req) {
+	if n := stripSignatures(req, caps); n > 0 {
+		detail := "another vendor minted this signature and this backend refuses one it cannot verify, so the part was replayed without it"
+		if !caps.ThinkingSignatures {
+			detail = "this backend cannot verify a signature, so the part was replayed without one"
+		}
 		a.Note(llm.Diagnostic{
 			Code: llm.DropSignature, Class: llm.ClassContent, Stage: llm.StagePlan,
-			Severity: llm.SeverityLoss, Provider: a.Provider,
-			Detail: "this backend cannot verify a thinking signature, so the block was replayed without one",
+			Severity: llm.SeverityLoss, Provider: a.Provider, Count: n, Detail: detail,
 		})
 	}
 	if !caps.RedactedThinking && stripRedacted(req) {
@@ -242,6 +267,95 @@ func negotiate(a *llm.Attempt, caps llm.Capabilities) error {
 		})
 	}
 	return nil
+}
+
+// forced says a tool choice leaves the model no answer but a tool call. One
+// naming no tool is dropped as meaningless wherever it goes, so it forces
+// nothing.
+func forced(tc *llm.ToolChoice) bool {
+	return tc != nil && (tc.Mode == llm.ToolRequired || tc.Mode == llm.ToolSpecific && tc.Name != "")
+}
+
+// An offer is what a request hands the model to act with: the tools goose
+// models, the tool servers a backend dials for itself, and the tools that
+// travel as written for the one wire that knows them.
+type offer struct{ tools, servers, carried bool }
+
+func offerOf(req *llm.Request) offer {
+	_, carried := req.Extra["tools"]
+	return offer{tools: len(req.Tools) > 0, servers: len(req.MCPServers) > 0, carried: carried}
+}
+
+// keptBy is what of the offer a backend takes as it stands.
+func (o offer) keptBy(caps llm.Capabilities, extraFrom string) offer {
+	return offer{
+		tools:   o.tools && caps.Tools,
+		servers: o.servers && caps.MCPServers,
+		carried: o.carried && caps.Takes(extraFrom),
+	}
+}
+
+func (o offer) any() bool { return o.tools || o.servers || o.carried }
+
+// carries says a backend can take a request's tools as they stand and be held
+// to the call it insists on, if it insists on one. Where the caller's format
+// has no field for a tool call, none can: a backend that takes the tools is
+// refused there, and one that strips them serves.
+func carries(caps llm.Capabilities, req *llm.Request, renders llm.Renders) bool {
+	o := offerOf(req)
+	if o.tools && renders.Declared() && !renders.ToolCalls {
+		return false
+	}
+	return o.keptBy(caps, req.ExtraFrom) == o && !unheld(req, caps)
+}
+
+// unheld says a request insists on a tool call this backend cannot be held to:
+// it keeps none of the tools the call could be made with, or it cannot be told
+// to make one. A choice that travels as written reaches only a backend that
+// takes the wire it came from.
+func unheld(req *llm.Request, caps llm.Capabilities) bool {
+	if forced(req.ToolChoice) {
+		o := offerOf(req)
+		return o.any() && (!caps.ToolChoice || !o.keptBy(caps, req.ExtraFrom).any())
+	}
+	switch carriedChoice(req) {
+	case llm.ToolRequired, llm.ToolSpecific:
+		return !caps.Takes(req.ExtraFrom)
+	}
+	return false
+}
+
+// declined says the caller forbade a tool call, so a backend that strips the
+// tools takes nothing the answer would have used.
+func declined(req *llm.Request) bool {
+	if req.ToolChoice != nil {
+		return req.ToolChoice.Mode == llm.ToolNone
+	}
+	return carriedChoice(req) == llm.ToolNone
+}
+
+// carriedChoice reads a tool choice that travels as written beside the tools it
+// governs, as the mode goose would have read it as: one that names a tool
+// insists on that tool, and one that names a mode says which.
+func carriedChoice(req *llm.Request) llm.ToolMode {
+	raw, ok := req.Extra["tool_choice"]
+	if !ok {
+		return ""
+	}
+	var mode string
+	if json.Unmarshal(raw, &mode) == nil {
+		return llm.ToolMode(mode)
+	}
+	var named struct {
+		Mode string `json:"mode"`
+	}
+	if json.Unmarshal(raw, &named) != nil {
+		return ""
+	}
+	if named.Mode != "" {
+		return llm.ToolMode(named.Mode)
+	}
+	return llm.ToolSpecific
 }
 
 func hasImage(req *llm.Request) bool {
@@ -377,17 +491,47 @@ func hasParallelTools(req *llm.Request) bool {
 	return false
 }
 
-func stripSignatures(req *llm.Request) bool {
-	found := false
-	for _, m := range req.Messages {
-		for _, p := range m.Content {
-			if t, ok := p.(*llm.Thinking); ok && t.Signature != "" {
-				t.Signature = ""
-				found = true
+// stripSignatures takes off every signature the backend cannot verify, which is
+// all of them where it verifies none and those another family minted where it
+// does. One nobody attributed is left for the backend to judge. A part that
+// held nothing but its signature goes with it, and so does the name a foreign
+// backend gave a thinking block, which names nothing here either.
+func stripSignatures(req *llm.Request, caps llm.Capabilities) int {
+	n := 0
+	for i := range req.Messages {
+		kept := req.Messages[i].Content[:0]
+		for _, p := range req.Messages[i].Content {
+			sig, signer := wirecore.Signed(p)
+			foreign := caps.ThinkingSignatures && signer != "" && caps.Signer != "" && signer != caps.Signer
+			if sig == "" || caps.ThinkingSignatures && !foreign {
+				kept = append(kept, p)
+				continue
 			}
+			n++
+			switch v := p.(type) {
+			case *llm.Text:
+				v.Signature, v.Signer = "", ""
+				if v.Text == "" {
+					continue
+				}
+			case *llm.Thinking:
+				v.Signature, v.Signer = "", ""
+				if foreign {
+					v.ID = ""
+				}
+				if v.Text == "" && len(v.Redacted) == 0 && v.ID == "" {
+					continue
+				}
+			case *llm.ToolUse:
+				v.Signature, v.Signer = "", ""
+			case *llm.Image:
+				v.Signature, v.Signer = "", ""
+			}
+			kept = append(kept, p)
 		}
+		req.Messages[i].Content = kept
 	}
-	return found
+	return n
 }
 
 func stripRedacted(req *llm.Request) bool {

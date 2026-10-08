@@ -15,7 +15,7 @@ func frame(headers, payload []byte) []byte {
 	prelude := make([]byte, preludeLen)
 	binary.BigEndian.PutUint32(prelude[0:4], total)
 	binary.BigEndian.PutUint32(prelude[4:8], uint32(len(headers)))
-	table := crc32.MakeTable(crc32.Castagnoli)
+	table := crc32.IEEETable
 	binary.BigEndian.PutUint32(prelude[8:12], crc32.Checksum(prelude[:8], table))
 
 	body := append(append([]byte{}, prelude...), headers...)

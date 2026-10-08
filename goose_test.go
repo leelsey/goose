@@ -21,6 +21,7 @@ type stub struct {
 	err     error
 	resp    *llm.Response
 	frames  []*llm.Frame
+	models  []llm.Model
 	seenMod []string
 	calls   int
 	closed  bool
@@ -52,6 +53,15 @@ func (s *stub) Stream(_ context.Context, a *llm.Attempt) (*llm.Stream, error) {
 }
 
 func (s *stub) Close(context.Context) error { s.closed = true; return nil }
+
+func (s *stub) Models(context.Context) ([]llm.Model, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.models, nil
+}
+
+func (s *stub) Probe(context.Context) error { return s.err }
 
 func retryable(msg string) error {
 	return &llm.Error{Kind: llm.KindOverloaded, Message: msg, Sent: true, Retryable: true}
@@ -313,6 +323,35 @@ func TestStrictPolicyRefusesALossyAnswer(t *testing.T) {
 	}
 }
 
+// Strict refuses content that was lost, not a note saying nothing was: a block
+// carried through verbatim reached the caller whole. A field the answer had
+// nowhere to carry is lost, and is still refused.
+func TestStrictPolicyDeliversAnAnswerThatLostNothing(t *testing.T) {
+	answer := func(diags llm.Diagnostics) *llm.Response {
+		return &llm.Response{
+			Choices:     []llm.Choice{{Message: llm.Message{Content: []llm.Part{&llm.Text{Text: "ok"}}}, Stop: llm.StopEnd}},
+			Diagnostics: diags,
+		}
+	}
+	p := &stub{id: "only", resp: answer(llm.Diagnostics{{
+		Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageResponse,
+		Severity: llm.SeverityInfo, Field: "server_tool_use", Detail: "content block carried verbatim",
+	}})}
+	c, err := New(WithProvider(p), WithLossPolicy(llm.LossPolicy{Strict: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Chat(context.Background(), req()); err != nil {
+		t.Fatalf("err = %v: nothing was lost, so there was nothing to refuse", err)
+	}
+
+	p.resp = answer(wirecore.Unmodelled([]byte(`{"index":0,"stop_reason":"</s>"}`),
+		map[string]bool{"index": true}, "choice", nil))
+	if _, err := c.Chat(context.Background(), req()); !errors.Is(err, &llm.Error{Kind: llm.KindLoss}) {
+		t.Fatalf("err = %v: a field left behind is lost, and strict refuses a loss", err)
+	}
+}
+
 func TestDiscardedRetriesReachTheLedger(t *testing.T) {
 	p := &retrying{id: "only"}
 	mem := usage.NewMemory()
@@ -370,7 +409,7 @@ func (s *slow) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, error) 
 	if err != nil {
 		return nil, err
 	}
-	return wirecore.Synthesise(resp), nil
+	return wirecore.Synthesise(resp, a.Renders), nil
 }
 
 func TestLimitsTimeoutBoundsAnAttempt(t *testing.T) {
@@ -473,4 +512,54 @@ func TestAnUnboundedModelNameIsRefused(t *testing.T) {
 	if e := llm.AsError(err); e.Kind != llm.KindInvalidRequest {
 		t.Fatalf("kind = %q", e.Kind)
 	}
+}
+
+// A model listing or a readiness probe that fails has reached a backend, so
+// what it says is the vendor's like any other upstream failure — its body, or
+// its own address when the dial never landed — and redact withholds it here
+// as it does wherever else a call reaches an upstream.
+func TestModelsAndReadyHoldBackTheUpstreamsWordsWhenAskedTo(t *testing.T) {
+	const secret = "Your credit balance is too low ZZSECRET"
+	for name, failure := range map[string]error{
+		"a vendor's body": &llm.Error{
+			Kind: llm.KindPermission, Provider: "one", Status: 403, Sent: true,
+			Message: secret, Body: `{"error":{"message":"` + secret + `"}}`,
+		},
+		"a dial that never landed": errors.New(`Get "http://127.0.0.1:0/v1/models": dial tcp 127.0.0.1:0: ` + secret),
+	} {
+		_, diags := (&stub{id: "one", err: failure}).client(t).Models(context.Background(), true)
+		if got := diags.Find(llm.CapNoModelList); len(got) != 1 || strings.Contains(got[0].Detail, secret) {
+			t.Fatalf("%s: diagnostics = %+v: the upstream's own words reached a caller redaction was asked to keep them from", name, diags)
+		}
+		health, ok := (&stub{id: "one", err: failure}).client(t).Ready(context.Background(), true)
+		if ok || len(health) != 1 || strings.Contains(health[0].Err, secret) {
+			t.Fatalf("%s: health = %+v: the upstream's own words reached a caller redaction was asked to keep them from", name, health)
+		}
+	}
+}
+
+// goose's own refusal is not an upstream's words, so redact must not hold it
+// back the way it holds back a backend's own sentence.
+func TestModelsAndReadyKeepGoosesOwnRefusalUnderRedact(t *testing.T) {
+	own := &llm.Error{
+		Kind: llm.KindLoss, Code: llm.CapCeilingSupplied, Provider: "one",
+		Message: "translation would lose content: " + llm.CapCeilingSupplied,
+	}
+	_, diags := (&stub{id: "one", err: own}).client(t).Models(context.Background(), true)
+	if got := diags.Find(llm.CapNoModelList); len(got) != 1 || !strings.Contains(got[0].Detail, llm.CapCeilingSupplied) {
+		t.Fatalf("diagnostics = %+v: goose's own refusal was redacted like an upstream's words", diags)
+	}
+	health, _ := (&stub{id: "one", err: own}).client(t).Ready(context.Background(), true)
+	if len(health) != 1 || !strings.Contains(health[0].Err, llm.CapCeilingSupplied) {
+		t.Fatalf("health = %+v: goose's own refusal was redacted like an upstream's words", health)
+	}
+}
+
+func (s *stub) client(t *testing.T) *Client {
+	t.Helper()
+	c, err := New(WithProvider(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

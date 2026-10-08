@@ -35,7 +35,7 @@ func (c *Codec) Routes() []wire.Route {
 
 func (c *Codec) Renders() wire.Renders {
 	return wire.Renders{Thinking: true,
-		ToolCalls: true, Images: true, Candidates: 8,
+		ToolCalls: true, Images: true, Candidates: 8, Raw: []string{Name},
 	}
 }
 

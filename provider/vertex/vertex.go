@@ -68,6 +68,11 @@ func New(o Options) (llm.Provider, error) {
 	if o.Region == "" {
 		o.Region = defaultRegion
 	}
+	// The region is spliced into the host and the path a call and its token
+	// go to, so a character no region's name has could move them elsewhere.
+	if strings.Trim(o.Region, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" {
+		return nil, llm.Errorf(llm.KindInvalidRequest, "vertex: region %q is not a region's name", o.Region)
+	}
 	if o.BaseURL == "" {
 		// Only a regional endpoint takes the region as a prefix; the global one
 		// is the bare host, and "global-aiplatform.googleapis.com" is nobody.
@@ -129,6 +134,9 @@ func surface(o Options, publisher, id, prefix string,
 			ID: id, BaseURL: o.BaseURL, Model: o.Model,
 			MaxRetries: o.MaxRetries, Timeout: o.Timeout, Header: o.Header, Sign: sign,
 			NoConnectors: true,
+			// Vertex takes only some of Anthropic's betas and refuses the rest,
+			// and a caller speaking Anthropic's API sends the first party's.
+			NoClientBetas: true,
 			Path: func(a *llm.Attempt, stream bool) string {
 				action := "rawPredict"
 				if stream {

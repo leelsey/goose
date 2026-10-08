@@ -4,6 +4,7 @@
 package httpcore
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -19,7 +20,7 @@ func TestUpstreamReadsEveryVendorShape(t *testing.T) {
 	}{
 		{"openai", `{"error":{"message":"You exceeded your quota","type":"insufficient_quota","code":"quota"}}`, "You exceeded your quota", "quota"},
 		{"anthropic", `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`, "Overloaded", "overloaded_error"},
-		{"google", `{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}`, "Resource exhausted", "429"},
+		{"google", `{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}`, "Resource exhausted", "RESOURCE_EXHAUSTED"},
 		{"ollama", `{"error":"model 'x' not found"}`, "model 'x' not found", ""},
 		{"aws", `{"__type":"com.amazon#ThrottlingException","message":"Rate exceeded"}`, "Rate exceeded", "ThrottlingException"},
 		{"cloudflare", `{"success":false,"errors":[{"code":7003,"message":"Could not route"}]}`, "Could not route", "7003"},
@@ -113,5 +114,33 @@ func TestAClippedMessageIsStillText(t *testing.T) {
 	got := clip(long)
 	if !utf8.ValidString(got) {
 		t.Fatalf("clip cut a character in half: %q", got[len(got)-12:])
+	}
+}
+
+// Gemini sends the status again as a number beside the name of the failure, and
+// the name is what tells a bad key from a bad request.
+func TestAVendorsNameForAFailureIsKeptOverItsNumber(t *testing.T) {
+	for _, tc := range []struct{ body, want string }{
+		{`{"error":{"code":400,"message":"API key not valid.","status":"INVALID_ARGUMENT"}}`, "INVALID_ARGUMENT"},
+		{`{"error":{"message":"bad grammar","type":"BadRequestError","code":400}}`, "BadRequestError"},
+		{`{"error":{"message":"Overloaded","type":503}}`, "503"},
+		{`{"message":"no","code":7,"status":"DENIED"}`, "DENIED"},
+		{`{"errors":[{"message":"Could not route","code":7003}]}`, "7003"},
+	} {
+		if _, got := Upstream([]byte(tc.body)); got != tc.want {
+			t.Errorf("Upstream(%s) code = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestACodeIsReadAsANameOrANumber(t *testing.T) {
+	var got struct {
+		A, B, C, D Code
+	}
+	if err := json.Unmarshal([]byte(`{"A":"quota","B":400,"C":null,"D":{"x":1}}`), &got); err != nil {
+		t.Fatalf("err = %v: a code of an unexpected shape must not cost the message beside it", err)
+	}
+	if got.A != "quota" || got.B != "400" || got.C != "" || got.D != "" {
+		t.Fatalf("codes = %+v", got)
 	}
 }

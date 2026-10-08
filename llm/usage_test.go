@@ -45,6 +45,16 @@ func TestSettleClampsFiveMinuteWrite(t *testing.T) {
 	}
 }
 
+func TestSettleClampsHourWriteToWhatFiveMinutesLeft(t *testing.T) {
+	u := RawUsage{Prompt: 1000, CacheWrite: 800, CacheWrite5m: 300, CacheWrite1h: 800}.Normalise()
+	if u.CacheWrite1h != 500 {
+		t.Fatalf("cache_write_1h = %d, want 500", u.CacheWrite1h)
+	}
+	if !hasAnomaly(u, AnomalyCacheSplit) {
+		t.Fatal("clamped split must be recorded, not silently corrected")
+	}
+}
+
 func TestSettleMarksImpossiblePromptBreakdown(t *testing.T) {
 	u := Usage{Prompt: 5, CacheRead: 10}.settle()
 	if _, ok := u.Uncached(); ok {

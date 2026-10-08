@@ -42,6 +42,7 @@ func (c *Codec) Renders() wire.Renders {
 		Thinking:   true,
 		ToolCalls:  true,
 		Candidates: 1,
+		Raw:        []string{Name},
 	}
 }
 
@@ -58,8 +59,12 @@ func stopName(s llm.StopReason) (string, bool) {
 	switch s {
 	case llm.StopEnd:
 		return "end_turn", true
-	case llm.StopLength, llm.StopContextOverflow:
+	case llm.StopLength:
 		return "max_tokens", true
+	case llm.StopContextOverflow:
+		// Read as max_tokens, it would have a client raise a ceiling where
+		// what it needs is a smaller context.
+		return "model_context_window_exceeded", true
 	case llm.StopSequence:
 		return "stop_sequence", true
 	case llm.StopToolUse:
@@ -101,6 +106,7 @@ func DecodeUsage(u wireUsage) llm.Usage {
 	}
 	if u.CacheCreation != nil {
 		raw.CacheWrite5m = u.CacheCreation.Ephemeral5m
+		raw.CacheWrite1h = u.CacheCreation.Ephemeral1h
 		if raw.CacheWrite == 0 {
 			raw.CacheWrite = u.CacheCreation.Ephemeral5m + u.CacheCreation.Ephemeral1h
 		}
@@ -118,11 +124,14 @@ func encodeUsage(u llm.Usage) wireUsage {
 	if n, ok := u.Uncached(); ok {
 		out.Input = n
 	}
-	if u.CacheWrite5m > 0 || u.CacheWrite > 0 {
+	// Most backends report a write without saying how long it lasts. The split
+	// is written only as the backend measured it: a share made up for it would
+	// be priced at a lifetime nobody chose.
+	if u.CacheWrite5m > 0 || u.CacheWrite1h > 0 {
 		out.CacheCreation = &struct {
 			Ephemeral5m int `json:"ephemeral_5m_input_tokens,omitempty"`
 			Ephemeral1h int `json:"ephemeral_1h_input_tokens,omitempty"`
-		}{Ephemeral5m: u.CacheWrite5m, Ephemeral1h: u.CacheWrite - u.CacheWrite5m}
+		}{Ephemeral5m: u.CacheWrite5m, Ephemeral1h: u.CacheWrite1h}
 	}
 	return out
 }

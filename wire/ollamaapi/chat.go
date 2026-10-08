@@ -222,7 +222,7 @@ func (c *Chat) message(parts []llm.Part, format string) (*outMessage, llm.Diagno
 		case *llm.ToolUse:
 			tc := outToolCall{}
 			tc.Function.Name = v.Name
-			tc.Function.Arguments = argsObject(v.Args)
+			tc.Function.Arguments = argsObject(v, format, &diags)
 			out.ToolCalls = append(out.ToolCalls, tc)
 		case *llm.Image:
 			diags = append(diags, drop(format, llm.DropImage, "an assistant image has no field on this wire"))
@@ -233,16 +233,26 @@ func (c *Chat) message(parts []llm.Part, format string) (*outMessage, llm.Diagno
 		}
 	}
 	if refusal != "" {
+		diags = append(diags, refusalAsText(format))
 		if out.Content != "" {
 			out.Content += "\n\n"
 		}
 		out.Content += refusal
 	}
+	if n := signed(parts); n > 0 {
+		diags = append(diags, unsignedParts(format, n))
+	}
 	return out, diags
 }
 
-func argsObject(raw json.RawMessage) json.RawMessage {
-	return wirecore.ObjectArgs(raw)
+func argsObject(t *llm.ToolUse, format string, diags *llm.Diagnostics) json.RawMessage {
+	args, broken := wirecore.ObjectArgsBroken(t.Args)
+	if broken {
+		d := drop(format, llm.DropToolCall, "this call's arguments did not survive, so it travelled with none rather than with what was meant")
+		d.Field = t.Name
+		diags.Note(d)
+	}
+	return args
 }
 
 func (c *Chat) EncodeResponse(resp *llm.Response, opts wire.Options) (*wire.Outbound, llm.Diagnostics, error) {
@@ -304,6 +314,7 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 	var pendingTools []*llm.ToolUse
 	merger := wirecore.NewToolMerger()
 	var streamErr error
+	checked := 0
 	// An unmodelled field rides one chunk: the one its own frame produced, or
 	// the next chunk out where that frame produced none. Repeating it on every
 	// later chunk re-sends the upstream's bytes per delta; dropping it loses
@@ -329,6 +340,12 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 		}
 		msg := &outMessage{Role: "assistant"}
 		emit := false
+		// Noted here, before this frame's Check, rather than accumulated for
+		// one diagnostic at the end: a loss the policy will not take must be
+		// caught before what it lost is written, not after.
+		if n := signed(fr.Delta); n > 0 {
+			diags = append(diags, unsignedParts(NameChat, n))
+		}
 		for _, p := range fr.Delta {
 			switch v := p.(type) {
 			case *llm.Text:
@@ -338,12 +355,16 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 			case *llm.Thinking:
 				msg.Thinking += v.Text
 				emit = emit || v.Text != ""
+				if len(v.Redacted) > 0 {
+					diags = append(diags, drop(NameChat, llm.DropThinking, "redacted thinking has no field on this wire"))
+				}
 			case *llm.Refusal:
 				// The whole-answer path parts a refusal from the text before it,
 				// and a reader accumulating these chunks must arrive at the same
 				// words, whether or not a frame boundary falls between them.
 				if !refusing {
 					refusing = true
+					diags = append(diags, refusalAsText(NameChat))
 					if sentContent {
 						msg.Content += "\n\n"
 					}
@@ -356,10 +377,18 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 				pendingTools = merger.Tools()
 			case *llm.Image:
 				diags = append(diags, drop(NameChat, llm.DropImage, "an assistant image has no field on this wire"))
+			case *llm.ToolResult:
+				diags = append(diags, drop(NameChat, llm.DropToolResult, "a tool result cannot ride on an assistant message"))
 			case *llm.Raw:
 				diags = append(diags, drop(NameChat, llm.DropUnknownBlock, "content block "+v.Type+" has no shape on this wire"))
 			}
 		}
+		// What a frame loses here is known before any of it is written, so a
+		// loss the stream's policy will not take is refused in its place.
+		if streamErr = s.Check(diags[checked:]); streamErr != nil {
+			break
+		}
+		checked = len(diags)
 		if emit {
 			if err := send(chatBody{Model: model, CreatedAt: stamp(c.opts.now()), Message: msg}, fr.Extra); err != nil {
 				return diags, err
@@ -388,14 +417,13 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 
 	final := chatBody{Model: model, CreatedAt: stamp(c.opts.now()), Done: true, wireUsage: encodeUsage(s.Usage())}
 	diags = append(diags, s.Usage().Uncarried(NameChat)...)
-	last := &outMessage{Role: "assistant"}
+	var tailCalls []outToolCall
 	for _, t := range pendingTools {
 		tc := outToolCall{}
 		tc.Function.Name = t.Name
-		tc.Function.Arguments = argsObject(t.Args)
-		last.ToolCalls = append(last.ToolCalls, tc)
+		tc.Function.Arguments = argsObject(t, NameChat, &diags)
+		tailCalls = append(tailCalls, tc)
 	}
-	final.Message = last
 	reason, clean := doneReason(stop)
 	if !clean {
 		diags = append(diags, llm.Diagnostic{
@@ -405,6 +433,24 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 		})
 	}
 	final.Reason = reason
+	if merger.Overflowed() {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.WireBufferFull, Class: llm.ClassContent, Stage: llm.StageEncode,
+			Severity: llm.SeverityLoss, Format: NameChat,
+			Detail: "the tool arguments outgrew what one turn may hold, so the call is short of what was streamed",
+		})
+	}
+	if streamErr == nil {
+		streamErr = s.Check(diags[checked:])
+	}
+	// A refusal found only here, or one already open, means the calls built
+	// above are exactly what were refused; they must not follow the error
+	// onto the wire.
+	last := &outMessage{Role: "assistant"}
+	if streamErr == nil {
+		last.ToolCalls = tailCalls
+	}
+	final.Message = last
 	if streamErr != nil {
 		e := llm.AsError(streamErr)
 		final.Reason = "error"
@@ -414,13 +460,6 @@ func (c *Chat) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Option
 		diags = append(diags, llm.Diagnostic{
 			Code: llm.WireErrorInBody, Class: llm.ClassTransport, Stage: llm.StageEncode,
 			Severity: llm.SeverityLoss, Format: NameChat, Detail: e.Message,
-		})
-	}
-	if merger.Overflowed() {
-		diags = append(diags, llm.Diagnostic{
-			Code: llm.WireBufferFull, Class: llm.ClassContent, Stage: llm.StageEncode,
-			Severity: llm.SeverityLoss, Format: NameChat,
-			Detail: "the tool arguments outgrew what one turn may hold, so the call is short of what was streamed",
 		})
 	}
 	if err := send(final, nil); err != nil {

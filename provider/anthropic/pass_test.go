@@ -46,3 +46,39 @@ func TestPassthroughCarriesTheSignature(t *testing.T) {
 		t.Errorf("x-api-key = %q, want nothing: a signed backend mints its own credential", key)
 	}
 }
+
+// A gateway that admits a routed call on a configured header admits an
+// unrouted one on the same, and the configured betas are asked for on both. A
+// key in the query is the gate's or another vendor's, and goes no further.
+func TestAPassthroughCarriesWhatTheOperatorConfigured(t *testing.T) {
+	var seen *http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p, err := New(Options{BaseURL: srv.URL, APIKey: "operator-key", Betas: []string{"b1", "b2"},
+		Header: http.Header{"X-Gateway-Auth": {"gw-secret"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := p.Pass(context.Background(), &llm.PassRequest{
+		Method: http.MethodPost, Path: "/v1/messages/count_tokens", Query: "key=GATE&beta=true",
+		Header: http.Header{"Anthropic-Beta": {"b2,own"}, "X-Gateway-Auth": {"forged"}},
+		Body:   strings.NewReader("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := seen.Header.Values("X-Gateway-Auth"); len(got) != 1 || got[0] != "gw-secret" {
+		t.Errorf("X-Gateway-Auth = %q", got)
+	}
+	if got := strings.Join(seen.Header.Values("anthropic-beta"), ","); got != "b2,own,b1" {
+		t.Errorf("anthropic-beta = %q: each beta once, the caller's kept", got)
+	}
+	if seen.URL.RawQuery != "beta=true" {
+		t.Errorf("query = %q", seen.URL.RawQuery)
+	}
+}

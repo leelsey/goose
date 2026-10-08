@@ -100,6 +100,34 @@ func TestStrictPromotesContentAndNotCapability(t *testing.T) {
 	}
 }
 
+// Strict refuses content that was lost. A block carried through verbatim lost
+// nothing, and a caller who denies the code by name still refuses it.
+func TestStrictLeavesANoteThatLostNothingAlone(t *testing.T) {
+	verbatim := Diagnostic{
+		Code: DropUnknownBlock, Class: ClassContent, Severity: SeverityInfo,
+		Detail: "content block carried verbatim",
+	}
+	if got := (LossPolicy{Strict: true}).Apply(verbatim).Severity; got != SeverityInfo {
+		t.Fatalf("severity = %v: nothing was lost", got)
+	}
+	if err := (LossPolicy{Deny: []string{DropUnknownBlock}}).Check([]Diagnostic{verbatim}); err == nil {
+		t.Fatal("a code the caller denies is refused whatever severity it came with")
+	}
+}
+
+// A site reporting a drop at info still dropped it: thinking that could not be
+// replayed without its signature was not sent at all, and strict refuses that
+// as it always has.
+func TestStrictStillRefusesContentReportedAtInfo(t *testing.T) {
+	unsigned := Diagnostic{
+		Code: DropSignature, Class: ClassContent, Stage: StageRequest, Severity: SeverityInfo,
+		Detail: "thinking without its signature cannot be replayed to this backend",
+	}
+	if err := (LossPolicy{Strict: true}).Check([]Diagnostic{unsigned}); err == nil {
+		t.Fatal("strict delivered an answer to a conversation whose thinking was left out")
+	}
+}
+
 func TestEveryDeclaredCodeIsOnTheList(t *testing.T) {
 	src, err := os.ReadFile("diagnostic.go")
 	if err != nil {

@@ -62,7 +62,11 @@ type Error struct {
 
 	Status     int
 	RetryAfter time.Duration
-	Body       string
+	// Body is what the upstream sent to say it failed: a refusal's body, a 200
+	// carrying an error, or a stream's error frame. It being set is what marks
+	// Message as the upstream's words rather than goose's, so an adapter that
+	// reads a failure out of what a backend sent sets it whatever the status.
+	Body string
 
 	Sent      bool
 	Retryable bool
@@ -121,7 +125,7 @@ func RetryableStatus(status int) bool {
 
 func KindForStatus(status int) ErrorKind {
 	switch {
-	case status == 400, status == 422:
+	case status == 400, status == 413, status == 422:
 		return KindInvalidRequest
 	case status == 401:
 		return KindAuth

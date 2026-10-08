@@ -70,6 +70,28 @@ func TestTargetsInheritTheRuleModelThenTheRequest(t *testing.T) {
 	if dec.Targets[0].Model != "rule-model" || dec.Targets[1].Model != "target-model" {
 		t.Fatalf("targets = %+v", dec.Targets)
 	}
+	if dec.Targets[0].FromCall || dec.Targets[1].FromCall {
+		t.Fatalf("targets = %+v: the operator named these models, not the caller", dec.Targets)
+	}
+}
+
+// A model nobody on the route named is the caller's, and a backend that does
+// not have it is refusing that caller, not failing everyone else.
+func TestAModelLeftToTheCallerIsMarkedAsTheCallers(t *testing.T) {
+	tbl := &Table{Rules: []Rule{{
+		Match: Always(),
+		Chain: []Target{{Provider: "a"}, {Provider: "b", Model: "target-model"}},
+	}}}
+	dec, err := tbl.Route(&Call{Model: "asked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dec.Targets[0]; got.Model != "asked" || !got.FromCall {
+		t.Fatalf("target = %+v: the model came from the call", got)
+	}
+	if dec.Targets[1].FromCall {
+		t.Fatalf("target = %+v: the operator named this one", dec.Targets[1])
+	}
 }
 
 func TestMatchersCompose(t *testing.T) {

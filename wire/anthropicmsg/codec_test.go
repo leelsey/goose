@@ -6,6 +6,8 @@ package anthropicmsg
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +140,23 @@ func TestEncodeAlwaysCarriesUsage(t *testing.T) {
 	}
 	if !strings.Contains(string(out.Body), `"usage"`) {
 		t.Fatalf("body = %s: a missing usage key reads as a backend that said nothing", out.Body)
+	}
+}
+
+// An answer on this wire has no image block, so an assistant image is lost and
+// said to be, unstreamed as it is streamed, rather than written as a block an
+// Anthropic SDK has no type for.
+func TestAnAssistantImageIsLostUnstreamedAsStreamed(t *testing.T) {
+	resp := &llm.Response{Choices: []llm.Choice{{
+		Message: llm.Message{Content: []llm.Part{&llm.Text{Text: "here"}, &llm.Image{MIME: "image/png", Data: []byte("x")}}},
+		Stop:    llm.StopEnd,
+	}}}
+	out, diags, err := New(Options{}).EncodeResponse(resp, wire.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out.Body), `"image"`) || !diags.Has(llm.DropImage) {
+		t.Fatalf("body = %s, diagnostics = %v", out.Body, diags.Codes())
 	}
 }
 
@@ -459,5 +478,142 @@ func TestRedactedThinkingSurvivesEveryBackend(t *testing.T) {
 	}
 	if out.Data != string(raw) {
 		t.Fatalf("data = %q, want %q", out.Data, raw)
+	}
+}
+
+func TestAdaptiveThinkingIsThinkingTheModelSizes(t *testing.T) {
+	r, _, diags := decode(t, `{"model":"claude","max_tokens":4000,
+		"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"}}`)
+	if r.Thinking == nil || !r.Thinking.Enabled || !r.Thinking.Adaptive || r.Thinking.Budget != -1 {
+		t.Fatalf("thinking = %+v: this wire's own mode for current models reached no backend", r.Thinking)
+	}
+	if diags.Has(llm.DropExtraField) {
+		t.Fatalf("diagnostics = %+v", diags)
+	}
+}
+
+func TestACacheWriteWithNoSplitIsNotCalledAnHour(t *testing.T) {
+	raw, err := json.Marshal(encodeUsage(llm.Usage{Prompt: 1000, CacheWrite: 800, Reported: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"cache_creation_input_tokens":800`) {
+		t.Fatalf("usage = %s: the write itself was measured", raw)
+	}
+	if strings.Contains(string(raw), "ephemeral_1h") {
+		t.Fatalf("usage = %s: a lifetime nobody reported was written, at the dearer rate", raw)
+	}
+	for _, measured := range []string{
+		`{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":500}`,
+		`{"ephemeral_1h_input_tokens":800}`,
+	} {
+		var start, delta wireUsage
+		if err := json.Unmarshal([]byte(`{"input_tokens":10,"cache_creation_input_tokens":800,"cache_creation":`+measured+`}`), &start); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(`{"output_tokens":5}`), &delta); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(encodeUsage(DecodeUsage(start).Merge(DecodeUsage(delta))).CacheCreation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != measured {
+			t.Fatalf("cache creation = %s, want %s: the split this backend measured travels as it measured it", raw, measured)
+		}
+	}
+}
+
+func TestASignatureOnlyTextIsNotAnEmptyBlock(t *testing.T) {
+	blocks, diags := EncodeBlocks([]llm.Part{&llm.Text{Text: "ok"}, &llm.Text{Signature: "SIG"}})
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %s: this wire refuses an empty text block", blocks)
+	}
+	if len(diags) != 1 || diags[0].Code != llm.DropSignature {
+		t.Fatalf("diagnostics = %+v: the signature it carried has no field here, and its loss is said", diags)
+	}
+}
+
+func TestStreamReportsWhatItFlattenedOrEmptied(t *testing.T) {
+	i0 := 0
+	s := llm.StaticStream(llm.StreamMeta{ID: "msg_1", Model: "claude"}, []*llm.Frame{
+		{Delta: []llm.Part{&llm.Refusal{Text: "I can't "}}},
+		{Delta: []llm.Part{&llm.Refusal{Text: "help with that."}}},
+		{Delta: []llm.Part{&llm.ToolUse{Index: &i0, ID: "t", Name: "f", Args: json.RawMessage(`{"a":`)}}},
+		{Stop: llm.StopEnd},
+	})
+	diags, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, &wire.BufferWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(diags.Find(llm.DropRefusal)); n != 1 {
+		t.Fatalf("drop.refusal noted %d times: the unstreamed answer says so once, and so must this", n)
+	}
+	if !diags.Has(llm.DropToolCall) {
+		t.Fatalf("diagnostics = %+v: a call sent with none of its arguments is a call that changed", diags)
+	}
+}
+
+// An image kept in the Files API is a name only the backend holding the file
+// can resolve. Read as an image it has neither bytes nor an address and is sent
+// as nothing, even to that backend.
+func TestAFilesImageTravelsAsTheReferenceItIs(t *testing.T) {
+	r, _, diags := decode(t, `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+		{"type":"image","source":{"type":"file","file_id":"file_abc"}},
+		{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"file","file_id":"file_def"}}]}]}]}`)
+	raw, ok := r.Messages[0].Content[0].(*llm.Raw)
+	if !ok || raw.Vendor != Name || raw.Type != "image" {
+		t.Fatalf("image = %#v: it must travel as the reference it is", r.Messages[0].Content[0])
+	}
+	if !diags.Has(llm.DropUnknownBlock) {
+		t.Fatalf("diagnostics = %v: carrying a block whole is recorded", diags.Codes())
+	}
+	blocks, d := EncodeBlocks(r.Messages[0].Content)
+	if d.Has(llm.DropImage) || len(blocks) != 2 {
+		t.Fatalf("blocks = %s, diagnostics = %v", blocks, d.Codes())
+	}
+	for i, id := range []string{"file_abc", "file_def"} {
+		if !strings.Contains(string(blocks[i]), `"source":{"type":"file","file_id":"`+id+`"}`) {
+			t.Errorf("block %d = %s: the file reference did not survive", i, blocks[i])
+		}
+	}
+}
+
+// A field this wire opens with a beta flag is refused without it, so the flags
+// the caller sent travel with its request, once each.
+func TestTheCallersBetasTravelWithItsRequest(t *testing.T) {
+	req, _, _, err := New(Options{}).Decode(&wire.Inbound{
+		Header: http.Header{"Anthropic-Beta": {"files-api-2025-04-14, context-management-2025-06-27", "files-api-2025-04-14,"}},
+		Body:   []byte(`{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(req.Betas, ","); got != "files-api-2025-04-14,context-management-2025-06-27" {
+		t.Fatalf("betas = %q", got)
+	}
+}
+
+// De-duplicating the header must stay linear in the number of distinct
+// values: a scan of what has been kept so far, repeated per value, turns a
+// caller's own header into a CPU bill for every request holding a
+// concurrency slot. Regression test for r3-wire-6.
+func TestBetaHeaderDeduplicationIsNotQuadratic(t *testing.T) {
+	const n = 60000
+	values := make([]string, n)
+	for i := range values {
+		values[i] = "flag-" + strconv.Itoa(i)
+	}
+	in := &wire.Inbound{Header: http.Header{"Anthropic-Beta": {strings.Join(values, ",")}}}
+
+	start := time.Now()
+	out := betas(in)
+	elapsed := time.Since(start)
+
+	if len(out) != n {
+		t.Fatalf("betas = %d values, want %d", len(out), n)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("betas took %s for %d distinct values: de-duplication must not be quadratic", elapsed, n)
 	}
 }

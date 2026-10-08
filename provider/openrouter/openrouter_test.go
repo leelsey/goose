@@ -76,6 +76,39 @@ func TestUnsetHeadersAreNotSent(t *testing.T) {
 	}
 }
 
+// OpenRouter refuses a model id it does not have with the 400 a malformed
+// request gets. Only a malformed request fails the same on every backend, so
+// the chain must be able to walk on past the rest.
+func TestAModelOpenRouterDoesNotHaveIsNotAMalformedRequest(t *testing.T) {
+	for body, want := range map[string]llm.ErrorKind{
+		`{"error":{"message":"claude-sonnet-5 is not a valid model ID","code":400}}`: llm.KindNotFound,
+		`{"error":{"message":"'model' must be a string","code":400}}`:                llm.KindInvalidRequest,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(body))
+		}))
+		p, err := New(Options{BaseURL: srv.URL, APIKey: "sk"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := &llm.Attempt{
+			Model:    "claude-sonnet-5",
+			Request:  &llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}}},
+			Recorder: llm.NopRecorder{},
+		}
+		_, err = p.Complete(context.Background(), a)
+		if e := llm.AsError(err); e.Kind != want {
+			t.Errorf("unary %s: err = %+v, want %s", body, e, want)
+		}
+		_, err = p.Stream(context.Background(), a)
+		if e := llm.AsError(err); e.Kind != want {
+			t.Errorf("stream %s: err = %+v, want %s", body, e, want)
+		}
+		srv.Close()
+	}
+}
+
 func TestPinnedVendorsTravelOnEveryRequest(t *testing.T) {
 	var body string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

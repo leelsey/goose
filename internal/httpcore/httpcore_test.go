@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +69,26 @@ func TestUnsentFailuresAreNotBooked(t *testing.T) {
 	}
 	if booked != 0 {
 		t.Fatal("a request that never left the process was booked as billed")
+	}
+}
+
+func TestADeadlineThatEndsWhileSigningIsATimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	c := &Caller{Provider: "stub"}
+	_, err := c.Do(ctx, Request{
+		URL: "http://127.0.0.1:1",
+		Sign: func(ctx context.Context, _ *http.Request, _ []byte) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	e := llm.AsError(err)
+	if e == nil || e.Kind != llm.KindTimeout {
+		t.Fatalf("err = %+v: a credential still on its way when time ran out is not a refused key", e)
+	}
+	if e.Sent {
+		t.Fatal("nothing left the process, so nothing was billed")
 	}
 }
 
@@ -175,6 +196,8 @@ func TestAPassthroughCarriesNoCredentialItWasGiven(t *testing.T) {
 		"X-Goog-Api-Key":      {"google-key"},
 		"Api-Key":             {"azure-key"},
 		"X-Goog-User-Project": {"someone"},
+		"Openai-Organization": {"org-caller"},
+		"Openai-Project":      {"proj-caller"},
 		"Cookie":              {"session=1"},
 		"Host":                {"proxy.example"},
 		"Content-Length":      {"12"},
@@ -187,7 +210,8 @@ func TestAPassthroughCarriesNoCredentialItWasGiven(t *testing.T) {
 
 	for _, gone := range []string{
 		"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Api-Key",
-		"X-Goog-User-Project", "Cookie", "Host", "Content-Length", "Connection",
+		"X-Goog-User-Project", "OpenAI-Organization", "OpenAI-Project",
+		"Cookie", "Host", "Content-Length", "Connection",
 	} {
 		if dst.Get(gone) != "" {
 			t.Errorf("%s reached the backend", gone)
@@ -197,5 +221,64 @@ func TestAPassthroughCarriesNoCredentialItWasGiven(t *testing.T) {
 		if dst.Get(kept) == "" {
 			t.Errorf("%s belongs to the message and was dropped", kept)
 		}
+	}
+}
+
+// The gate takes a key in the query, and a backend handed one there keeps it in
+// its logs with the rest of the address.
+func TestAPassthroughQueryCarriesNoCredential(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{"alt=sse&n=1", "alt=sse&n=1"},
+		{"key=GATE&alt=sse", "alt=sse"},
+		{"KEY=GATE", ""},
+		{"api_key=a&api-key=b&access_token=c&limit=2", "limit=2"},
+		{"n=1&key=a&key=b", "n=1"},
+	} {
+		got, err := PassQuery("p", tc.in)
+		if err != nil {
+			t.Fatalf("PassQuery(%q) = %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("PassQuery(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if _, err := PassQuery("p", "key=GATE;alt=sse"); llm.AsError(err).Kind != llm.KindInvalidRequest {
+		t.Fatalf("err = %v: a query nobody can read may carry a key nobody can find", err)
+	}
+}
+
+func TestAConfiguredHeaderIsTheOperators(t *testing.T) {
+	dst := http.Header{"X-Gateway-Auth": {"from-the-caller"}, "X-Trace": {"t"}}
+	Overlay(dst, http.Header{"X-Gateway-Auth": {"gw-secret"}, "X-Extra": {"a", "b"}})
+	if got := dst.Values("X-Gateway-Auth"); len(got) != 1 || got[0] != "gw-secret" {
+		t.Fatalf("X-Gateway-Auth = %q: the operator set it for this backend", got)
+	}
+	if len(dst.Values("X-Extra")) != 2 || dst.Get("X-Trace") != "t" {
+		t.Fatalf("header = %+v", dst)
+	}
+}
+
+func TestARefusalIsReadForWhatItsStatusDoesNotSay(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"key not valid"}}`))
+	}))
+	defer srv.Close()
+
+	c := &Caller{Provider: "p", HTTP: srv.Client(), Refine: func(e *llm.Error) {
+		if strings.Contains(e.Body, "key not valid") {
+			e.Kind = llm.KindAuth
+		}
+	}}
+	_, err := c.Do(context.Background(), Request{URL: srv.URL})
+	if e := llm.AsError(err); e.Kind != llm.KindAuth || e.Status != http.StatusBadRequest {
+		t.Fatalf("err = %+v", e)
+	}
+}
+
+func TestAnErrorKeepsNoMoreOfAnInBandBodyThanOfARefusal(t *testing.T) {
+	if got := ErrorBody(make([]byte, errBodyCap*2)); len(got) != errBodyCap {
+		t.Fatalf("kept %d bytes, want %d", len(got), errBodyCap)
 	}
 }

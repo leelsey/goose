@@ -8,10 +8,13 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +39,12 @@ type Options struct {
 	APIKey     string
 	CORS       bool
 	CORSOrigin string
+	// Host is the name or address the listener is bound to, with or without
+	// its port. On a loopback one with no APIKey and no ForwardedHeader, a
+	// request addressed to a name that does not mean this machine is refused,
+	// since that is what a page sends once it has pointed a name of its own at
+	// 127.0.0.1.
+	Host string
 
 	MaxBody         int64
 	Logger          *slog.Logger
@@ -59,13 +68,15 @@ type Server struct {
 
 	inflight *gate
 	rate     *limiter
-	byPath   map[string]wire.Codec
-	byPrefix map[string]wire.Codec
+	byRoute  map[string]wire.Codec
 
 	probeMu   sync.Mutex
 	probeAt   time.Time
 	probeHeld []goose.Health
 	probeOK   bool
+
+	turnedMu sync.Mutex
+	turned   map[string]bool
 }
 
 func New(c *goose.Client, o Options) (*Server, error) {
@@ -88,6 +99,10 @@ func New(c *goose.Client, o Options) (*Server, error) {
 		if o.CORSOrigin == "*" && o.APIKey == "" {
 			return nil, llm.Errorf(llm.KindInvalidRequest, "a wildcard CORS origin needs an API key")
 		}
+		if o.CORSOrigin == "null" && o.APIKey == "" {
+			return nil, llm.Errorf(llm.KindInvalidRequest,
+				`the CORS origin "null" is sent by a sandboxed frame on any site, so it needs an API key`)
+		}
 	}
 	if o.Passthrough != "" {
 		p, known := c.Provider(o.Passthrough)
@@ -102,8 +117,8 @@ func New(c *goose.Client, o Options) (*Server, error) {
 		client: c, opts: o, mux: http.NewServeMux(),
 		inflight: newGate(o.MaxConcurrent),
 		rate:     newLimiter(o.MaxPerMinute, c.Env().Now),
-		byPath:   map[string]wire.Codec{},
-		byPrefix: map[string]wire.Codec{},
+		byRoute:  map[string]wire.Codec{},
+		turned:   map[string]bool{},
 	}
 	seen := map[string]bool{}
 	for _, codec := range o.Codecs {
@@ -113,10 +128,7 @@ func New(c *goose.Client, o Options) (*Server, error) {
 				return nil, llm.Errorf(llm.KindInvalidRequest, "two codecs claim %s", pattern)
 			}
 			seen[pattern] = true
-			if strings.HasSuffix(r.Pattern, "/") {
-				s.byPrefix[r.Pattern] = codec
-			}
-			s.byPath[strings.TrimSuffix(r.Pattern, "/")] = codec
+			s.byRoute[pattern] = codec
 			s.mux.HandleFunc(pattern, s.handle(codec))
 			s.routes = append(s.routes, pattern+" -> "+codec.Name())
 		}
@@ -132,7 +144,7 @@ func New(c *goose.Client, o Options) (*Server, error) {
 				continue
 			}
 			seen[pattern] = true
-			s.byPath[strings.TrimSuffix(r.Pattern, "/")] = codec
+			s.byRoute[pattern] = codec
 			s.mux.HandleFunc(pattern, s.wireModels(lister))
 			s.routes = append(s.routes, pattern+" -> "+codec.Name()+" models")
 		}
@@ -166,10 +178,12 @@ func (s *Server) Handler() http.Handler { return s.handler }
 
 func (s *Server) wrap() http.Handler {
 	// Outermost first: the log records every refusal, including the ones the
-	// limiter and the key check make themselves; the rate limiter counts
-	// unauthenticated traffic too, because that is most of what it exists to
-	// shed; and the concurrency gate sits inside the key check, because a slot
-	// is for work that is actually going to happen.
+	// limiter and the key check make themselves; a page the browser check
+	// turns away spends no allowance, since on loopback it shares an address
+	// with the operator's own client; the rate limiter counts unauthenticated
+	// traffic too, because that is most of what it exists to shed; and the
+	// concurrency gate sits inside the key check, because a slot is for work
+	// that is actually going to happen.
 	var h http.Handler = s.unserved()
 	h = s.limitBody(h)
 	if s.opts.Metrics != nil {
@@ -184,6 +198,7 @@ func (s *Server) wrap() http.Handler {
 	if s.rate != nil {
 		h = s.rateLimit(h)
 	}
+	h = s.browser(h)
 	if s.opts.LogRequests && s.opts.Logger != nil {
 		h = s.logRequests(h)
 	}
@@ -257,11 +272,8 @@ func (s *Server) limitBody(next http.Handler) http.Handler {
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	key := []byte(s.opts.APIKey)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+		switch s.served(r) {
+		case "GET /health", "GET /ready":
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -297,6 +309,53 @@ func presentedAll(r *http.Request) []string {
 	return out
 }
 
+// handedOn is the credential a caller means for the backend: the one it
+// presented, unless that is the proxy's own key, in which case whichever other
+// one on the request is not. Which header carries which is the client's to
+// choose.
+func (s *Server) handedOn(r *http.Request, key string) string {
+	if s.opts.APIKey == "" || key != s.opts.APIKey {
+		return key
+	}
+	for _, candidate := range presentedAll(r) {
+		if candidate != s.opts.APIKey {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// travels is the routed path's rule for a caller's own key where there is one
+// backend: a key whose header says which vendor minted it goes to that vendor
+// and no other, and one whose header says nothing goes to the only backend.
+func travels(scheme, backend llm.CredentialScheme) bool {
+	return scheme == "" || backend == "" || scheme == backend
+}
+
+// A credential in the query is one like any in a header, and those are not
+// forwarded as sent: the proxy's own would reach a vendor's URL and its logs,
+// and a caller's would reach the backend whatever the operator allowed. The one
+// the proxy reads as a key is handed on by the client-key rule instead.
+var queryCredentials = []string{"key", "access_token"}
+
+func withoutCredentials(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	pairs := strings.Split(raw, "&")
+	kept := pairs[:0]
+	for _, pair := range pairs {
+		name, _, _ := strings.Cut(pair, "=")
+		if unescaped, err := url.QueryUnescape(name); err == nil {
+			name = unescaped
+		}
+		if !slices.Contains(queryCredentials, name) {
+			kept = append(kept, pair)
+		}
+	}
+	return strings.Join(kept, "&")
+}
+
 func holdsKey(r *http.Request, key []byte) bool {
 	ok := false
 	for _, candidate := range presentedAll(r) {
@@ -307,6 +366,14 @@ func holdsKey(r *http.Request, key []byte) bool {
 	return ok
 }
 
+// corsResponseHeaders are the ones cors() itself sets on every response.
+var corsResponseHeaders = []string{
+	"Access-Control-Allow-Origin",
+	"Access-Control-Allow-Headers",
+	"Access-Control-Allow-Methods",
+	"Access-Control-Expose-Headers",
+}
+
 func (s *Server) cors(next http.Handler) http.Handler {
 	origin := s.opts.CORSOrigin
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -314,10 +381,11 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		if origin != "*" {
 			w.Header().Add("Vary", "Origin")
 		}
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, x-goog-api-key, anthropic-version, anthropic-beta")
+		w.Header().Set("Access-Control-Allow-Headers", allowedHeaders(r.Header.Get("Access-Control-Request-Headers")))
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Expose-Headers", strings.Join([]string{UsageHeader, SessionHeader, ProviderHeader, DiagnosticsHeader, "Retry-After"}, ", "))
 		if r.Method == http.MethodOptions {
+			w.Header().Add("Vary", "Access-Control-Request-Headers")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -364,13 +432,13 @@ func (s *Server) probe(ctx context.Context) ([]goose.Health, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	health, ok := s.client.Ready(ctx)
+	health, ok := s.client.Ready(ctx, s.opts.RedactUpstream)
 	s.probeAt, s.probeHeld, s.probeOK = now, health, ok
 	return health, ok
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
-	models, diags := s.client.Models(r.Context())
+	models, diags := s.client.Models(r.Context(), s.opts.RedactUpstream)
 	noteDiagnostics(w, diags)
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
@@ -403,7 +471,7 @@ func noteDiagnostics(w http.ResponseWriter, diags llm.Diagnostics) {
 
 func (s *Server) wireModels(lister wire.Lister) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		models, diags := s.client.Models(r.Context())
+		models, diags := s.client.Models(r.Context(), s.opts.RedactUpstream)
 		noteDiagnostics(w, diags)
 		out, err := lister.EncodeModels(models)
 		if err != nil {
@@ -421,6 +489,31 @@ func (s *Server) wireModels(lister wire.Lister) http.HandlerFunc {
 	}
 }
 
+func dotSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// passedMethods are the ones a vendor's API is called with. Anything else is
+// not sent on the operator's credentials: TRACE has a server echo back the
+// request it was sent, those credentials included, and CONNECT asks for a
+// tunnel.
+var passedMethods = []string{
+	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+	http.MethodPatch, http.MethodDelete, http.MethodOptions,
+}
+
+func tooLarge(err *http.MaxBytesError) *llm.Error {
+	return &llm.Error{
+		Kind: llm.KindInvalidRequest, Status: http.StatusRequestEntityTooLarge,
+		Message: "request body: " + err.Error(),
+	}
+}
+
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.client.Provider(s.opts.Passthrough)
 	if !ok {
@@ -434,36 +527,97 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	key := presented(r)
-	if key == s.opts.APIKey {
+	if !slices.Contains(passedMethods, r.Method) {
+		w.Header().Set("Allow", strings.Join(passedMethods, ", "))
+		e := llm.Errorf(llm.KindInvalidRequest, "%s is not a method this proxy forwards", r.Method)
+		e.Status = http.StatusMethodNotAllowed
+		s.refuse(w, r, e)
+		return
+	}
+	// A query the proxy cannot read is one it cannot say is free of credentials,
+	// so it goes no further; the mistake is the caller's, not the backend's.
+	if _, err := url.ParseQuery(r.URL.RawQuery); err != nil {
+		s.refuse(w, r, llm.Errorf(llm.KindInvalidRequest, "the query string could not be read: %v", err))
+		return
+	}
+	// A Pass implementation joins this path onto base_url as a string and
+	// reparses it, so a "." or ".." element could climb back out of it; that
+	// reads the same once decoded whether it arrived literally or as
+	// "%2E%2E" or "%2F", so the decoded path is what is checked.
+	if dotSegment(r.URL.Path) {
+		s.refuse(w, r, llm.Errorf(llm.KindInvalidRequest, `the request path may not hold a "." or ".." element`))
+		return
+	}
+	// A body the listener would cut off partway is refused before any of it is
+	// sent, as the routed path refuses it.
+	if r.ContentLength > s.opts.MaxBody {
+		s.refuse(w, r, tooLarge(&http.MaxBytesError{Limit: s.opts.MaxBody}))
+		return
+	}
+	key := s.handedOn(r, presented(r))
+	if !travels(schemeOf(r, key), p.Capabilities().KeyScheme) {
 		key = ""
+		w.Header().Set(DiagnosticsHeader, llm.PolicyKeyWithheld)
 	}
 	started := s.client.Env().Clock()
 	resp, err := passer.Pass(r.Context(), &llm.PassRequest{
-		Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery,
+		// The raw, still-escaped path: the decoded r.URL.Path turns an
+		// encoded "%2F" into a literal separator and an encoded "%3F" into a
+		// literal '?', either of which a string-joined, reparsed URL would
+		// then read as real path or query structure rather than opaque text.
+		Method: r.Method, Path: r.URL.EscapedPath(), Query: withoutCredentials(r.URL.RawQuery),
 		Header: r.Header, Body: r.Body, Key: key,
 	})
+	// Nobody counts what a forwarded call used, which is not the same as it
+	// having used nothing; one that never left used nothing.
 	rec := llm.Attempted{
 		Provider: s.opts.Passthrough, Sent: true, Outcome: llm.OutcomeOK,
 		Started: started, Elapsed: s.client.Env().Clock().Sub(started).Milliseconds(),
-		Usage: llm.Usage{}.Unmeasured(),
 	}
 	if err != nil {
 		e := llm.AsError(err)
-		rec.Outcome, rec.Err, rec.Status = llm.OutcomeError, e.Message, e.Status
+		// Booked the way the routed path books the same failure: a caller
+		// gone or a wait that ran out is cancelled, not an upstream error the
+		// backend is blamed for.
+		rec.Sent, rec.Outcome, rec.Err, rec.Status = e.Sent, goose.OutcomeFor(e), e.Message, e.Status
+		if e.Sent {
+			rec.Usage = rec.Usage.Unmeasured()
+		}
+		// A body that gave no length and ran past the limit was cut off by the
+		// listener while it was being forwarded. The mistake is the caller's,
+		// so it is answered and booked as goose's refusal, not as the backend
+		// failing.
+		var over *http.MaxBytesError
+		if errors.As(err, &over) {
+			e = tooLarge(over)
+			rec.Outcome, rec.Err, rec.Status = llm.OutcomeRejected, e.Message, e.Status
+		}
 		s.client.Record(context.WithoutCancel(r.Context()), rec, "passthrough")
+		if over != nil {
+			s.refuse(w, r, e)
+			return
+		}
+		e = s.hide(e)
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error": map[string]any{"message": e.Message, "type": string(e.Kind)},
 		})
 		return
 	}
-	rec.Status = resp.Status
+	rec.Status, rec.Usage = resp.Status, rec.Usage.Unmeasured()
 	if resp.Status >= 400 {
 		rec.Outcome = llm.OutcomeError
 	}
 	s.client.Record(context.WithoutCancel(r.Context()), rec, "passthrough")
 	defer resp.Body.Close()
-	httpcore.ForwardHeader(w.Header(), resp.Header)
+	var drop []string
+	if s.opts.CORS {
+		// cors() already set these on w.Header() as the one answer this proxy
+		// gives; an upstream that answers CORS itself, such as Ollama or
+		// Anthropic's own browser access, must not add a second value beside
+		// them.
+		drop = corsResponseHeaders
+	}
+	httpcore.ForwardHeader(w.Header(), resp.Header, drop...)
 	w.WriteHeader(resp.Status)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
@@ -489,12 +643,13 @@ func (s *Server) refuse(w http.ResponseWriter, r *http.Request, e *llm.Error) {
 	if status < 400 {
 		status = wire.StatusFor(e.Kind)
 	}
+	wire.SetRetryAfter(w.Header(), e)
 	generic := func() {
 		writeJSON(w, status, map[string]any{
 			"error": map[string]any{"message": e.Message, "type": string(e.Kind)},
 		})
 	}
-	codec := s.codecFor(r.URL.Path)
+	codec := s.codecFor(r)
 	if codec == nil {
 		generic()
 		return
@@ -504,11 +659,7 @@ func (s *Server) refuse(w http.ResponseWriter, r *http.Request, e *llm.Error) {
 		generic()
 		return
 	}
-	for k, vs := range out.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
+	overlay(w.Header(), out.Header)
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/json")
 	}

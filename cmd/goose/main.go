@@ -10,11 +10,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -75,21 +78,17 @@ func run(args []string, stdout, stderr *os.File) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Parsing stops at the first word that is not a flag, so anything after it
+	// would otherwise be dropped without a word, flags and all.
+	if rest := fs.Args(); len(rest) > 0 {
+		if slices.Contains(rest, "mcp") && !f.stdio {
+			return fmt.Errorf("mcp comes before any flag: goose mcp [flags]")
+		}
+		return fmt.Errorf("unexpected argument %q", rest[0])
+	}
 	if f.version {
 		fmt.Fprintf(stdout, "goose %s\n", version)
 		return nil
-	}
-
-	cfg, origin, err := load(f.config)
-	if err != nil {
-		return err
-	}
-	if err := apply(cfg, f); err != nil {
-		return err
-	}
-	cfg.resolveSecrets(os.Getenv)
-	if err := cfg.validate(); err != nil {
-		return err
 	}
 
 	level := slog.LevelInfo
@@ -98,7 +97,32 @@ func run(args []string, stdout, stderr *os.File) error {
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
 
-	sinks, closeSinks, mem, err := buildSinks(cfg)
+	cfg, origin, err := load(f.config)
+	if err != nil {
+		return err
+	}
+	skipped := unread(f.config)
+	for _, name := range skipped {
+		logger.Warn("a configuration file in the working directory is read only when named", "skipped", name, "use", "-c "+name)
+	}
+	if err := apply(cfg, f); err != nil {
+		return err
+	}
+	if origin == noFile && len(cfg.Providers) == 0 {
+		return nothingRead(skipped)
+	}
+	if err := cfg.validate(!f.stdio); err != nil {
+		return err
+	}
+	notes, err := cfg.resolveSecrets(os.Getenv, !f.stdio)
+	if err != nil {
+		return err
+	}
+	for _, note := range notes {
+		logger.Warn(note)
+	}
+
+	sinks, closeSinks, mem, err := buildSinks(cfg, f.check)
 	if err != nil {
 		return err
 	}
@@ -143,13 +167,35 @@ func run(args []string, stdout, stderr *os.File) error {
 	}
 	defer client.Close(context.Background())
 
+	calls := &inflight{}
 	if tools != nil && (f.stdio || cfg.Server.MCPTools) {
-		if err := tools.Serve("goose", gooseTools(client)...); err != nil {
+		own := gooseTools(client, cfg, logger)
+		// The listener logs every request under -v, a call to /mcp among
+		// them; goose mcp has no listener, so its own tools say it instead.
+		if f.stdio && f.verbose {
+			own = logged(own, logger)
+		}
+		if err := tools.Serve("goose", calls.tools(own)...); err != nil {
 			return err
 		}
 	}
-	if f.stdio && !f.check {
-		return serveStdio(tools, stdout, stderr, cfg, origin, mem)
+	// goose mcp binds no port and speaks no vendor wire, so what the listener
+	// alone reads is neither checked nor listed for it.
+	if f.stdio && f.check {
+		fmt.Fprintf(stdout, "goose %s: configuration from %s is valid\n", version, origin)
+		for _, m := range cfg.MCP {
+			fmt.Fprintf(stdout, "  tools -> %s (not started)\n", m.Name)
+		}
+		fmt.Fprintln(stdout, "  tools -> goose's own")
+		return nil
+	}
+	if f.stdio {
+		err := serveStdio(tools, stdout, stderr, origin)
+		calls.settle(settleFor, logger)
+		if mem != nil && cfg.Usage.Summary {
+			summary(stderr, mem)
+		}
+		return err
 	}
 
 	codecs, err := buildCodecs(cfg.Formats)
@@ -161,6 +207,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		APIKey:          cfg.Server.APIKey,
 		CORS:            cfg.Server.CORS,
 		CORSOrigin:      cfg.Server.CORSOrigin,
+		Host:            cfg.Server.Host,
 		MaxBody:         int64(cfg.Server.MaxBodyMB) << 20,
 		Logger:          logger,
 		LogRequests:     f.verbose,
@@ -184,7 +231,7 @@ func run(args []string, stdout, stderr *os.File) error {
 		for _, m := range cfg.MCP {
 			fmt.Fprintf(stdout, "  POST /mcp -> %s (not started)\n", m.Name)
 		}
-		if cfg.Server.MCPTools || f.stdio {
+		if cfg.Server.MCPTools {
 			fmt.Fprintln(stdout, "  POST /mcp -> goose's own tools")
 		}
 		return nil
@@ -194,7 +241,7 @@ func run(args []string, stdout, stderr *os.File) error {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           srv.Handler(),
+		Handler:           calls.handler(srv.Handler()),
 		ReadHeaderTimeout: 30 * time.Second,
 		// A request body arrives in one go; only the answer is slow. Without
 		// this a client dribbling its body holds a connection, and a
@@ -223,15 +270,32 @@ func run(args []string, stdout, stderr *os.File) error {
 	case <-ctx.Done():
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		_ = server.Close()
-	}
+	// The first signal asks for the open requests to finish, and a stream can
+	// take the whole budget doing so; one more is how an operator at a
+	// terminal says not to wait for them.
+	again := make(chan os.Signal, 1)
+	signal.Notify(again, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(again)
+	stop()
+	shutdown(server, calls, 10*time.Second, logger, again)
 	if mem != nil && cfg.Usage.Summary {
 		summary(stdout, mem)
 	}
 	return nil
+}
+
+// nothingRead is the error for a start with no file and no -p. Said bare, "no
+// providers configured" sends the operator looking for a mistake in a file
+// that was never opened.
+func nothingRead(skipped []string) error {
+	if len(skipped) > 0 {
+		return fmt.Errorf("no providers configured: %s in the working directory is read only when named; give -c %s", skipped[0], skipped[0])
+	}
+	where := "~/.config/goose/config.toml"
+	if home := homeConfig(); home != "" {
+		where = home
+	}
+	return fmt.Errorf("no providers configured: no file was named with -c and %s does not exist; give -c <file>, or -p <kind> to serve one provider", where)
 }
 
 func listen(server *http.Server, cfg *Config) error {
@@ -276,14 +340,25 @@ func apply(cfg *Config, f flags) error {
 	}
 	if f.provider != "" {
 		cfg.Providers = []Provider{{
-			ID: f.provider, Kind: f.provider, Model: f.model, BaseURL: f.baseURL,
+			ID: f.provider, Kind: f.provider, Model: f.model, BaseURL: f.baseURL, typed: true,
 		}}
+		// Both name the file's providers, which are no longer there.
 		cfg.Routes = nil
+		cfg.Server.Passthrough = ""
 	}
 	return nil
 }
 
-func buildSinks(cfg *Config) ([]usage.Sink, func(), *usage.Memory, error) {
+// buildSinks opens what a run will write usage to. A check serves nothing, so
+// it is validated without opening — and so without needing write access to —
+// the ledger; the directory it sits in belongs to whoever runs the service,
+// which need not be whoever runs -check.
+func buildSinks(cfg *Config, check bool) ([]usage.Sink, func(), *usage.Memory, error) {
+	if cfg.Usage.Log != "" && check {
+		if err := ledgerPlace(cfg.Usage.Log); err != nil {
+			return nil, func() {}, nil, fmt.Errorf("usage log: %w", err)
+		}
+	}
 	var sinks []usage.Sink
 	closers := []func(){}
 	var mem *usage.Memory
@@ -291,7 +366,7 @@ func buildSinks(cfg *Config) ([]usage.Sink, func(), *usage.Memory, error) {
 		mem = usage.NewMemory()
 		sinks = append(sinks, mem)
 	}
-	if cfg.Usage.Log != "" {
+	if cfg.Usage.Log != "" && !check {
 		f, err := os.OpenFile(cfg.Usage.Log, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return nil, func() {}, nil, fmt.Errorf("usage log: %w", err)
@@ -304,6 +379,23 @@ func buildSinks(cfg *Config) ([]usage.Sink, func(), *usage.Memory, error) {
 			c()
 		}
 	}, mem, nil
+}
+
+// ledgerPlace refuses, without writing anything, a ledger that no account
+// could open: one whose directory is missing, or that is itself a directory.
+// What cannot be looked at, for want of permission, is left for the run to
+// find out, since it may belong to an account that can.
+func ledgerPlace(path string) error {
+	dir := filepath.Dir(path)
+	if info, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%s: the directory does not exist", dir)
+	} else if err == nil && !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	return nil
 }
 
 func buildCodecs(names []string) ([]wire.Codec, error) {
@@ -415,8 +507,9 @@ const usageText = `goose - LLM proxy and provider bridge
 usage: goose [flags]
        goose mcp [flags]   serve the tool protocol on stdin/stdout
 
-  -c <file>        configuration file (default .goose.toml, goose.toml,
-                   ~/.config/goose/config.toml)
+  -c <file>        configuration file (default ~/.config/goose/config.toml; a
+                   goose.toml or .goose.toml in the working directory is read
+                   only when named here)
   -l <host:port>   listen address (default 127.0.0.1:11234)
   -k <key>         proxy API key; prefer GOOSE_PROXY_KEY, since anyone on this
                    host can read an argument list

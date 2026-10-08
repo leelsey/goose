@@ -38,6 +38,11 @@ func New(o Options) (*openai.Provider, error) {
 		if o.Resource == "" {
 			return nil, llm.Errorf(llm.KindInvalidRequest, "azure: resource or base_url is required")
 		}
+		// The resource is spliced into the host the key is sent to, so a
+		// character no resource name has could move the call to another host.
+		if strings.Trim(o.Resource, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") != "" {
+			return nil, llm.Errorf(llm.KindInvalidRequest, "azure: resource %q is not a resource's name", o.Resource)
+		}
 		base = "https://" + o.Resource + ".openai.azure.com"
 	}
 

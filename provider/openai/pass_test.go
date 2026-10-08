@@ -175,3 +175,95 @@ func TestMergeQuery(t *testing.T) {
 		})
 	}
 }
+
+func pass(t *testing.T, o Options, r *llm.PassRequest) *http.Request {
+	t.Helper()
+	var seen *http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	o.BaseURL = srv.URL + o.BaseURL
+	p, err := New(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Method == "" {
+		r.Method = http.MethodPost
+	}
+	if r.Header == nil {
+		r.Header = http.Header{}
+	}
+	r.Body = strings.NewReader("{}")
+	resp, err := p.Pass(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return seen
+}
+
+// Every OpenAI-shaped base ends in its version, and a client puts the version
+// in front of every path it asks for.
+func TestAPassthroughPathSaysTheVersionOnce(t *testing.T) {
+	for _, tc := range []struct{ base, asked, want string }{
+		{"/v1", "/v1/embeddings", "/v1/embeddings"},
+		{"/v1/", "/v1/files", "/v1/files"},
+		{"/api/v1", "/v1/files", "/api/v1/files"},
+		{"/openai/v1", "/v1/files", "/openai/v1/files"},
+		{"/openai/v1", "/openai/v1/files", "/openai/v1/files"},
+		{"/openai", "/openai/deployments/d/chat/completions", "/openai/deployments/d/chat/completions"},
+		{"", "/v1/anything", "/v1/anything"},
+		{"/v1", "/v1beta/models", "/v1/v1beta/models"},
+	} {
+		seen := pass(t, Options{APIKey: "k", BaseURL: tc.base}, &llm.PassRequest{Path: tc.asked})
+		if seen.URL.Path != tc.want {
+			t.Errorf("base %q, asked %q: upstream saw %q, want %q", tc.base, tc.asked, seen.URL.Path, tc.want)
+		}
+	}
+}
+
+// The gate takes a key in the query, and a backend handed one there keeps it in
+// its logs with the rest of the address.
+func TestAPassthroughSendsNoKeyInTheQuery(t *testing.T) {
+	seen := pass(t, Options{APIKey: "k"}, &llm.PassRequest{Path: "/v1/files", Query: "key=GATE&limit=2"})
+	if seen.URL.RawQuery != "limit=2" {
+		t.Fatalf("query = %q", seen.URL.RawQuery)
+	}
+	seen = pass(t, Options{APIKey: "k", Query: "api-version=v"}, &llm.PassRequest{Path: "/x", Query: "key=GATE"})
+	if seen.URL.RawQuery != "api-version=v" {
+		t.Fatalf("query = %q", seen.URL.RawQuery)
+	}
+}
+
+// A routed call carries the configured headers, organisation and project, and
+// an unrouted one is billed and admitted by the same.
+func TestAPassthroughCarriesWhatTheOperatorConfigured(t *testing.T) {
+	o := Options{APIKey: "operator-key", Organisation: "org-operator", Project: "proj-operator",
+		Header: http.Header{"X-Gateway-Auth": {"gw-secret"}}}
+	seen := pass(t, o, &llm.PassRequest{Path: "/v1/embeddings", Key: "caller-key", Header: http.Header{
+		"Openai-Organization": {"org-caller"}, "Openai-Project": {"proj-caller"}, "X-Gateway-Auth": {"forged"},
+	}})
+	for name, want := range map[string]string{
+		"X-Gateway-Auth": "gw-secret", "OpenAI-Organization": "org-operator",
+		"OpenAI-Project": "proj-operator", "Authorization": "Bearer operator-key",
+	} {
+		if got := seen.Header.Values(name); len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+
+	t.Run("the caller's own key", func(t *testing.T) {
+		o := Options{AllowClientKey: true, Organisation: "org-operator"}
+		seen := pass(t, o, &llm.PassRequest{Path: "/v1/embeddings", Key: "caller-key",
+			Header: http.Header{"Openai-Organization": {"org-caller"}}})
+		if seen.Header.Get("OpenAI-Organization") != "org-caller" || seen.Header.Get("Authorization") != "Bearer caller-key" {
+			t.Fatalf("header = %+v: the caller's key bills the caller, who names its organisation", seen.Header)
+		}
+		seen = pass(t, o, &llm.PassRequest{Path: "/v1/embeddings", Key: "caller-key"})
+		if seen.Header.Get("OpenAI-Organization") != "org-operator" {
+			t.Fatalf("header = %+v", seen.Header)
+		}
+	})
+}

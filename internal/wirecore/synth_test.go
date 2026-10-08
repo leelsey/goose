@@ -34,7 +34,7 @@ func richResponse() *llm.Response {
 
 func TestSynthesiseFoldRoundTrip(t *testing.T) {
 	orig := richResponse()
-	got, err := Fold(Synthesise(orig), FoldOptions{})
+	got, err := Fold(Synthesise(orig, llm.Renders{}), FoldOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestSynthesiseEmitsUsageLast(t *testing.T) {
 
 func TestSynthesiseCarriesPromptBlock(t *testing.T) {
 	resp := &llm.Response{Block: &llm.Block{Reason: "SAFETY"}, Stop: llm.StopContentFilter}
-	got, err := Fold(Synthesise(resp), FoldOptions{})
+	got, err := Fold(Synthesise(resp, llm.Renders{}), FoldOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,13 +127,121 @@ func TestSynthesiseCarriesPromptBlock(t *testing.T) {
 	}
 }
 
+// A synthesised stream has the whole answer before any of it is delivered, so
+// what the answer noted is known before the first frame, where a policy can
+// still refuse it, and is counted once.
+func TestASynthesisedStreamKnowsItsNotesBeforeItsFirstFrame(t *testing.T) {
+	resp := richResponse()
+	resp.Diagnostics = llm.Diagnostics{{
+		Code: llm.DropImage, Class: llm.ClassContent, Stage: llm.StageResponse, Severity: llm.SeverityLoss,
+	}}
+	s := Synthesise(resp, llm.Renders{})
+	if !s.Diagnostics().Has(llm.DropImage) {
+		t.Fatal("the answer's notes arrive only with its last frame, after everything else was delivered")
+	}
+	got, err := Fold(s, FoldOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(got.Diagnostics.Find(llm.DropImage)); n != 1 {
+		t.Fatalf("the note was counted %d times", n)
+	}
+}
+
 func TestSynthesiseEmptyAnswerKeepsOneChoice(t *testing.T) {
 	resp := &llm.Response{Choices: []llm.Choice{{Index: 0, Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopEnd}}}
-	got, err := Fold(Synthesise(resp), FoldOptions{})
+	got, err := Fold(Synthesise(resp, llm.Renders{}), FoldOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got.Choices) != 1 || got.Choices[0].Stop != llm.StopEnd {
 		t.Fatalf("response = %+v: an empty answer is still an answer", got)
+	}
+}
+
+// A refusal ends a synthesised stream before its last frame, the one carrying
+// the answer's usage, so booking what it cost cannot wait for that frame to
+// be absorbed: the call was still sent and billed.
+func TestSynthesisedStreamKeepsItsUsageWhenRefused(t *testing.T) {
+	resp := richResponse()
+	resp.Diagnostics = llm.Diagnostics{{
+		Code: llm.DropImage, Class: llm.ClassContent, Stage: llm.StageResponse, Severity: llm.SeverityLoss,
+	}}
+	s := Synthesise(resp, llm.Renders{})
+	if err := s.Prime(); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	s.Enforce(llm.LossPolicy{Strict: true}, llm.Renders{})
+	if e := llm.AsError(s.Err()); e == nil || e.Kind != llm.KindLoss {
+		t.Fatalf("err = %v, want a loss refusal", s.Err())
+	}
+	got := s.Usage().Unmeasured()
+	if got.Prompt != resp.Usage.Prompt || got.Completion != resp.Usage.Completion || !got.Reported {
+		t.Fatalf("usage = %+v, want the answer's own %+v", got, resp.Usage)
+	}
+	for _, a := range got.Anomalies {
+		if a.Code == llm.AnomalyNotMeasurable {
+			t.Fatalf("usage carries %s: a sent, reported call must not book as if the backend reported nothing", a.Code)
+		}
+	}
+}
+
+// Renders.Unrendered weighs the whole answer, every choice and every part of
+// it, not only what a stream has buffered so far. A synthesised stream must
+// be held to that before its first frame too, so strict either delivers the
+// whole of it or none, never a prefix ending where the loss was found.
+func TestSynthesiseRefusesTheWholeAnswerRatherThanPartOfIt(t *testing.T) {
+	resp := &llm.Response{Choices: []llm.Choice{{Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Part{
+		&llm.Text{Text: "per the result, "},
+		&llm.Raw{Vendor: "bedrock", Type: "x", JSON: json.RawMessage(`{}`)},
+		&llm.Text{Text: "geese honk"},
+	}}, Stop: llm.StopEnd}}}
+	to := llm.Renders{ToolCalls: true, Thinking: true, Candidates: 1, Raw: []string{"anthropic"}}
+
+	s := Synthesise(resp, to)
+	if err := s.Prime(); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	s.Enforce(llm.LossPolicy{Strict: true}, to)
+	if e := llm.AsError(s.Err()); e == nil || e.Kind != llm.KindLoss {
+		t.Fatalf("err = %v, want a loss refusal before any frame", s.Err())
+	}
+
+	var delivered string
+	for f := range s.Frames() {
+		delivered += llm.TextOf(f.Delta)
+	}
+	if delivered != "" {
+		t.Fatalf("delivered %q: a stream strict refuses must not hand over part of the answer first", delivered)
+	}
+}
+
+// An answer with no candidate came back whole all the same, whether it carried
+// only what it cost or only why it was stopped, so its stream ends with a
+// reason rather than reading as one cut off.
+func TestAnAnswerWithNoCandidateStillSaysWhyItEnded(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		resp *llm.Response
+		stop llm.StopReason
+	}{
+		{"only what it cost", &llm.Response{Usage: llm.Usage{Prompt: 3, Reported: true}}, llm.StopEnd},
+		{"only why it was stopped", &llm.Response{Block: &llm.Block{Reason: "safety"}}, llm.StopContentFilter},
+		{"a reason of its own", &llm.Response{Block: &llm.Block{Reason: "safety"}, Stop: llm.StopRefusal}, llm.StopRefusal},
+	} {
+		var stop llm.StopReason
+		for _, f := range SynthesiseFrames(tc.resp) {
+			if f.Stop != llm.StopNone {
+				stop = f.Stop
+			}
+		}
+		if stop != tc.stop {
+			t.Errorf("%s: stop = %q, want %q", tc.what, stop, tc.stop)
+		}
+		s := Synthesise(tc.resp, llm.Renders{})
+		if err := s.Prime(); err != nil {
+			t.Errorf("%s: err = %v: a whole answer read as one cut off", tc.what, err)
+		}
+		_ = s.Close()
 	}
 }

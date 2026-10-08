@@ -32,14 +32,14 @@ func Upstream(body []byte) (message, code string) {
 	var many []detail
 	if json.Unmarshal(top["errors"], &many) == nil && len(many) > 0 {
 		if m := clip(many[0].Message); m != "" {
-			return m, first(number(many[0].Code), number(many[0].Type))
+			return m, codeOf(many[0].Code, many[0].Type)
 		}
 	}
 	if m, c := read(top["detail"]); m != "" {
 		return m, c
 	}
 	if m := clip(number(top["message"])); m != "" {
-		return m, first(shortType(number(top["__type"])), number(top["code"]), number(top["status"]))
+		return m, first(shortType(number(top["__type"])), codeOf(top["code"], top["status"]))
 	}
 	return "", ""
 }
@@ -54,7 +54,7 @@ type detail struct {
 func read(raw json.RawMessage) (string, string) {
 	var d detail
 	if json.Unmarshal(raw, &d) == nil && d.Message != "" {
-		return clip(d.Message), first(number(d.Code), number(d.Type), number(d.Status))
+		return clip(d.Message), codeOf(d.Code, d.Type, d.Status)
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
@@ -76,6 +76,34 @@ func number(raw json.RawMessage) string {
 		return strconv.FormatInt(n, 10)
 	}
 	return ""
+}
+
+// codeOf names a failure the way the vendor does. A number beside a name is the
+// status again as often as not, and the name is what says which failure of
+// that status it was, so a name is taken wherever one was given.
+func codeOf(raws ...json.RawMessage) string {
+	for _, raw := range raws {
+		var s string
+		if json.Unmarshal(raw, &s) == nil && s != "" {
+			return s
+		}
+	}
+	for _, raw := range raws {
+		if n := number(raw); n != "" {
+			return n
+		}
+	}
+	return ""
+}
+
+// Code is an error code as a vendor spells it, a string or a number. A backend
+// that sends a number where another sends a name has still said what went
+// wrong, and decoding the error must not fail on the difference.
+type Code string
+
+func (c *Code) UnmarshalJSON(raw []byte) error {
+	*c = Code(number(raw))
+	return nil
 }
 
 func shortType(s string) string {

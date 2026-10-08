@@ -58,6 +58,7 @@ func FuzzResponsesRequestSurvivesTheProxy(f *testing.F) {
 		`{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"temperature":0.5,"top_p":0.9,"max_output_tokens":64}`,
 		`{"model":"m","input":"hi","instructions":"be brief"}`,
 		`{"model":"m","input":"hi","tools":[{"type":"function","name":"f","description":"d","parameters":{"type":"object"}}]}`,
+		`{"model":"m","input":"hi","tools":[{"type":"custom","name":"a"},{"type":"function","name":"f"}],"tool_choice":"required"}`,
 		`{"model":"m","input":"hi","reasoning":{"effort":"high"}}`,
 		`{"model":"m","input":[{"type":"function_call","call_id":"1","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"1","output":"42"}]}`,
 		`{"model":"m","input":"hi","text":{"format":{"type":"json_schema","name":"s","schema":{"type":"object"}}}}`,
@@ -123,17 +124,26 @@ func responsesToolNames(v any) []string {
 	if !ok {
 		return nil
 	}
-	var out []string
+	// The functions are built before the tools carried as written are put
+	// beside them, so each kind keeps its own order but not its place among
+	// the other.
+	var functions, carried []string
 	for _, entry := range list {
 		tool, ok := entry.(map[string]any)
 		if !ok {
 			continue
 		}
-		if name, ok := tool["name"].(string); ok && name != "" {
-			out = append(out, name)
+		name, ok := tool["name"].(string)
+		if !ok || name == "" {
+			continue
+		}
+		if kind, _ := tool["type"].(string); kind == "" || kind == "function" {
+			functions = append(functions, name)
+		} else {
+			carried = append(carried, name)
 		}
 	}
-	return out
+	return append(functions, carried...)
 }
 
 func itemKinds(v any) []string {

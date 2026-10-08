@@ -8,8 +8,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,6 +53,11 @@ func New(o Options) (*Provider, error) {
 	if o.Region == "" {
 		return nil, llm.Errorf(llm.KindInvalidRequest, "bedrock: region is required")
 	}
+	// The region is spliced into the host the call is signed for and sent to,
+	// so a character no region's name has could move the call to another host.
+	if strings.Trim(o.Region, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" {
+		return nil, llm.Errorf(llm.KindInvalidRequest, "bedrock: region %q is not a region's name", o.Region)
+	}
 	if o.Credentials == nil {
 		return nil, llm.Errorf(llm.KindInvalidRequest, "bedrock: credentials are required")
 	}
@@ -58,8 +65,31 @@ func New(o Options) (*Provider, error) {
 		o.BaseURL = "https://bedrock-runtime." + o.Region + ".amazonaws.com"
 	}
 	p := &Provider{opts: o}
-	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout)}
+	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout), Refine: refine}
 	return p, nil
+}
+
+// refine reads what the status does not say. Converse refuses a model it does
+// not know, and one it serves only through an inference profile, with the 400
+// a malformed request gets, and only a malformed request fails the same on
+// every backend. It refuses a model the account has not been granted, or
+// cannot subscribe to, with the 403 a credential without rights gets, though
+// every other model on the account may still be served.
+func refine(e *llm.Error) {
+	var unserved []string
+	switch e.Kind {
+	case llm.KindInvalidRequest:
+		unserved = []string{"model identifier is invalid", "on-demand throughput", "inference profile"}
+	case llm.KindPermission:
+		unserved = []string{"access to the model with the specified model id", "to enable access to this model"}
+	}
+	said := strings.ToLower(e.Message)
+	for _, s := range unserved {
+		if strings.Contains(said, s) {
+			e.Kind = llm.KindNotFound
+			return
+		}
+	}
 }
 
 func (p *Provider) ID() string { return p.opts.ID }
@@ -85,6 +115,8 @@ func (p *Provider) Capabilities() llm.Capabilities {
 		ImageIn:            true,
 		Thinking:           true,
 		ThinkingSignatures: true,
+		Signer:             llm.FamilyAnthropic,
+		RedactedThinking:   true,
 		Candidates:         1,
 		CacheBreakpoints:   maxBreakpoints,
 		Ceiling:            llm.CeilingMaxTokens,
@@ -204,15 +236,27 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 	}
 	body["messages"] = turns
 
+	thinking, ceiling, d := p.thinking(req.Thinking, req.MaxOutputTokens,
+		len(tools) > 0 && forced(req.ToolChoice), unsafeToResume(turns))
+	diags = append(diags, d...)
+	if thinking != nil {
+		body["additionalModelRequestFields"] = map[string]any{"thinking": thinking}
+	}
+	temperature, topP := req.Temperature, req.TopP
+	if thinking != nil {
+		temperature, topP, d = p.besideThinking(temperature, topP)
+		diags = append(diags, d...)
+	}
+
 	cfg := map[string]any{}
-	if req.MaxOutputTokens != nil {
-		cfg["maxTokens"] = *req.MaxOutputTokens
+	if ceiling != nil {
+		cfg["maxTokens"] = *ceiling
 	}
-	if req.Temperature != nil {
-		cfg["temperature"] = *req.Temperature
+	if temperature != nil {
+		cfg["temperature"] = *temperature
 	}
-	if req.TopP != nil {
-		cfg["topP"] = *req.TopP
+	if topP != nil {
+		cfg["topP"] = *topP
 	}
 	if len(req.Stop) > 0 {
 		cfg["stopSequences"] = req.Stop
@@ -253,16 +297,27 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 		if llm.StrictTools(tools) {
 			diags = append(diags, llm.ToolStrictness(p.ID()))
 		}
-	}
-
-	if req.Thinking != nil && req.Thinking.Enabled {
-		budget := req.Thinking.Budget
-		if budget <= 0 {
-			budget = 2048
+	} else if names := historyTools(msgs); len(names) > 0 {
+		// Converse refuses toolUse and toolResult blocks without a toolConfig,
+		// and a client may send a tool loop's history with no tools, to close
+		// it with a summary for instance. The tools the history names are
+		// declared again, with no schema, so the conversation travels as it was.
+		// Converse cannot be told that none may be called, so the description
+		// asks instead.
+		specs := make([]map[string]any, 0, len(names))
+		for _, name := range names {
+			specs = append(specs, map[string]any{"toolSpec": map[string]any{
+				"name":        name,
+				"description": "Not offered on this turn: declared only because earlier turns use it.",
+				"inputSchema": map[string]any{"json": json.RawMessage(`{"type":"object","properties":{}}`)},
+			}})
 		}
-		body["additionalModelRequestFields"] = map[string]any{
-			"thinking": map[string]any{"type": "enabled", "budget_tokens": budget},
-		}
+		body["toolConfig"] = map[string]any{"tools": specs}
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropToolDefinition, Class: llm.ClassCapability, Stage: llm.StageRequest,
+			Severity: llm.SeverityLoss, Provider: p.ID(), Field: "tools", Count: len(names),
+			Detail: "this backend refuses a tool history without the tools it names, so they were declared again and the model may call one the request did not offer",
+		})
 	}
 
 	diags = append(diags, llm.UnsentSampling(req, p.ID(),
@@ -271,11 +326,163 @@ func (p *Provider) body(a *llm.Attempt) ([]byte, llm.Diagnostics, error) {
 	for _, x := range diags {
 		a.Note(x)
 	}
+	if err := a.Check(); err != nil {
+		return nil, diags, err
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, diags, llm.Errorf(llm.KindInternal, "encode request: %v", err)
 	}
 	return raw, diags, nil
+}
+
+const (
+	defaultThinkingBudget = 2048
+	minThinkingBudget     = 1024
+	minThinkingTopP       = 0.95
+	// thinkingCeiling and answerRoom are the anthropic provider's: the least
+	// any Claude that thinks writes in one answer, and the room an answer has
+	// after a budget where the caller set no ceiling.
+	thinkingCeiling = 32000
+	answerRoom      = 4096
+)
+
+// thinking is the thinking Claude takes here for what was asked, as on
+// Anthropic's own API: at least 1024 tokens, fewer than the output ceiling,
+// none before a tool call it is made to make, and none when the turn it would
+// resume into does not lead with the thinking Claude requires of it. A request
+// outside that is refused whole. The ceiling returned is the one to send.
+func (p *Provider) thinking(th *llm.ThinkingConfig, ceiling *int, forced, unsafeResume bool) (map[string]any, *int, llm.Diagnostics) {
+	if th == nil || !th.Enabled {
+		return nil, ceiling, nil
+	}
+	off := func(detail string) (map[string]any, *int, llm.Diagnostics) {
+		return nil, ceiling, llm.Diagnostics{{
+			Code: llm.DropThinking, Class: llm.ClassCapability, Stage: llm.StageRequest,
+			Severity: llm.SeverityLoss, Provider: p.ID(), Field: "thinking",
+			Detail: detail,
+		}}
+	}
+	if forced {
+		return off("this backend cannot think before a tool call it is made to make, so thinking was not enabled")
+	}
+	if unsafeResume {
+		return off("the turn whose tool call this request answers does not lead with thinking this backend can verify, which it requires of that turn once thinking is on, so thinking was not enabled")
+	}
+	// The models a caller names the adaptive mode for refuse a budget of any
+	// size, so the mode is sent as it was named.
+	if th.Adaptive {
+		return map[string]any{"type": "adaptive"}, ceiling, nil
+	}
+	var diags llm.Diagnostics
+	most := math.MaxInt
+	switch {
+	case ceiling != nil:
+		most = *ceiling - 1
+	case th.Budget > 0:
+		// With no ceiling sent, Converse gives the model the largest it has,
+		// which a budget can pass and is then refused whole. One is sent as on
+		// Anthropic's own API, so the budget is kept as far as any Claude that
+		// thinks can write and the answer after it has the same room.
+		most = min(max(th.Budget, minThinkingBudget), thinkingCeiling-answerRoom)
+		ceiling = llm.Ptr(most + answerRoom)
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.CapCeilingSupplied, Class: llm.ClassCapability, Stage: llm.StageRequest,
+			Severity: llm.SeverityInfo, Provider: p.ID(), Field: "maxTokens",
+			Detail: "this backend thinks for fewer tokens than the output ceiling, so one was sent to fit the budget, and the answer stops at the default after it rather than where the model would have",
+		})
+	}
+	if most < minThinkingBudget {
+		return off("this backend thinks for at least 1024 tokens and for fewer than the output ceiling, which this ceiling leaves no room between, so thinking was not enabled")
+	}
+	budget := th.Budget
+	switch {
+	case budget <= 0:
+		budget = defaultThinkingBudget
+		if ceiling != nil {
+			budget = min(budget, max(*ceiling/2, minThinkingBudget))
+		}
+	case budget < minThinkingBudget || budget > most:
+		budget = min(max(budget, minThinkingBudget), most)
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropExtraField, Class: llm.ClassCapability, Stage: llm.StageRequest,
+			Severity: llm.SeverityInfo, Provider: p.ID(), Field: "thinking.budget",
+			Detail: "this backend thinks for at least 1024 tokens and for fewer than the output ceiling, so the budget was moved to the nearest it takes",
+		})
+	}
+	return map[string]any{"type": "enabled", "budget_tokens": budget}, ceiling, diags
+}
+
+// unsafeToResume reports whether turns end with a tool result answering an
+// assistant turn that does not lead with reasoning. Claude requires that turn
+// to start with its thinking whenever thinking is enabled, however the turn
+// came to lose it: dropped here unsigned, stripped before it arrived, or never
+// there.
+func unsafeToResume(turns []map[string]any) bool {
+	n := len(turns)
+	if n < 2 || turns[n-1]["role"] != "user" || turns[n-2]["role"] != "assistant" {
+		return false
+	}
+	answers := slices.ContainsFunc(turns[n-1]["content"].([]map[string]any), func(b map[string]any) bool {
+		_, ok := b["toolResult"]
+		return ok
+	})
+	if !answers {
+		return false
+	}
+	lead := turns[n-2]["content"].([]map[string]any)
+	if len(lead) == 0 {
+		return true
+	}
+	_, ok := lead[0]["reasoningContent"]
+	return !ok
+}
+
+// besideThinking is the sampling Claude takes here while it thinks, as on
+// Anthropic's own API: no temperature but 1 and no top_p under 0.95. Anything
+// else beside thinking is refused whole.
+func (p *Provider) besideThinking(temperature, topP *float64) (*float64, *float64, llm.Diagnostics) {
+	var diags llm.Diagnostics
+	unsent := func(field, detail string) {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropExtraField, Class: llm.ClassCapability, Stage: llm.StageRequest,
+			Severity: llm.SeverityInfo, Provider: p.ID(), Field: field,
+			Detail: detail,
+		})
+	}
+	if temperature != nil && *temperature != 1 {
+		temperature = nil
+		unsent(llm.FieldTemperature, "this backend samples at its own temperature while it thinks, so the one asked for was not sent")
+	}
+	if topP != nil && *topP < minThinkingTopP {
+		topP = llm.Ptr(minThinkingTopP)
+		unsent(llm.FieldTopP, "this backend takes a top_p of at least 0.95 while it thinks, so 0.95 was sent")
+	}
+	return temperature, topP, diags
+}
+
+// forced says a tool choice leaves the model no answer but a tool call.
+func forced(tc *llm.ToolChoice) bool {
+	return tc != nil && (tc.Mode == llm.ToolRequired || tc.Mode == llm.ToolSpecific)
+}
+
+func historyTools(msgs []llm.Message) []string {
+	var names []string
+	for _, m := range msgs {
+		for _, part := range m.Content {
+			var name string
+			switch v := part.(type) {
+			case *llm.ToolUse:
+				name = v.Name
+			case *llm.ToolResult:
+				name = v.Name
+			}
+			if name != "" && !slices.Contains(names, name) {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
 }
 
 func toolChoice(tc *llm.ToolChoice) map[string]any {
@@ -311,6 +518,18 @@ func contentBlocks(parts []llm.Part, diags *llm.Diagnostics) ([]map[string]any, 
 				}})
 				continue
 			}
+			// A block stripped of a foreign signature, or one that never had
+			// Claude's own, cannot be replayed as this backend's own reasoning:
+			// sent with an empty signature it is indistinguishable from one
+			// Claude never verified, which Claude refuses the same as anthropic.
+			if v.Signature == "" {
+				local = append(local, llm.Diagnostic{
+					Code: llm.DropSignature, Class: llm.ClassContent, Stage: llm.StageRequest,
+					Severity: llm.SeverityInfo,
+					Detail:   "thinking without its signature cannot be replayed to this backend",
+				})
+				continue
+			}
 			out = append(out, map[string]any{"reasoningContent": map[string]any{
 				"reasoningText": map[string]any{"text": v.Text, "signature": v.Signature},
 			}})
@@ -325,6 +544,12 @@ func contentBlocks(parts []llm.Part, diags *llm.Diagnostics) ([]map[string]any, 
 		case *llm.ToolResult:
 			inner, d := contentBlocks(v.Content, diags)
 			local = append(local, d...)
+			// Converse refuses a tool result with nothing in it, as null or as an
+			// empty list, and a tool that printed nothing is routine. The result
+			// says so in words rather than failing the whole turn.
+			if len(inner) == 0 {
+				inner = []map[string]any{{"text": "(no content)"}}
+			}
 			status := "success"
 			if v.IsError {
 				status = "error"
@@ -428,7 +653,7 @@ func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 	if out.Message != "" && len(out.Output.Message.Content) == 0 {
 		return nil, &llm.Error{
 			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200,
-			Code: out.Type, Message: out.Message,
+			Code: out.Type, Message: out.Message, Body: httpcore.ErrorBody([]byte(out.Message)),
 		}
 	}
 	parts, d := decodeBlocks(out.Output.Message.Content)
@@ -491,7 +716,8 @@ func decodeBlocks(blocks []json.RawMessage) ([]llm.Part, llm.Diagnostics) {
 				continue
 			}
 			if b.Reasoning.ReasoningText != nil {
-				out = append(out, &llm.Thinking{Text: b.Reasoning.ReasoningText.Text, Signature: b.Reasoning.ReasoningText.Signature})
+				out = append(out, &llm.Thinking{Text: b.Reasoning.ReasoningText.Text,
+					Signature: b.Reasoning.ReasoningText.Signature, Signer: llm.FamilyAnthropic})
 			}
 		case b.Image != nil:
 			data, _ := base64.StdEncoding.DecodeString(b.Image.Source.Bytes)

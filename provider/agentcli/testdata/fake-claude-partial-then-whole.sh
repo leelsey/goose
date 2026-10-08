@@ -1,6 +1,7 @@
 #!/bin/sh
-# What --include-partial-messages really produces: the turn streamed as deltas,
-# then the same turn restated whole on the line that closes it.
+# A turn streamed as deltas, then restated whole on one line once it has
+# finished. The binary itself restates a block at a time, and earlier, which is
+# fake-claude-blocks.sh; a whole restatement must not repeat the turn either.
 cat >/dev/null
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}'
 printf '%s\n' '{"type":"stream_event","session_id":"s1","event":{"type":"message_start","message":{"id":"msg_1","model":"claude-x","usage":{"input_tokens":11}}}}'

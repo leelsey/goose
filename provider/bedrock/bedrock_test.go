@@ -113,6 +113,110 @@ func TestRolesAlternateStrictly(t *testing.T) {
 	}
 }
 
+func toolLoop(results ...llm.Part) *llm.Request {
+	return &llm.Request{Model: "m", Messages: []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "make the directory"}}},
+		{Role: llm.RoleAssistant, Content: []llm.Part{&llm.ToolUse{ID: "t1", Name: "shell", Args: json.RawMessage(`{"cmd":"mkdir x"}`)}}},
+		{Role: llm.RoleTool, Content: results},
+		{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "summarise"}}},
+	}}
+}
+
+type sentBody struct {
+	Messages []struct {
+		Role    string `json:"role"`
+		Content []struct {
+			ToolResult *struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"toolResult"`
+		} `json:"content"`
+	} `json:"messages"`
+	ToolConfig *struct {
+		Tools []struct {
+			ToolSpec struct {
+				Name        string          `json:"name"`
+				InputSchema json.RawMessage `json:"inputSchema"`
+			} `json:"toolSpec"`
+		} `json:"tools"`
+	} `json:"toolConfig"`
+}
+
+func sent(t *testing.T, body string) sentBody {
+	t.Helper()
+	var out sentBody
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestAToolResultWithNothingInItStillCarriesABlock(t *testing.T) {
+	for name, content := range map[string][]llm.Part{
+		"none":         nil,
+		"empty text":   {&llm.Text{}},
+		"only dropped": {&llm.Image{URL: "https://example.com/a.png"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, bodies, _ := serve(t, cached())
+			if _, err := p.Complete(context.Background(), attempt(toolLoop(&llm.ToolResult{ID: "t1", Content: content}))); err != nil {
+				t.Fatal(err)
+			}
+			var found bool
+			for _, m := range sent(t, (*bodies)[0]).Messages {
+				for _, block := range m.Content {
+					if block.ToolResult == nil {
+						continue
+					}
+					found = true
+					var inner []map[string]any
+					if err := json.Unmarshal(block.ToolResult.Content, &inner); err != nil || len(inner) == 0 {
+						t.Fatalf("content = %s: Converse refuses a tool result with no block in it", block.ToolResult.Content)
+					}
+					if text, _ := inner[0]["text"].(string); strings.TrimSpace(text) == "" {
+						t.Fatalf("content = %s: a blank block says nothing either", block.ToolResult.Content)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("body = %s: the tool result went missing", (*bodies)[0])
+			}
+		})
+	}
+}
+
+func TestToolHistoryWithoutToolsDeclaresTheToolsItNames(t *testing.T) {
+	p, bodies, _ := serve(t, cached())
+	resp, err := p.Complete(context.Background(), attempt(toolLoop(&llm.ToolResult{ID: "t1", Name: "shell", Content: []llm.Part{&llm.Text{Text: "done"}}})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := sent(t, (*bodies)[0]).ToolConfig
+	if cfg == nil || len(cfg.Tools) != 1 || cfg.Tools[0].ToolSpec.Name != "shell" || len(cfg.Tools[0].ToolSpec.InputSchema) == 0 {
+		t.Fatalf("body = %s: Converse refuses toolUse and toolResult blocks without a toolConfig naming them", (*bodies)[0])
+	}
+	if !resp.Diagnostics.Has(llm.DropToolDefinition) {
+		t.Fatalf("diagnostics = %v: tools the request did not offer were declared without a word", resp.Diagnostics.Codes())
+	}
+
+	p, bodies, _ = serve(t, cached())
+	req := toolLoop(&llm.ToolResult{ID: "t1", Content: []llm.Part{&llm.Text{Text: "done"}}})
+	req.Tools = []llm.Tool{{Name: "search", Schema: []byte(`{"type":"object"}`)}}
+	if _, err := p.Complete(context.Background(), attempt(req)); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := sent(t, (*bodies)[0]).ToolConfig; cfg == nil || len(cfg.Tools) != 1 || cfg.Tools[0].ToolSpec.Name != "search" {
+		t.Fatalf("body = %s: the tools a request offers are the ones sent", (*bodies)[0])
+	}
+
+	p, bodies, _ = serve(t, cached())
+	if _, err := p.Complete(context.Background(), attempt(hello())); err != nil {
+		t.Fatal(err)
+	}
+	if sent(t, (*bodies)[0]).ToolConfig != nil {
+		t.Fatalf("body = %s: a conversation with no tools in it needs no toolConfig", (*bodies)[0])
+	}
+}
+
 func TestThinkingKeepsItsSignature(t *testing.T) {
 	p, bodies, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"output":{"message":{"role":"assistant","content":[
@@ -133,6 +237,32 @@ func TestThinkingKeepsItsSignature(t *testing.T) {
 	th, ok := resp.Choices[0].Message.Content[0].(*llm.Thinking)
 	if !ok || th.Signature != "sig" {
 		t.Fatalf("thinking = %+v", resp.Choices[0].Message.Content[0])
+	}
+}
+
+// A thinking block with no signature, whether it never had one or a foreign
+// one was stripped from it upstream, is not this backend's own reasoning and
+// must not be replayed as reasoningText with an empty signature: sent that
+// way it is indistinguishable from a block Claude never verified, and Claude
+// refuses it. Regression test for r3-cloud-1.
+func TestUnsignedThinkingIsNotReplayedWithAnEmptySignature(t *testing.T) {
+	p, bodies, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{}}`))
+	})
+	req := hello()
+	req.Messages = append(req.Messages, llm.Message{Role: llm.RoleAssistant, Content: []llm.Part{
+		&llm.Thinking{Text: "plan", Signature: ""},
+		&llm.Text{Text: "hi again"},
+	}})
+	resp, err := p.Complete(context.Background(), attempt(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains((*bodies)[0], `"signature":""`) {
+		t.Fatalf("body = %s: an unsigned block must not be sent as reasoningText with an empty signature", (*bodies)[0])
+	}
+	if !resp.Diagnostics.Has(llm.DropSignature) {
+		t.Fatalf("diagnostics = %+v: the drop must be reported", resp.Diagnostics)
 	}
 }
 
@@ -388,6 +518,28 @@ func TestAToolChoiceOfNoneIsReported(t *testing.T) {
 	}
 }
 
+func TestAdaptiveThinkingReachesTheModelAsNamed(t *testing.T) {
+	p, bodies, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{}}`))
+	})
+	req := hello()
+	req.Thinking = &llm.ThinkingConfig{Enabled: true, Budget: -1, Adaptive: true}
+	if _, err := p.Complete(context.Background(), attempt(req)); err != nil {
+		t.Fatal(err)
+	}
+	var sent struct {
+		Fields struct {
+			Thinking json.RawMessage `json:"thinking"`
+		} `json:"additionalModelRequestFields"`
+	}
+	if err := json.Unmarshal([]byte((*bodies)[0]), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if string(sent.Fields.Thinking) != `{"type":"adaptive"}` {
+		t.Fatalf("thinking = %s: the models that take this mode refuse a budget", sent.Fields.Thinking)
+	}
+}
+
 func TestOnlyModelsThatServeCachingAreSentCachePoints(t *testing.T) {
 	cases := []struct {
 		model string
@@ -405,5 +557,21 @@ func TestOnlyModelsThatServeCachingAreSentCachePoints(t *testing.T) {
 			t.Errorf("cacheable(%q) = %v, want %v: a cache point on a model that refuses one fails the whole request",
 				c.model, got, c.want)
 		}
+	}
+}
+
+// The region is spliced into the host a call is signed for and sent to, so
+// one that could end the host early or name another is refused at once.
+func TestARegionThatCouldMoveTheHostIsRefused(t *testing.T) {
+	creds := func(context.Context) (Credentials, error) {
+		return Credentials{AccessKeyID: "AK", SecretAccessKey: "SK"}, nil
+	}
+	for _, region := range []string{"x@127.0.0.1:18409/#", "us-east-1.evil.example", "US-EAST-1", "a/b"} {
+		if _, err := New(Options{Region: region, Credentials: creds}); err == nil {
+			t.Fatalf("region %q was spliced into the host", region)
+		}
+	}
+	if _, err := New(Options{Region: "eu-west-2", Credentials: creds}); err != nil {
+		t.Fatalf("a region's name was refused: %v", err)
 	}
 }

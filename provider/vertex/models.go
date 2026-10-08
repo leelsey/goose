@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/leelsey/goose/internal/httpcore"
 	"github.com/leelsey/goose/llm"
@@ -33,6 +34,42 @@ func (g *garden) Bind(env llm.Env) error {
 		return b.Bind(env)
 	}
 	return nil
+}
+
+func (g *garden) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response, error) {
+	resp, err := g.Provider.Complete(ctx, a)
+	if err != nil {
+		refine(llm.AsError(err))
+	}
+	return resp, err
+}
+
+func (g *garden) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, error) {
+	s, err := g.Provider.Stream(ctx, a)
+	if err != nil {
+		refine(llm.AsError(err))
+	}
+	return s, err
+}
+
+// refine reads what the status does not say. Vertex refuses a model it will
+// not serve this project or region with the 400 a malformed request gets as
+// often as with a 404, and only a malformed request fails the same on every
+// backend.
+func refine(e *llm.Error) {
+	if e.Kind != llm.KindInvalidRequest {
+		return
+	}
+	said := strings.ToLower(e.Message)
+	if !strings.Contains(said, "publisher model") {
+		return
+	}
+	for _, unserved := range []string{"not found", "not allowed to use", "not servable", "does not have access"} {
+		if strings.Contains(said, unserved) {
+			e.Kind = llm.KindNotFound
+			return
+		}
+	}
 }
 
 func (g *garden) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassResponse, error) {

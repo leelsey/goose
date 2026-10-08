@@ -143,6 +143,248 @@ func TestPrimeReportsFailureBeforeCommit(t *testing.T) {
 	}
 }
 
+// A backend that answers and then fails on its first event has delivered
+// nothing, so that is a failure before the first frame too. What the event
+// counted is still the stream's to report.
+func TestPrimeReportsAFirstFrameThatIsOnlyAFailure(t *testing.T) {
+	boom := &Error{Kind: KindOverloaded, Message: "overloaded", Sent: true}
+	s := frames(&Frame{Err: boom, Usage: &Usage{Prompt: 9, Reported: true}})
+	if err := s.Prime(); !errors.Is(err, boom) {
+		t.Fatalf("prime err = %v: nothing was delivered, so the router can still go elsewhere", err)
+	}
+	if s.Committed() {
+		t.Fatal("a failure before any content is still a routing decision")
+	}
+	if u := s.Usage(); u.Prompt != 9 {
+		t.Fatalf("usage = %+v: the failed event was still counted", u)
+	}
+
+	s = frames(&Frame{Delta: []Part{&Text{Text: "half"}}, Err: boom})
+	if err := s.Prime(); err != nil {
+		t.Fatalf("prime err = %v: a frame with content in it is an answer that began", err)
+	}
+	if got := drain(s); len(got) != 1 || s.Err() == nil {
+		t.Fatalf("frames = %d, err = %v", len(got), s.Err())
+	}
+}
+
+// A backend opens with frames that name and count the answer before any of it
+// arrives, and can fail after them. Nothing has been delivered until content
+// has, so that failure is still one the router can walk past.
+func TestPrimeHoldsWhatArrivesBeforeContent(t *testing.T) {
+	boom := &Error{Kind: KindOverloaded, Message: "overloaded", Sent: true}
+	opening := func() *Frame {
+		return &Frame{ID: "msg_1", Model: "claude-x", Role: RoleAssistant, Usage: &Usage{Prompt: 12, Reported: true}}
+	}
+	for name, fs := range map[string][]*Frame{
+		"after the opening frame": {opening(), {Err: boom}},
+		"after the closing count": {
+			{Usage: &Usage{Prompt: 12, Reported: true}, Total: true, TurnEnd: true, Stop: StopEnd},
+			{Err: boom},
+		},
+	} {
+		s := frames(fs...)
+		if err := s.Prime(); !errors.Is(err, boom) {
+			t.Fatalf("%s: prime err = %v: nothing had been delivered, so the router can still go elsewhere", name, err)
+		}
+		if s.Committed() {
+			t.Fatalf("%s: a failure before any content is still a routing decision", name)
+		}
+		if u := s.Usage(); u.Prompt != 12 {
+			t.Fatalf("%s: usage = %+v: what the opening counted is still reported", name, u)
+		}
+	}
+
+	s := frames(opening(), &Frame{Delta: []Part{&Text{Text: "hi"}}}, &Frame{Stop: StopEnd})
+	if err := s.Prime(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Committed() || s.Meta().ID != "msg_1" {
+		t.Fatalf("committed = %v, meta = %+v", s.Committed(), s.Meta())
+	}
+	if got := drain(s); len(got) != 3 || got[0].ID != "msg_1" || TextOf(got[1].Delta) != "hi" || s.Err() != nil {
+		t.Fatalf("frames = %+v, err = %v: what was held is delivered once, in order", got, s.Err())
+	}
+
+	s = frames(opening(), &Frame{Stop: StopEnd, TurnEnd: true})
+	if err := s.Prime(); err != nil {
+		t.Fatalf("prime err = %v: an answer with nothing in it is still an answer", err)
+	}
+	if got := drain(s); len(got) != 2 || s.Err() != nil {
+		t.Fatalf("frames = %d, err = %v", len(got), s.Err())
+	}
+
+	s = frames(opening())
+	s.Tolerate(WireNoFinish)
+	if err := s.Prime(); err != nil {
+		t.Fatalf("prime err = %v: the caller chose to live with an unfinished answer", err)
+	}
+
+	var many []*Frame
+	for range maxHeld + 4 {
+		many = append(many, opening())
+	}
+	s = frames(append(many, &Frame{Err: boom})...)
+	if err := s.Prime(); err != nil {
+		t.Fatalf("prime err = %v: past the bound, the stream is handed over as it stands", err)
+	}
+	if got := drain(s); len(got) != len(many)+1 || !errors.Is(s.Err(), boom) {
+		t.Fatalf("frames = %d, err = %v", len(got), s.Err())
+	}
+}
+
+// A stream held to a policy stops at the first frame carrying a loss the policy
+// refuses, without delivering it, and says why. What it delivered before that
+// stays delivered, and a stream refused at its first frame has delivered none.
+func TestAnEnforcedStreamStopsAtALossItRefuses(t *testing.T) {
+	lost := Diagnostic{Code: DropRefusal, Class: ClassContent, Severity: SeverityLoss}
+	s := frames(
+		&Frame{Delta: []Part{&Text{Text: "a"}}},
+		&Frame{Delta: []Part{&Text{Text: "b"}}, Diagnostics: Diagnostics{lost}},
+		&Frame{Delta: []Part{&Text{Text: "c"}}},
+	)
+	ended := 0
+	s.OnEnd(func(*Stream) { ended++ })
+	s.Enforce(LossPolicy{Strict: true}, Renders{})
+	if got := drain(s); len(got) != 1 || TextOf(got[0].Delta) != "a" {
+		t.Fatalf("frames = %+v: delivery went on past the loss", got)
+	}
+	if e := AsError(s.Err()); e == nil || e.Kind != KindLoss {
+		t.Fatalf("err = %v: a refused stream that ends cleanly reads as a whole answer", s.Err())
+	}
+	if ended != 1 {
+		t.Fatalf("end hook fired %d times", ended)
+	}
+
+	s = frames(&Frame{Delta: []Part{&Text{Text: "b"}}, Diagnostics: Diagnostics{lost}})
+	if err := s.Prime(); err != nil {
+		t.Fatal(err)
+	}
+	s.Enforce(LossPolicy{Deny: []string{DropRefusal}}, Renders{})
+	if got := drain(s); len(got) != 0 || s.Committed() {
+		t.Fatalf("frames = %d, committed = %v: the lossy first frame was delivered", len(got), s.Committed())
+	}
+	if e := AsError(s.Err()); e == nil || e.Kind != KindLoss {
+		t.Fatalf("err = %v", s.Err())
+	}
+
+	s = frames(&Frame{Delta: []Part{&Text{Text: "b"}}, Diagnostics: Diagnostics{lost}}, &Frame{Stop: StopEnd})
+	s.Enforce(LossPolicy{}, Renders{})
+	if got := drain(s); len(got) != 2 || s.Err() != nil {
+		t.Fatalf("frames = %d, err = %v: a policy that accepts the loss delivers it", len(got), s.Err())
+	}
+
+	s = frames(&Frame{Delta: []Part{&Text{Text: "b"}}}, &Frame{Stop: StopEnd})
+	s.Enforce(LossPolicy{Strict: true}, Renders{})
+	s.Note(lost)
+	if got := drain(s); len(got) != 2 || s.Err() != nil {
+		t.Fatalf("frames = %d, err = %v: a note added afterwards is the caller's own", len(got), s.Err())
+	}
+
+	// An answer with no content in it ends while it is primed, and is held to
+	// the policy all the same.
+	s = frames(&Frame{Stop: StopEnd, TurnEnd: true})
+	if err := s.Prime(); err != nil {
+		t.Fatal(err)
+	}
+	s.Note(lost)
+	s.Enforce(LossPolicy{Strict: true}, Renders{})
+	if got := drain(s); len(got) != 0 {
+		t.Fatalf("frames = %d: a refused answer was delivered because it had already ended", len(got))
+	}
+	if e := AsError(s.Err()); e == nil || e.Kind != KindLoss {
+		t.Fatalf("err = %v", s.Err())
+	}
+}
+
+// A stream held to a policy for a destination weighs what it hands over
+// against what that destination can write out: a block carried from a wire it
+// does not speak is refused before it is delivered, held frames included, and
+// the refusal is of something that was sent.
+func TestAnEnforcedStreamRefusesABlockItsDestinationCannotWriteOut(t *testing.T) {
+	carried := func() *Stream {
+		return frames(
+			&Frame{Role: RoleAssistant},
+			&Frame{Delta: []Part{&Raw{Vendor: "anthropic", Type: "web_search_tool_result", JSON: json.RawMessage(`{}`)}},
+				Diagnostics: Diagnostics{{Code: DropUnknownBlock, Class: ClassContent, Severity: SeverityInfo}}},
+			&Frame{Delta: []Part{&Text{Text: "so"}}},
+			&Frame{Stop: StopEnd},
+		)
+	}
+	s := carried()
+	if err := s.Prime(); err != nil {
+		t.Fatal(err)
+	}
+	s.Enforce(LossPolicy{Strict: true}, Renders{ToolCalls: true, Candidates: 128})
+	if got := drain(s); len(got) != 0 || s.Committed() {
+		t.Fatalf("frames = %d: the stream was handed over with a block its destination drops", len(got))
+	}
+	if e := AsError(s.Err()); e == nil || e.Kind != KindLoss || e.Code != DropUnknownBlock || !e.Sent {
+		t.Fatalf("err = %+v", e)
+	}
+
+	s = carried()
+	s.Enforce(LossPolicy{Strict: true}, Renders{ToolCalls: true, Candidates: 1, Raw: []string{"anthropic"}})
+	if got := drain(s); len(got) != 4 || s.Err() != nil {
+		t.Fatalf("frames = %d, err = %v: the block's own wire writes it out whole", len(got), s.Err())
+	}
+
+	s = carried()
+	s.Enforce(LossPolicy{Strict: true}, Renders{})
+	if got := drain(s); len(got) != 4 || s.Err() != nil {
+		t.Fatalf("frames = %d, err = %v: a library caller takes the block as it is", len(got), s.Err())
+	}
+}
+
+// What an encoder loses in writing a stream out is held to the policy the
+// stream was enforced with. A loss it will not take ends the stream there, as a
+// refusal of something sent, and nothing after it is delivered. A stream never
+// enforced, or a loss the policy takes, goes on.
+func TestAStreamRefusesWhatItsEncoderLosesWhereThePolicyWillNot(t *testing.T) {
+	lost := Diagnostic{Code: DropImage, Class: ClassContent, Stage: StageEncode, Severity: SeverityLoss}
+	two := func() *Stream {
+		return frames(&Frame{Delta: []Part{&Text{Text: "a"}}}, &Frame{Delta: []Part{&Text{Text: "b"}}}, &Frame{Stop: StopEnd})
+	}
+
+	s := two()
+	ended := 0
+	s.OnEnd(func(*Stream) { ended++ })
+	s.Enforce(LossPolicy{Strict: true}, Renders{})
+	var got []*Frame
+	for f := range s.Frames() {
+		got = append(got, f)
+		if err := s.Check(Diagnostics{lost}); err != nil {
+			if e := AsError(err); e.Kind != KindLoss || e.Code != DropImage || !e.Sent {
+				t.Fatalf("err = %+v", e)
+			}
+			break
+		}
+	}
+	if len(got) != 1 || ended != 1 {
+		t.Fatalf("frames = %d, ended = %d: delivery went on past what the encoder lost", len(got), ended)
+	}
+	if e := AsError(s.Err()); e == nil || e.Code != DropImage {
+		t.Fatalf("err = %v: the stream does not say why it ended", s.Err())
+	}
+
+	for _, s := range []*Stream{two(), func() *Stream {
+		s := two()
+		s.Enforce(LossPolicy{Strict: true, Allow: []string{DropImage}}, Renders{})
+		return s
+	}()} {
+		n := 0
+		for range s.Frames() {
+			n++
+			if err := s.Check(Diagnostics{lost}); err != nil {
+				t.Fatalf("err = %v: nothing here refuses the loss", err)
+			}
+		}
+		if n != 3 || s.Err() != nil {
+			t.Fatalf("frames = %d, err = %v", n, s.Err())
+		}
+	}
+}
+
 func TestCloseBanksAndIsIdempotent(t *testing.T) {
 	closed := 0
 	s := NewStream(StreamMeta{}, func() (*Frame, error) {
@@ -222,7 +464,7 @@ func TestOnEndFiresOnceHoweverTheStreamEnds(t *testing.T) {
 }
 
 func TestOnEndFiresOnCloseWithoutIteration(t *testing.T) {
-	s := frames(&Frame{Usage: &Usage{Prompt: 1, Reported: true}})
+	s := frames(&Frame{Usage: &Usage{Prompt: 1, Reported: true}}, &Frame{Delta: []Part{&Text{Text: "hi"}}})
 	ended := 0
 	s.OnEnd(func(*Stream) { ended++ })
 	if err := s.Prime(); err != nil {

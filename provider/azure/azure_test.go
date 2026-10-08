@@ -163,3 +163,16 @@ func TestTheDeploymentDoesNotRewriteTheChatModel(t *testing.T) {
 		t.Fatalf("body model = %q, want what was asked for", sent.Model)
 	}
 }
+
+// The resource becomes the host the key is sent to, so anything that could
+// end the host early or name another one is refused before a request is built.
+func TestAResourceThatCouldMoveTheHostIsRefused(t *testing.T) {
+	for _, resource := range []string{"x@127.0.0.1:18409/#", "evil.example.com/#", "a.b", "a b"} {
+		if _, err := New(Options{Resource: resource, APIKey: "k"}); err == nil {
+			t.Fatalf("resource %q was spliced into the host", resource)
+		}
+	}
+	if _, err := New(Options{Resource: "my-Resource-01", APIKey: "k"}); err != nil {
+		t.Fatalf("a resource's name was refused: %v", err)
+	}
+}

@@ -5,6 +5,7 @@ package ollama
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -139,5 +140,57 @@ func TestTheBackendsOwnTimestampSurvives(t *testing.T) {
 	}
 	if resp.Created.IsZero() {
 		t.Fatal("a backend that said nothing still needs a stamp")
+	}
+}
+
+// The Anthropic and Gemini wires carry a tool result inside a user turn, and
+// this backend takes one only as a tool message of its own. The result must
+// reach it as one, named by the tool it answers, and the user turn that held
+// nothing else must not reach it empty. Regression test for r4-prov-4.
+func TestAToolResultInAUserTurnReachesTheBackend(t *testing.T) {
+	p, bodies := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"m","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}`))
+	})
+	result := &llm.ToolResult{ID: "c1", Content: []llm.Part{&llm.Text{Text: "20C"}}}
+	for name, c := range map[string]struct {
+		last []llm.Part
+		want []map[string]string
+	}{
+		"alone": {[]llm.Part{result}, []map[string]string{
+			{"role": "tool", "tool_name": "get_weather", "content": "20C"},
+		}},
+		"beside the user's next words": {[]llm.Part{result, &llm.Text{Text: "and tomorrow?"}}, []map[string]string{
+			{"role": "tool", "tool_name": "get_weather", "content": "20C"},
+			{"role": "user", "content": "and tomorrow?"},
+		}},
+	} {
+		req := hello()
+		req.Messages = []llm.Message{
+			{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "weather?"}}},
+			{Role: llm.RoleAssistant, Content: []llm.Part{&llm.ToolUse{ID: "c1", Name: "get_weather", Args: json.RawMessage(`{}`)}}},
+			{Role: llm.RoleUser, Content: c.last},
+		}
+		if _, err := p.Complete(context.Background(), attempt(req)); err != nil {
+			t.Fatal(err)
+		}
+		body := (*bodies)[len(*bodies)-1]
+		var sent struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(body), &sent); err != nil {
+			t.Fatal(err)
+		}
+		if len(sent.Messages) != 2+len(c.want) {
+			t.Errorf("%s: body = %s: want the tool loop and %d more messages", name, body, len(c.want))
+			continue
+		}
+		for i, want := range c.want {
+			got := sent.Messages[2+i]
+			for k, v := range want {
+				if got[k] != v {
+					t.Errorf("%s: message %d = %v, want %s %q", name, 2+i, got, k, v)
+				}
+			}
+		}
 	}
 }

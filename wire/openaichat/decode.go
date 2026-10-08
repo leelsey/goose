@@ -46,6 +46,15 @@ type wireToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	ExtraContent *extraContent `json:"extra_content"`
+}
+
+// extraContent is where Google's OpenAI-compatible endpoint puts a Gemini call's
+// thought signature, and the one field this wire has for one.
+type extraContent struct {
+	Google struct {
+		ThoughtSignature string `json:"thought_signature"`
+	} `json:"google"`
 }
 
 type wireMessage struct {
@@ -305,12 +314,18 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 
 func decodeMessage(m wireMessage, legacy *legacyCalls) (llm.Message, llm.Diagnostics, error) {
 	var diags llm.Diagnostics
-	out := llm.Message{Role: llm.Role(m.Role), Name: m.Name}
+	out := llm.Message{Role: llm.Role(m.Role)}
 	if !validRole[m.Role] {
 		return out, diags, llm.Errorf(llm.KindInvalidRequest, "unknown role %q", m.Role)
 	}
 	if m.Role == "function" {
 		out.Role = llm.RoleTool
+	}
+	// A tool or function message's name is the call it answers, which the
+	// result holds. On the message it would read as a participant's name,
+	// which most backends have no field for.
+	if out.Role != llm.RoleTool {
+		out.Name = m.Name
 	}
 
 	parts, d, err := decodeContent(m.Content)
@@ -337,12 +352,16 @@ func decodeMessage(m wireMessage, legacy *legacyCalls) (llm.Message, llm.Diagnos
 		if tc.Index != nil {
 			idx = *tc.Index
 		}
-		out.Content = append(out.Content, &llm.ToolUse{
+		call := &llm.ToolUse{
 			ID:    tc.ID,
 			Name:  tc.Function.Name,
 			Args:  json.RawMessage(tc.Function.Arguments),
 			Index: &idx,
-		})
+		}
+		if x := tc.ExtraContent; x != nil {
+			call.Signer, call.Signature = wirecore.OpenSignature(llm.FamilyGoogle, x.Google.ThoughtSignature)
+		}
+		out.Content = append(out.Content, call)
 	}
 	if fc := m.FunctionCall; fc != nil && fc.Name != "" && len(m.ToolCalls) == 0 {
 		idx := 0

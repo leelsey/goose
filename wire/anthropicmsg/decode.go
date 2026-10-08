@@ -54,7 +54,7 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 	opts.RequestModel = req.Model
 
 	if raw, ok := top["system"]; ok && string(raw) != "null" {
-		parts, hint, d, err := decodeBlocks(raw)
+		parts, hint, d, err := decodeBlocks(raw, true, false)
 		if err != nil {
 			return nil, opts, diags, fmt.Errorf("system: %w", err)
 		}
@@ -78,7 +78,7 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 		if m.Role != "user" && m.Role != "assistant" {
 			return nil, opts, diags, llm.Errorf(llm.KindInvalidRequest, "messages[%d]: unknown role %q", i, m.Role)
 		}
-		parts, hint, d, err := decodeBlocks(m.Content)
+		parts, hint, d, err := decodeBlocks(m.Content, true, false)
 		if err != nil {
 			return nil, opts, diags, fmt.Errorf("messages[%d]: %w", i, err)
 		}
@@ -196,7 +196,13 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 			return nil, opts, diags, llm.Errorf(llm.KindInvalidRequest, "thinking: %v", err)
 		}
 		req.Thinking = &llm.ThinkingConfig{Enabled: th.Type == "enabled", Budget: th.Budget}
-		if th.Type != "enabled" && th.Type != "disabled" {
+		switch th.Type {
+		case "enabled", "disabled":
+		case "adaptive":
+			// The models that take this mode refuse a budget, so the mode itself
+			// travels; a backend without it reads the budget of -1 instead.
+			req.Thinking = &llm.ThinkingConfig{Enabled: true, Budget: -1, Adaptive: true}
+		default:
 			diags = append(diags, llm.Diagnostic{
 				Code: llm.DropExtraField, Class: llm.ClassContent, Stage: llm.StageDecode,
 				Severity: llm.SeverityLoss, Format: Name, Field: "thinking.type",
@@ -225,6 +231,7 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 		req.Extra[k] = v
 	}
 
+	req.Betas = betas(in)
 	opts.Key = in.Get("x-api-key")
 	if opts.Key == "" {
 		opts.Key = bearer(in.Get("Authorization"))
@@ -232,11 +239,36 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 	return req, opts, diags, nil
 }
 
-func DecodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnostics, error) {
-	return decodeBlocks(raw)
+// betas are the flags the caller opened its own fields with, once each. A
+// field sent without the flag it needs makes the backend refuse the request.
+func betas(in *wire.Inbound) []string {
+	if in == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range in.Header.Values("anthropic-beta") {
+		for _, b := range strings.Split(v, ",") {
+			if b = strings.TrimSpace(b); b != "" && !seen[b] {
+				seen[b] = true
+				out = append(out, b)
+			}
+		}
+	}
+	return out
 }
 
-func decodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnostics, error) {
+// DecodeBlocks reads blocks a backend on this wire sent, so every signature on
+// them is Anthropic's as it stands.
+func DecodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnostics, error) {
+	return decodeBlocks(raw, false, false)
+}
+
+// decodeBlocks reads a turn's blocks. A client's signature may be one goose
+// handed it for another family, and says so; a backend's is its own. inResult
+// says the blocks are a tool result's content, which holds no tool result of
+// its own.
+func decodeBlocks(raw json.RawMessage, client, inResult bool) ([]llm.Part, *llm.CacheHint, llm.Diagnostics, error) {
 	var diags llm.Diagnostics
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil, diags, nil
@@ -286,7 +318,14 @@ func decodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnost
 			}
 			b, _ := json.Marshal(item)
 			_ = json.Unmarshal(b, &t)
-			parts = append(parts, &llm.Thinking{Text: t.Thinking, Signature: t.Signature})
+			th := &llm.Thinking{Text: t.Thinking, Signature: t.Signature}
+			switch {
+			case client:
+				th.Signer, th.Signature = wirecore.OpenSignature(llm.FamilyAnthropic, t.Signature)
+			case t.Signature != "":
+				th.Signer = llm.FamilyAnthropic
+			}
+			parts = append(parts, th)
 		case "redacted_thinking":
 			var d string
 			_ = field(item, "data", &d)
@@ -301,14 +340,17 @@ func decodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnost
 			_ = json.Unmarshal(b, &t)
 			parts = append(parts, &llm.ToolUse{ID: t.ID, Name: t.Name, Args: t.Input})
 		case "tool_result":
-			var t struct {
-				ID      string          `json:"tool_use_id"`
-				IsError bool            `json:"is_error"`
-				Content json.RawMessage `json:"content"`
+			// Each level read again from the top would cost the square of how
+			// deep a caller nests them, and the backend refuses the nesting
+			// anyway.
+			if inResult {
+				return nil, nil, diags, llm.Errorf(llm.KindInvalidRequest, "content: a tool result cannot hold another tool result")
 			}
-			b, _ := json.Marshal(item)
-			_ = json.Unmarshal(b, &t)
-			inner, innerHint, d, err := decodeBlocks(t.Content)
+			var id string
+			var isError bool
+			_ = field(item, "tool_use_id", &id)
+			_ = field(item, "is_error", &isError)
+			inner, innerHint, d, err := decodeBlocks(item["content"], client, true)
 			if err != nil {
 				return nil, nil, diags, err
 			}
@@ -322,13 +364,20 @@ func decodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnost
 					Detail: "a breakpoint inside a tool result has nowhere to sit once the result is a part, so it was not kept",
 				})
 			}
-			parts = append(parts, &llm.ToolResult{ID: t.ID, Content: inner, IsError: t.IsError})
+			parts = append(parts, &llm.ToolResult{ID: id, Content: inner, IsError: isError})
 		case "image":
 			img, err := decodeImage(item)
 			if err != nil {
 				return nil, nil, diags, err
 			}
 			parts = append(parts, img)
+			if _, carried := img.(*llm.Raw); carried {
+				diags = append(diags, llm.Diagnostic{
+					Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageDecode,
+					Severity: llm.SeverityInfo, Format: Name, Field: kind,
+					Detail: "content block carried verbatim",
+				})
+			}
 		default:
 			b, _ := json.Marshal(item)
 			parts = append(parts, &llm.Raw{Vendor: Name, Type: kind, JSON: b})
@@ -342,7 +391,7 @@ func decodeBlocks(raw json.RawMessage) ([]llm.Part, *llm.CacheHint, llm.Diagnost
 	return parts, hint, diags, nil
 }
 
-func decodeImage(item map[string]json.RawMessage) (*llm.Image, error) {
+func decodeImage(item map[string]json.RawMessage) (llm.Part, error) {
 	var src struct {
 		Type      string `json:"type"`
 		MediaType string `json:"media_type"`
@@ -353,6 +402,14 @@ func decodeImage(item map[string]json.RawMessage) (*llm.Image, error) {
 		if err := json.Unmarshal(raw, &src); err != nil {
 			return nil, llm.Errorf(llm.KindInvalidRequest, "image source: %v", err)
 		}
+	}
+	switch src.Type {
+	case "", "base64", "url":
+	default:
+		// A file the Files API holds is a name only the backend that keeps it
+		// can resolve. As an image it would carry neither bytes nor an address.
+		b, _ := json.Marshal(item)
+		return &llm.Raw{Vendor: Name, Type: "image", JSON: b}, nil
 	}
 	img := &llm.Image{MIME: src.MediaType, URL: src.URL}
 	if src.Type == "base64" && src.Data != "" {

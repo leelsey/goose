@@ -30,10 +30,7 @@ type genConfig struct {
 	Seed             *int64          `json:"seed"`
 	FrequencyPenalty *float64        `json:"frequencyPenalty"`
 	PresencePenalty  *float64        `json:"presencePenalty"`
-	ThinkingConfig   *struct {
-		ThinkingBudget  *int `json:"thinkingBudget"`
-		IncludeThoughts bool `json:"includeThoughts"`
-	} `json:"thinkingConfig"`
+	ThinkingConfig   json.RawMessage `json:"thinkingConfig"`
 }
 
 var modelledConfig = map[string]bool{
@@ -42,6 +39,8 @@ var modelledConfig = map[string]bool{
 	"responseschema": true, "seed": true, "thinkingconfig": true,
 	"frequencypenalty": true, "presencepenalty": true,
 }
+
+var modelledThinking = map[string]bool{"thinkingbudget": true, "includethoughts": true}
 
 func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagnostics, error) {
 	var diags llm.Diagnostics
@@ -97,7 +96,7 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 				Detail: "role " + strconv.Quote(ct.Role) + " is not one this format has, so the turn was read as the caller's",
 			})
 		}
-		parts, d, err := decodeParts(ct.Parts, mint)
+		parts, d, err := decodeParts(ct.Parts, mint, true)
 		if err != nil {
 			return nil, opts, diags, err
 		}
@@ -116,7 +115,7 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 		if err := json.Unmarshal(sys, &block); err != nil {
 			return nil, opts, diags, llm.Errorf(llm.KindInvalidRequest, "systemInstruction: %v", err)
 		}
-		parts, d, err := decodeParts(block.Parts, mint)
+		parts, d, err := decodeParts(block.Parts, mint, true)
 		if err != nil {
 			return nil, opts, diags, err
 		}
@@ -144,12 +143,11 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 				Detail: "this setting arrived spelled more than one way, and only the last of them was read",
 			})
 		}
-		if rest := wirecore.NestedExtra(cfgRaw, modelledConfig); rest != nil {
-			if req.Extra == nil {
-				req.Extra = map[string]json.RawMessage{}
-				req.ExtraFrom = Name
+		rest := map[string]json.RawMessage{}
+		if kept := wirecore.NestedExtra(cfgRaw, modelledConfig); kept != nil {
+			if err := json.Unmarshal(kept, &rest); err != nil {
+				return nil, opts, diags, llm.Errorf(llm.KindInternal, "generationConfig: %v", err)
 			}
-			req.Extra["generationConfig"] = rest
 		}
 		if cfg.ResponseMimeType == "application/json" || len(cfg.ResponseSchema) > 0 {
 			req.ResponseFormat = &llm.ResponseFormat{Type: "json_schema", Schema: cfg.ResponseSchema}
@@ -157,12 +155,26 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 				req.ResponseFormat.Type = "json_object"
 			}
 		}
-		if cfg.ThinkingConfig != nil {
-			req.Thinking = &llm.ThinkingConfig{Enabled: true}
-			if cfg.ThinkingConfig.ThinkingBudget != nil {
-				req.Thinking.Budget = *cfg.ThinkingConfig.ThinkingBudget
-				req.Thinking.Enabled = *cfg.ThinkingConfig.ThinkingBudget != 0
+		if len(cfg.ThinkingConfig) > 0 && string(cfg.ThinkingConfig) != "null" {
+			thinking, carried, err := decodeThinking(cfg.ThinkingConfig)
+			if err != nil {
+				return nil, opts, diags, err
 			}
+			req.Thinking = thinking
+			if carried != nil {
+				rest["thinkingConfig"] = carried
+			}
+		}
+		if len(rest) > 0 {
+			raw, err := json.Marshal(rest)
+			if err != nil {
+				return nil, opts, diags, llm.Errorf(llm.KindInternal, "generationConfig: %v", err)
+			}
+			if req.Extra == nil {
+				req.Extra = map[string]json.RawMessage{}
+				req.ExtraFrom = Name
+			}
+			req.Extra["generationConfig"] = raw
 		}
 	}
 
@@ -230,11 +242,57 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 	return req, opts, diags, nil
 }
 
-func DecodeParts(raw []json.RawMessage) ([]llm.Part, llm.Diagnostics, error) {
-	return decodeParts(raw, newIDMinters())
+// decodeThinking reads a thinkingConfig into the neutral request and returns
+// what the neutral request has no field for, such as a thinking level, to
+// travel to a backend on this wire. This wire hands the thoughts back only
+// when asked to.
+func decodeThinking(raw json.RawMessage) (*llm.ThinkingConfig, json.RawMessage, error) {
+	var th struct {
+		ThinkingBudget  *int `json:"thinkingBudget"`
+		IncludeThoughts bool `json:"includeThoughts"`
+	}
+	if err := json.Unmarshal(raw, &th); err != nil {
+		return nil, nil, llm.Errorf(llm.KindInvalidRequest, "generationConfig.thinkingConfig: %v", err)
+	}
+	out := &llm.ThinkingConfig{Enabled: true}
+	if th.ThinkingBudget != nil {
+		out.Budget = *th.ThinkingBudget
+		out.Enabled = *th.ThinkingBudget != 0
+	}
+	// With thinking off there is no level to keep and no thought to show.
+	if !out.Enabled {
+		return out, nil, nil
+	}
+	out.Hidden = !th.IncludeThoughts
+	return out, wirecore.NestedExtra(raw, modelledThinking), nil
 }
 
-func decodeParts(raw []json.RawMessage, mint *idMinters) ([]llm.Part, llm.Diagnostics, error) {
+// DecodeParts reads parts a Gemini backend sent, so every signature on them is
+// Google's as it stands.
+func DecodeParts(raw []json.RawMessage) ([]llm.Part, llm.Diagnostics, error) {
+	return decodeParts(raw, newIDMinters(), false)
+}
+
+// textKeys are what a text part is made of. A signed part with anything else
+// is a kind this wire does not model, and read as text it would lose that.
+var textKeys = map[string]bool{"text": true, "thought": true, "thoughtSignature": true}
+
+func textLike(item json.RawMessage) bool {
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(item, &keys) != nil {
+		return false
+	}
+	for k := range keys {
+		if !textKeys[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeParts reads a turn's parts. A client's signature may be one goose
+// handed it for another family, and says so; a backend's is its own.
+func decodeParts(raw []json.RawMessage, mint *idMinters, client bool) ([]llm.Part, llm.Diagnostics, error) {
 	var diags llm.Diagnostics
 	var out []llm.Part
 	for _, item := range raw {
@@ -264,13 +322,20 @@ func decodeParts(raw []json.RawMessage, mint *idMinters) ([]llm.Part, llm.Diagno
 		if err := json.Unmarshal(item, &p); err != nil {
 			return nil, diags, llm.Errorf(llm.KindInvalidRequest, "parts: %v", err)
 		}
+		signer, sig := llm.Family(""), p.ThoughtSignature
+		switch {
+		case client:
+			signer, sig = wirecore.OpenBytesSignature(llm.FamilyGoogle, sig)
+		case sig != "":
+			signer = llm.FamilyGoogle
+		}
 		switch {
 		case p.FunctionCall != nil:
 			id := p.FunctionCall.ID
 			if id == "" {
 				id = mint.calls.Next(p.FunctionCall.Name)
 			}
-			out = append(out, &llm.ToolUse{ID: id, Name: p.FunctionCall.Name, Args: p.FunctionCall.Args})
+			out = append(out, &llm.ToolUse{ID: id, Name: p.FunctionCall.Name, Args: p.FunctionCall.Args, Signature: sig, Signer: signer})
 		case p.FunctionResponse != nil:
 			id := p.FunctionResponse.ID
 			if id == "" {
@@ -283,13 +348,13 @@ func decodeParts(raw []json.RawMessage, mint *idMinters) ([]llm.Part, llm.Diagno
 			if err != nil {
 				return nil, diags, llm.Errorf(llm.KindInvalidRequest, "inlineData: %v", err)
 			}
-			out = append(out, &llm.Image{MIME: p.InlineData.MimeType, Data: b})
+			out = append(out, &llm.Image{MIME: p.InlineData.MimeType, Data: b, Signature: sig, Signer: signer})
 		case p.FileData != nil:
-			out = append(out, &llm.Image{MIME: p.FileData.MimeType, URL: p.FileData.FileURI})
+			out = append(out, &llm.Image{MIME: p.FileData.MimeType, URL: p.FileData.FileURI, Signature: sig, Signer: signer})
 		case p.Thought:
-			out = append(out, &llm.Thinking{Text: p.Text, Signature: p.ThoughtSignature})
-		case p.Text != "":
-			out = append(out, &llm.Text{Text: p.Text})
+			out = append(out, &llm.Thinking{Text: p.Text, Signature: sig, Signer: signer})
+		case p.Text != "" || sig != "" && textLike(item):
+			out = append(out, &llm.Text{Text: p.Text, Signature: sig, Signer: signer})
 		default:
 			out = append(out, &llm.Raw{Vendor: Name, Type: "part", JSON: item})
 			diags = append(diags, llm.Diagnostic{

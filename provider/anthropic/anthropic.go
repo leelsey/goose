@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/leelsey/goose/internal/httpcore"
@@ -37,6 +38,9 @@ type Options struct {
 	KeyScheme      llm.CredentialScheme
 	Header         http.Header
 	NoConnectors   bool
+	// NoClientBetas keeps the caller's own beta flags, and the fields they open,
+	// from a surface that refuses flags it does not know.
+	NoClientBetas bool
 
 	Path        func(a *llm.Attempt, stream bool) string
 	RewriteBody func(body map[string]any, stream bool)
@@ -63,7 +67,7 @@ func New(o Options) (*Provider, error) {
 		o.Version = defaultVersion
 	}
 	p := &Provider{opts: o}
-	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout)}
+	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout), Refine: refine}
 	return p, nil
 }
 
@@ -80,6 +84,7 @@ func (p *Provider) Bind(env llm.Env) error {
 func (p *Provider) Capabilities() llm.Capabilities {
 	return llm.Capabilities{
 		KeyScheme:          p.opts.KeyScheme,
+		ClientKey:          p.opts.AllowClientKey && p.opts.APIKey == "" && p.opts.Sign == nil,
 		Streaming:          true,
 		Usage:              llm.UsageShape{StreamUsage: true},
 		SystemPrompt:       true,
@@ -91,6 +96,7 @@ func (p *Provider) Capabilities() llm.Capabilities {
 		ImageIn:            true,
 		Thinking:           true,
 		ThinkingSignatures: true,
+		Signer:             llm.FamilyAnthropic,
 		RedactedThinking:   true,
 		Effort:             false,
 		ResponseFormat:     false,
@@ -124,17 +130,31 @@ func (p *Provider) header(a *llm.Attempt) http.Header {
 	if key := p.key(a); key != "" && p.opts.Sign == nil {
 		h.Set("x-api-key", key)
 	}
-	betas := p.opts.Betas
-	if a != nil && a.Request != nil && len(a.Request.MCPServers) > 0 && !slices.Contains(betas, mcpBeta) {
-		betas = append(append([]string(nil), betas...), mcpBeta)
-	}
-	for _, b := range betas {
-		h.Add("anthropic-beta", b)
-	}
+	addBetas(h, p.betas(a))
 	return h
 }
 
-const mcpBeta = "mcp-client-2025-11-20"
+// betas are the flags a call goes out with: the operator's, the caller's where
+// this surface takes them, and the one its tool servers need.
+func (p *Provider) betas(a *llm.Attempt) []string {
+	betas := slices.Clone(p.opts.Betas)
+	if a != nil && a.Request != nil {
+		if !p.opts.NoClientBetas {
+			betas = append(betas, a.Request.Betas...)
+		}
+		if len(a.Request.MCPServers) > 0 {
+			betas = append(betas, mcpBeta)
+		}
+	}
+	return betas
+}
+
+const (
+	mcpBeta = "mcp-client-2025-11-20"
+	// Under this flag a budget covers every thinking block of a turn, and may
+	// be larger than the output ceiling of any one answer.
+	interleavedBeta = "interleaved-thinking-"
+)
 
 type upstreamResponse struct {
 	ID           string              `json:"id"`
@@ -191,10 +211,12 @@ func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response,
 			}
 			kind = out.Error.Type
 		}
-		return nil, &llm.Error{
+		e := &llm.Error{
 			Kind: kindForType(kind), Provider: p.ID(), Sent: true, Status: 200,
-			Code: kind, Message: message, Body: string(raw),
+			Code: kind, Message: message, Body: httpcore.ErrorBody(raw),
 		}
+		refine(e)
+		return nil, e
 	}
 	parts, _, d, perr := anthropicmsg.DecodeBlocks(mustArray(out.Content))
 	if perr != nil {
@@ -250,6 +272,8 @@ func decodeStop(s string) llm.StopReason {
 		return llm.StopPause
 	case "refusal":
 		return llm.StopRefusal
+	case "model_context_window_exceeded":
+		return llm.StopContextOverflow
 	case "":
 		return llm.StopNone
 	default:
@@ -264,6 +288,23 @@ func (p *Provider) endpoint(a *llm.Attempt, stream bool) string {
 	return httpcore.JoinURL(p.opts.BaseURL, "/v1/messages")
 }
 
+// addBetas asks for the configured betas beside any the caller asked for, once
+// each.
+func addBetas(h http.Header, betas []string) {
+	asked := map[string]bool{}
+	for _, v := range h.Values("anthropic-beta") {
+		for _, b := range strings.Split(v, ",") {
+			asked[strings.TrimSpace(b)] = true
+		}
+	}
+	for _, b := range betas {
+		if !asked[b] {
+			asked[b] = true
+			h.Add("anthropic-beta", b)
+		}
+	}
+}
+
 func (p *Provider) passKey(r *llm.PassRequest) string {
 	if p.opts.APIKey != "" {
 		return p.opts.APIKey
@@ -276,18 +317,24 @@ func (p *Provider) passKey(r *llm.PassRequest) string {
 
 func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassResponse, error) {
 	url := httpcore.JoinURL(p.opts.BaseURL, r.Path)
-	if r.Query != "" {
-		url += "?" + r.Query
+	q, err := httpcore.PassQuery(p.ID(), r.Query)
+	if err != nil {
+		return nil, err
+	}
+	if q != "" {
+		url += "?" + q
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, url, r.Body)
 	if err != nil {
 		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(), Message: err.Error()}
 	}
 	httpcore.ForwardPassthrough(req.Header, r.Header)
+	httpcore.Overlay(req.Header, p.opts.Header)
 	req.Header.Set("anthropic-version", p.opts.Version)
 	if key := p.passKey(r); key != "" && p.opts.Sign == nil {
 		req.Header.Set("x-api-key", key)
 	}
+	addBetas(req.Header, p.opts.Betas)
 	if p.opts.Sign != nil {
 		// The body is a stream here, so a signer that covers it cannot be used
 		// for passthrough; the token minters this reaches do not read it.

@@ -291,6 +291,21 @@ func TestStreamEmitsCompleteToolArguments(t *testing.T) {
 	}
 }
 
+func TestStreamReportsArgumentsThatDidNotSurvive(t *testing.T) {
+	i0 := 0
+	s := llm.StaticStream(llm.StreamMeta{ID: "resp_1", Model: "gpt-5"}, []*llm.Frame{
+		{Delta: []llm.Part{&llm.ToolUse{Index: &i0, ID: "c1", Name: "f", Args: json.RawMessage(`{"a":`)}}},
+		{Stop: llm.StopToolUse},
+	})
+	diags, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, &wire.BufferWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diags.Has(llm.DropToolCall) {
+		t.Fatalf("diagnostics = %+v: a call sent with none of its arguments is a call that changed", diags)
+	}
+}
+
 func TestStreamFailureUsesTheFailedTerminal(t *testing.T) {
 	s := llm.StaticStream(llm.StreamMeta{}, []*llm.Frame{
 		{Delta: []llm.Part{&llm.Text{Text: "half"}}},

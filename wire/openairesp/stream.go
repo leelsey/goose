@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
@@ -26,8 +27,11 @@ type streamer struct {
 	open        string
 	itemID      string
 	outputIndex int
-	buf         string
-	refusalBuf  string
+	// What the open item's closing events carry, built as it streams: each
+	// delta added by copying all before it would cost the square of their
+	// number.
+	buf        strings.Builder
+	refusalBuf strings.Builder
 	// A part is announced when something arrives for it, and its index is the
 	// order it was announced in. A message that carries only a refusal has no
 	// text part at all, which is what the unstreamed shape says too.
@@ -35,6 +39,10 @@ type streamer struct {
 	refusalIndex int
 	parts        int
 	summaryOpen  bool
+	// named is the open reasoning item's id when the backend gave it one, and
+	// empty when goose minted it.
+	named     string
+	signature string
 
 	imageBuf    []byte
 	imageFmt    string
@@ -84,6 +92,7 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 
 	stop := llm.StopNone
 	var streamErr error
+	checked := 0
 
 	for fr := range s.Frames() {
 		if err := ctx.Err(); err != nil {
@@ -94,8 +103,19 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			streamErr = fr.Err
 			break
 		}
+		// A part this wire has no item for is lost as it is met, so a loss the
+		// stream's policy will not take is refused there, before the part
+		// itself or anything after it is written.
 		for _, p := range fr.Delta {
-			st.part(p)
+			st.notePart(p)
+			if streamErr = s.Check(st.diags[checked:]); streamErr != nil {
+				break
+			}
+			checked = len(st.diags)
+			st.writePart(p)
+		}
+		if streamErr != nil {
+			break
 		}
 		if fr.Stop != llm.StopNone {
 			stop = fr.Stop
@@ -106,13 +126,25 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 	}
 
 	st.closeItem()
-	st.flushTools()
+	toolBlocks := st.prepareTools()
+	if _, _, clean := status(stop, false, true); !clean {
+		st.diags = append(st.diags, unknownStop(stop))
+	}
 
 	if streamErr == nil {
 		streamErr = s.Err()
 	}
+	if streamErr == nil {
+		streamErr = s.Check(st.diags[checked:])
+	}
+	// A tool call is only ever written here; when it is itself what a loss
+	// noted above got refused for, it must not still reach the client, or the
+	// closing snapshot's output array, once the error that refused it is sent.
+	if streamErr == nil {
+		st.emitTools(toolBlocks)
+	}
 
-	state, incomplete := status(stop, streamErr != nil)
+	state, incomplete, _ := status(stop, streamErr != nil, true)
 	if st.overflow && state == "completed" {
 		state, incomplete = "incomplete", "max_output_tokens"
 		st.diags = append(st.diags, llm.Diagnostic{
@@ -192,21 +224,60 @@ func (s *streamer) nextID(prefix string) string {
 	return prefix + "_" + strconv.Itoa(s.ids)
 }
 
-func (s *streamer) part(p llm.Part) {
+// notePart says what a part loses on this wire and writes none of it. Noted
+// here, before this part's own Check, rather than accumulated for one
+// diagnostic at the end, and kept apart from the writing: a loss the policy
+// will not take must be caught before what it lost is written, not after.
+func (s *streamer) notePart(p llm.Part) {
+	if sig, _ := wirecore.Signed(p); sig != "" && p.Kind() != llm.KindThinking {
+		s.diags = append(s.diags, unsignedParts(1))
+	}
 	switch v := p.(type) {
 	case *llm.Thinking:
 		if len(v.Redacted) > 0 {
 			s.diags = append(s.diags, drop(llm.DropThinking, "redacted thinking has no item on this wire"))
+		}
+	case *llm.ToolResult:
+		s.diags = append(s.diags, drop(llm.DropToolResult, "a tool result cannot ride on an assistant turn here"))
+	case *llm.Raw:
+		if _, ok := rawItem(v); !ok {
+			s.diags = append(s.diags, drop(llm.DropUnknownBlock, "content block "+v.Type+" has no shape on this wire"))
+		}
+	}
+}
+
+// writePart puts a part on the stream once what it loses has been let through.
+func (s *streamer) writePart(p llm.Part) {
+	switch v := p.(type) {
+	case *llm.Thinking:
+		if len(v.Redacted) > 0 {
 			return
 		}
-		if v.Text == "" {
+		// A backend's item that holds neither a summary nor a signature is
+		// still one it stored, and the unstreamed answer hands it over too.
+		if v.Text == "" && v.Signature == "" && v.ID == "" {
 			return
 		}
-		s.openReasoning()
-		s.hold(&s.buf, v.Text)
-		s.event("response.reasoning_summary_text.delta", map[string]any{
-			"item_id": s.itemID, "output_index": s.outputIndex, "summary_index": 0, "delta": v.Text,
-		})
+		if s.open == "reasoning" && !sameReasoning(s.named, s.signature, v) {
+			s.closeItem()
+		}
+		s.openReasoning(v.ID)
+		if v.Text != "" {
+			if !s.summaryOpen {
+				s.event("response.reasoning_summary_part.added", map[string]any{
+					"item_id": s.itemID, "output_index": s.outputIndex, "summary_index": 0,
+					"part": summaryPart{Type: "summary_text", Text: ""},
+				})
+				s.summaryOpen = true
+			}
+			s.hold(&s.buf, v.Text)
+			s.event("response.reasoning_summary_text.delta", map[string]any{
+				"item_id": s.itemID, "output_index": s.outputIndex, "summary_index": 0, "delta": v.Text,
+			})
+		}
+		if v.Signature != "" {
+			s.signature = wirecore.SealSignature(llm.FamilyOpenAI, v.Signer, v.Signature)
+		}
 	case *llm.Text:
 		if v.Text == "" {
 			return
@@ -233,16 +304,22 @@ func (s *streamer) part(p llm.Part) {
 		s.tools = s.merger.Tools()
 	case *llm.Image:
 		s.image(v)
-	case *llm.ToolResult:
-		s.diags = append(s.diags, drop(llm.DropToolResult, "a tool result cannot ride on an assistant turn here"))
 	case *llm.Raw:
-		s.diags = append(s.diags, drop(llm.DropUnknownBlock, "content block "+v.Type+" has no shape on this wire"))
+		it, ok := rawItem(v)
+		if !ok {
+			return
+		}
+		s.closeItem()
+		idx := len(s.items)
+		s.items = append(s.items, it)
+		s.event("response.output_item.added", map[string]any{"output_index": idx, "item": it})
+		s.event("response.output_item.done", map[string]any{"output_index": idx, "item": it})
 	}
 }
 
-func (s *streamer) hold(dst *string, text string) {
+func (s *streamer) hold(dst *strings.Builder, text string) {
 	if s.charge(len(text)) {
-		*dst += text
+		dst.WriteString(text)
 	}
 }
 
@@ -297,23 +374,22 @@ func (s *streamer) image(v *llm.Image) {
 	s.closeItem()
 }
 
-func (s *streamer) openReasoning() {
+func (s *streamer) openReasoning(id string) {
 	if s.open == "reasoning" {
 		return
 	}
 	s.closeItem()
 	s.open = "reasoning"
-	s.itemID = s.nextID("rs")
+	s.named = id
+	s.itemID = id
+	if s.itemID == "" {
+		s.itemID = s.nextID(mintedReasoning)
+	}
 	s.outputIndex = len(s.items)
 	s.event("response.output_item.added", map[string]any{
 		"output_index": s.outputIndex,
 		"item":         item{Type: "reasoning", ID: s.itemID, Summary: []summaryPart{}},
 	})
-	s.event("response.reasoning_summary_part.added", map[string]any{
-		"item_id": s.itemID, "output_index": s.outputIndex, "summary_index": 0,
-		"part": summaryPart{Type: "summary_text", Text: ""},
-	})
-	s.summaryOpen = true
 }
 
 func (s *streamer) openMessage() {
@@ -344,21 +420,22 @@ func (s *streamer) announce(index *int, p contentPart) int {
 }
 
 func (s *streamer) closeItem() {
+	text, refusal := s.buf.String(), s.refusalBuf.String()
 	switch s.open {
 	case "reasoning":
 		if s.summaryOpen {
 			s.event("response.reasoning_summary_text.done", map[string]any{
-				"item_id": s.itemID, "output_index": s.outputIndex, "summary_index": 0, "text": s.buf,
+				"item_id": s.itemID, "output_index": s.outputIndex, "summary_index": 0, "text": text,
 			})
 			s.event("response.reasoning_summary_part.done", map[string]any{
 				"item_id": s.itemID, "output_index": s.outputIndex, "summary_index": 0,
-				"part": summaryPart{Type: "summary_text", Text: s.buf},
+				"part": summaryPart{Type: "summary_text", Text: text},
 			})
 			s.summaryOpen = false
 		}
-		it := item{Type: "reasoning", ID: s.itemID, Summary: []summaryPart{}}
-		if s.buf != "" {
-			it.Summary = append(it.Summary, summaryPart{Type: "summary_text", Text: s.buf})
+		it := item{Type: "reasoning", ID: s.itemID, Summary: []summaryPart{}, EncryptedContent: s.signature}
+		if text != "" {
+			it.Summary = append(it.Summary, summaryPart{Type: "summary_text", Text: text})
 		}
 		s.items = append(s.items, it)
 		s.event("response.output_item.done", map[string]any{"output_index": s.outputIndex, "item": it})
@@ -382,10 +459,10 @@ func (s *streamer) closeItem() {
 		// read the closing object agree about what the message holds.
 		parts := make([]contentPart, s.parts)
 		if s.textIndex >= 0 {
-			parts[s.textIndex] = contentPart{Type: "output_text", Text: s.buf, Annotations: []string{}}
+			parts[s.textIndex] = contentPart{Type: "output_text", Text: text, Annotations: []string{}}
 		}
 		if s.refusalIndex >= 0 {
-			parts[s.refusalIndex] = contentPart{Type: "refusal", Refusal: s.refusalBuf}
+			parts[s.refusalIndex] = contentPart{Type: "refusal", Refusal: refusal}
 		}
 		// The closing events go out in the order the parts were announced in,
 		// which is the order a client is entitled to read them in.
@@ -393,11 +470,11 @@ func (s *streamer) closeItem() {
 			switch at {
 			case s.textIndex:
 				s.event("response.output_text.done", map[string]any{
-					"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "text": s.buf,
+					"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "text": text,
 				})
 			case s.refusalIndex:
 				s.event("response.refusal.done", map[string]any{
-					"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "refusal": s.refusalBuf,
+					"item_id": s.itemID, "output_index": s.outputIndex, "content_index": at, "refusal": refusal,
 				})
 			}
 			s.event("response.content_part.done", map[string]any{
@@ -409,33 +486,55 @@ func (s *streamer) closeItem() {
 		s.event("response.output_item.done", map[string]any{"output_index": s.outputIndex, "item": it})
 	}
 	s.open = ""
-	s.buf = ""
-	s.refusalBuf = ""
+	s.buf.Reset()
+	s.refusalBuf.Reset()
+	s.named, s.signature = "", ""
 	s.textIndex, s.refusalIndex, s.parts = -1, -1, 0
 }
 
-func (s *streamer) flushTools() {
+// toolBlock is a function call built and diagnosed, ready to write to the
+// stream once it is known the answer will not be refused.
+type toolBlock struct {
+	id, callID, name, args string
+}
+
+// prepareTools builds each buffered call's block and notes what was lost
+// building it, without writing anything: the caller Checks the result
+// before emitTools puts a refused call on the wire.
+func (s *streamer) prepareTools() []toolBlock {
+	blocks := make([]toolBlock, 0, len(s.tools))
 	for _, t := range s.tools {
 		args := string(t.Args)
 		if args == "" || !json.Valid([]byte(args)) {
+			if _, broken := wirecore.ObjectArgsBroken(t.Args); broken {
+				d := drop(llm.DropToolCall, "this call's arguments did not survive, so it travelled with none rather than with what was meant")
+				d.Field = t.Name
+				s.diags = append(s.diags, d)
+			}
 			args = "{}"
 		}
-		id := s.nextID("fc")
+		blocks = append(blocks, toolBlock{id: s.nextID("fc"), callID: t.ID, name: t.Name, args: args})
+	}
+	s.tools = nil
+	s.merger.Reset()
+	return blocks
+}
+
+func (s *streamer) emitTools(blocks []toolBlock) {
+	for _, b := range blocks {
 		idx := len(s.items)
-		it := item{Type: "function_call", ID: id, CallID: t.ID, Name: t.Name, Args: args, Status: "completed"}
+		it := item{Type: "function_call", ID: b.id, CallID: b.callID, Name: b.name, Args: b.args, Status: "completed"}
 		s.event("response.output_item.added", map[string]any{
 			"output_index": idx,
-			"item":         item{Type: "function_call", ID: id, CallID: t.ID, Name: t.Name, Args: "", Status: "in_progress"},
+			"item":         item{Type: "function_call", ID: b.id, CallID: b.callID, Name: b.name, Args: "", Status: "in_progress"},
 		})
 		s.event("response.function_call_arguments.delta", map[string]any{
-			"item_id": id, "output_index": idx, "delta": args,
+			"item_id": b.id, "output_index": idx, "delta": b.args,
 		})
 		s.event("response.function_call_arguments.done", map[string]any{
-			"item_id": id, "output_index": idx, "arguments": args,
+			"item_id": b.id, "output_index": idx, "arguments": b.args,
 		})
 		s.items = append(s.items, it)
 		s.event("response.output_item.done", map[string]any{"output_index": idx, "item": it})
 	}
-	s.tools = nil
-	s.merger.Reset()
 }

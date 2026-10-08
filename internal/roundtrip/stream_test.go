@@ -197,9 +197,7 @@ func chunkParts(m map[string]any) (string, []string, string) {
 		if s, ok := delta["content"].(string); ok {
 			text += s
 		}
-		for _, name := range calls2(delta["tool_calls"]) {
-			calls = append(calls, name)
-		}
+		calls = append(calls, calls2(delta["tool_calls"])...)
 	}
 	return text, calls, finish
 }

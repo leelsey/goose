@@ -6,6 +6,7 @@ package agentcli
 import (
 	"encoding/json"
 
+	"github.com/leelsey/goose/internal/httpcore"
 	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/wire/anthropicmsg"
 )
@@ -105,7 +106,8 @@ func claudeParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 			}
 			frames = append(frames, &llm.Frame{Err: &llm.Error{
 				Kind: llm.KindForStatus(status), Provider: p.ID(), Sent: true, Status: status,
-				Message: claudeError(&evt), Retryable: status == 0 || llm.RetryableStatus(status),
+				Message: claudeError(&evt), Body: httpcore.ErrorBody([]byte(evt.Result)),
+				Retryable: status == 0 || llm.RetryableStatus(status),
 			}})
 		}
 		return frames, nil
@@ -130,24 +132,39 @@ func claudeWholeTurn(p *Provider, evt *claudeEvent, st *state) ([]*llm.Frame, er
 		Role: llm.RoleAssistant, Session: st.session, Delta: parts,
 		ID: evt.Message.ID, Model: evt.Message.Model, Diagnostics: diags,
 	}
-	// With --include-partial-messages the deltas already carried this turn, and
-	// the closing message restates all of it. Keep the figures and whatever the
-	// deltas had no event for, drop the second copy of the rest.
-	if st.turnOpen {
-		st.turnOpen = false
-		f.Delta = unstreamed(parts)
-	}
 	if evt.Message.Usage != nil {
 		u := anthropicmsg.DecodeUsage(*evt.Message.Usage)
 		f.Usage = &u
 	}
-	return []*llm.Frame{f, {TurnEnd: true}}, nil
+	// The binary prints one of these lines as each block of a message closes,
+	// under the message's id and with the usage message_start announced, and
+	// before the message is finished. With --include-partial-messages the
+	// deltas carry that message, so each of its lines adds only what they had
+	// no event for, and its figures are message_start's once more. Without
+	// them the lines are the message itself, one turn however many it takes.
+	id := evt.Message.ID
+	switch {
+	case st.streamed && id == st.msg:
+		f.Delta, f.Usage = unstreamed(parts), nil
+		if len(f.Delta) == 0 && len(f.Diagnostics) == 0 {
+			return nil, nil
+		}
+		return []*llm.Frame{f}, nil
+	case st.turnOpen && id != "" && id == st.msg:
+		return []*llm.Frame{f}, nil
+	}
+	var frames []*llm.Frame
+	if st.turnOpen {
+		frames = append(frames, &llm.Frame{TurnEnd: true})
+	}
+	st.turnOpen, st.streamed, st.msg = true, false, id
+	return append(frames, f), nil
 }
 
 // unstreamed keeps the parts of a restated turn that no stream event could
 // have carried. claudeStreamEvent spells out text, thinking and tool calls;
 // everything else — redacted thinking, a server-side tool, any block this
-// binary learns to emit later — reaches the caller on the closing line alone.
+// binary learns to emit later — reaches the caller on the line restating it.
 func unstreamed(parts []llm.Part) []llm.Part {
 	var out []llm.Part
 	for _, p := range parts {
@@ -183,7 +200,7 @@ func claudeStreamEvent(p *Provider, evt *claudeEvent, st *state) ([]*llm.Frame, 
 		if st.turnOpen {
 			frames = append(frames, &llm.Frame{TurnEnd: true})
 		}
-		st.turnOpen = true
+		st.turnOpen, st.streamed, st.msg = true, true, inner.Message.ID
 		f := &llm.Frame{Role: llm.RoleAssistant, Session: st.session}
 		if inner.Message.ID != "" {
 			f.ID = inner.Message.ID
@@ -198,10 +215,10 @@ func claudeStreamEvent(p *Provider, evt *claudeEvent, st *state) ([]*llm.Frame, 
 		return append(frames, f), nil
 
 	case "content_block_start":
-		if inner.ContentBlock.Type == "tool_use" {
+		st.openTool = inner.ContentBlock.Type == "tool_use"
+		if st.openTool {
 			idx := st.toolIdx
 			st.toolIdx++
-			st.openTool = true
 			return []*llm.Frame{{Delta: []llm.Part{&llm.ToolUse{
 				ID: inner.ContentBlock.ID, Name: inner.ContentBlock.Name, Index: &idx,
 			}}}}, nil
@@ -224,9 +241,11 @@ func claudeStreamEvent(p *Provider, evt *claudeEvent, st *state) ([]*llm.Frame, 
 			if inner.Delta.Signature == "" {
 				return nil, nil
 			}
-			return []*llm.Frame{{Delta: []llm.Part{&llm.Thinking{Signature: inner.Delta.Signature}}}}, nil
+			return []*llm.Frame{{Delta: []llm.Part{&llm.Thinking{Signature: inner.Delta.Signature, Signer: llm.FamilyAnthropic}}}}, nil
 		case "input_json_delta":
-			if inner.Delta.PartialJSON == "" {
+			// A server tool's input streams too, but belongs to its own block,
+			// which the closing line restates whole.
+			if inner.Delta.PartialJSON == "" || !st.openTool {
 				return nil, nil
 			}
 			idx := st.toolIdx - 1

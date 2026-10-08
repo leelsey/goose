@@ -11,8 +11,11 @@ import (
 	"io"
 )
 
+// An event is almost always one data line, so a line ceiling below the event's
+// refuses what the event ceiling was there to allow: a streamed image arrives
+// as one line of several megabytes.
 const (
-	DefaultMaxLine  = 1 << 20
+	DefaultMaxLine  = DefaultMaxEvent
 	DefaultMaxEvent = 8 << 20
 )
 

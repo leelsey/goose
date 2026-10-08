@@ -24,14 +24,21 @@ type breakers struct {
 	policy Breaker
 	now    func() time.Time
 
-	mu    sync.Mutex
-	state map[string]*breakerState
+	mu     sync.Mutex
+	state  map[string]*breakerState
+	probes probe
 }
+
+// A probe names the one call a breaker lets through after its cooldown, and
+// only that call gives the slot back. Another, let through while the breaker
+// was still closed, would otherwise free it by finishing while the probe runs
+// and admit a second beside it. Zero is no probe.
+type probe uint64
 
 type breakerState struct {
 	failures int
 	openedAt time.Time
-	probing  bool
+	probe    probe
 }
 
 func newBreakers(p Breaker, now func() time.Time) *breakers {
@@ -47,35 +54,43 @@ func newBreakers(p Breaker, now func() time.Time) *breakers {
 	return &breakers{policy: p, now: now, state: map[string]*breakerState{}}
 }
 
-// An allowed caller holds the probe slot until succeeded, failed or abandoned.
-func (b *breakers) allow(provider string) bool {
+// An allowed caller given a probe holds the slot until succeeded, failed or
+// abandoned.
+func (b *breakers) allow(provider string) (probe, bool) {
 	if b == nil {
-		return true
+		return 0, true
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s := b.state[provider]
 	if s == nil || s.failures < b.policy.Failures {
-		return true
+		return 0, true
 	}
 	if b.now().Sub(s.openedAt) < b.policy.Cooldown {
-		return false
+		return 0, false
 	}
-	if s.probing {
-		return false
+	if s.probe != 0 {
+		return 0, false
 	}
-	s.probing = true
-	return true
+	b.probes++
+	s.probe = b.probes
+	return s.probe, true
 }
 
-func (b *breakers) abandoned(provider string) {
+func (b *breakers) abandoned(provider string, p probe) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if s := b.state[provider]; s != nil {
-		s.probing = false
+		s.release(p)
+	}
+}
+
+func (s *breakerState) release(p probe) {
+	if p != 0 && s.probe == p {
+		s.probe = 0
 	}
 }
 
@@ -88,7 +103,7 @@ func (b *breakers) succeeded(provider string) {
 	delete(b.state, provider)
 }
 
-func (b *breakers) failed(provider string) {
+func (b *breakers) failed(provider string, p probe) {
 	if b == nil {
 		return
 	}
@@ -99,7 +114,7 @@ func (b *breakers) failed(provider string) {
 		s = &breakerState{}
 		b.state[provider] = s
 	}
-	s.probing = false
+	s.release(p)
 	s.failures++
 	if s.failures >= b.policy.Failures {
 		s.openedAt = b.now()

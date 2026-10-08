@@ -5,6 +5,7 @@ package vertex
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -115,12 +116,76 @@ func TestClaudeStreamUsesStreamRawPredict(t *testing.T) {
 	}
 }
 
+// Vertex refuses a model it will not serve this project or region with the 400
+// a malformed request gets. Only a malformed request fails the same on every
+// backend, so the chain walks on past the rest, whichever publisher it was.
+func TestAModelVertexWillNotServeIsNotAMalformedRequest(t *testing.T) {
+	for _, model := range []string{"claude-x@1", "gemini-x", "llama-x"} {
+		for message, want := range map[string]llm.ErrorKind{
+			"Project `proj` is not allowed to use Publisher Model `projects/proj/locations/us-east5/publishers/p/models/" + model + "`": llm.KindNotFound,
+			"Publisher Model `projects/proj/locations/us-east5/publishers/p/models/" + model + "` not found.":                           llm.KindNotFound,
+			"Invalid JSON payload received.": llm.KindInvalidRequest,
+		} {
+			p, _, _ := serve(t, Options{Model: model}, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"code":400,"message":"` + message + `","status":"FAILED_PRECONDITION"}}`))
+			})
+			_, err := p.Complete(context.Background(), attempt(model))
+			if e := llm.AsError(err); e.Kind != want {
+				t.Errorf("%s unary %q: err = %+v, want %s", model, message, e, want)
+			}
+			_, err = p.Stream(context.Background(), attempt(model))
+			if e := llm.AsError(err); e.Kind != want {
+				t.Errorf("%s stream %q: err = %+v, want %s", model, message, e, want)
+			}
+		}
+	}
+}
+
+// Vertex takes only some of Anthropic's betas and refuses a request naming
+// another, so a caller's first-party flags, and the fields they open, stay
+// here and the loss is reported.
+func TestTheCallersBetasDoNotReachVertex(t *testing.T) {
+	p, reqs, bodies := serve(t, Options{Model: "claude-sonnet-4@20250514"}, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"m","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{}}`))
+	})
+	a := attempt("claude-sonnet-4@20250514")
+	a.Request.Betas = []string{"context-management-2025-06-27"}
+	a.Request.Extra = map[string]json.RawMessage{"context_management": json.RawMessage(`{}`)}
+	a.Request.ExtraFrom = "anthropic"
+	resp, err := p.Complete(context.Background(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := (*reqs)[0].Header.Values("anthropic-beta"); len(got) != 0 {
+		t.Fatalf("anthropic-beta = %v", got)
+	}
+	if strings.Contains((*bodies)[0], "context_management") || !resp.Diagnostics.Has(llm.DropExtraField) {
+		t.Fatalf("body = %s, diagnostics = %v", (*bodies)[0], resp.Diagnostics.Codes())
+	}
+}
+
 func TestMissingProjectOrTokenIsRefused(t *testing.T) {
 	if _, err := New(Options{Token: cloudauth.StaticToken("t")}); err == nil {
 		t.Fatal("a project-scoped URL cannot be built without a project")
 	}
 	if _, err := New(Options{Project: "p"}); err == nil {
 		t.Fatal("an unauthenticated request must not be attempted")
+	}
+}
+
+// The region is spliced into the host and the path a call and its token go
+// to, so one that could end the host early or name another is refused at once.
+func TestARegionThatCouldMoveTheHostIsRefused(t *testing.T) {
+	for _, region := range []string{"127.0.0.1:18409/#", "x@127.0.0.1/#", "europe-west4.evil.example", "a/b"} {
+		if _, err := New(Options{Project: "p", Model: "gemini-2.5-pro", Region: region, Token: cloudauth.StaticToken("t")}); err == nil {
+			t.Fatalf("region %q was spliced into the host", region)
+		}
+	}
+	for _, region := range []string{"global", "europe-west4", "us-central1"} {
+		if _, err := New(Options{Project: "p", Model: "gemini-2.5-pro", Region: region, Token: cloudauth.StaticToken("t")}); err != nil {
+			t.Fatalf("region %q was refused: %v", region, err)
+		}
 	}
 }
 

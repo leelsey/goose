@@ -1,29 +1,41 @@
-# goose configuration. Copy to .goose.toml or ~/.config/goose/config.toml.
-# Root keys belong above the first table header.
+# goose configuration. Copy to ~/.config/goose/config.toml, or anywhere and name
+# it with -c; a goose.toml in the working directory is read only that way. Root
+# keys belong above the first table header.
 
 formats = ["openai", "openai-responses", "anthropic", "google", "ollama"]
 
 [server]
-host = "127.0.0.1"
+host = "127.0.0.1"                  # keyless on loopback, it answers only to
+#                                   localhost, *.localhost and loopback addresses
 port = 11234
 # api_key_env = "GOOSE_PROXY_KEY"   # required to bind anything but loopback
-# cors = false
+# cors = false                      # a client that sends an Origin (a page, an
+#                                   extension, a desktop app) needs this on and
+#                                   cors_origin naming it; any other is refused
 # strict = false                    # refuse a translation that lost content
 
-# Without these the binary serves plaintext HTTP and says so at startup.
+# Without these the binary serves plaintext HTTP and says so at startup. A
+# relative path is beside this file.
 # tls_cert = "/etc/goose/fullchain.pem"
 # tls_key  = "/etc/goose/privkey.pem"
 
 # api_key = "..."                   # prefer api_key_env: argv and files are read by others
-# cors_origin = "https://app.example"  # a wildcard origin needs a key
+# cors_origin = "https://app.example"  # "*" or "null" needs a key: any site can send either
 # max_body_mb = 32                  # largest request body accepted
 # max_concurrent = 64               # requests in flight; over it, 503
 # max_per_minute = 600              # by what a caller proved: one allowance for
 #                                   everyone holding server.api_key, and one per
-#                                   upstream credential where there is no key
-# forwarded_header = "X-Forwarded-For"  # only behind a proxy you trust
-# attempt_timeout = "15m"           # one attempt; a stream stops the clock once primed
+#                                   address where there is no key
+# forwarded_header = "X-Forwarded-For"  # only behind a proxy you trust; a keyless
+#                                   proxy meters the last address on it, and a
+#                                   keyless loopback listener answers to the
+#                                   names that proxy passes through
+# attempt_timeout = "15m"           # one attempt, including any wait for a slot;
+#                                   a stream stops the clock at its first content
 # max_response_mb = 64              # ceiling on one upstream body
+# max_frame_mb = 16                 # longest line of an upstream stream, where a
+#                                   streamed image arrives whole; left out, the
+#                                   provider's own ceiling
 # breaker_failures = 5              # failures before a backend is skipped
 # breaker_cooldown = "30s"          # before it is probed again
 # metrics = true                    # GET /metrics, behind the same key
@@ -31,9 +43,17 @@ port = 11234
 # redact_upstream_errors = false    # keep a backend's own words off the reply and
 #                                   out of the usage ledger, where a refusal that
 #                                   quotes the request would carry the prompt
-# passthrough = "claude"            # forward anything unrouted to this provider
+# passthrough = "claude"            # forward anything unrouted to this provider;
+#                                   GET, HEAD, POST, PUT, PATCH, DELETE and
+#                                   OPTIONS only
 # formats = [...]                   # same as the root key, kept for older files
 
+# api_key_env names the variable holding the key; one that is not set is said
+# on stderr, and that backend's calls carry no key until it is. An MCP client
+# may start goose mcp without it: pass it in the client's env for the server.
+# Left out, a vendor's usual one is read, and sent only to that vendor's own
+# host: a base_url anywhere else, such as a gateway, gets a key only by naming
+# it here.
 [[provider]]
 id = "claude"
 kind = "anthropic"
@@ -41,6 +61,9 @@ api_key_env = "ANTHROPIC_API_KEY"
 # model = "claude-sonnet-5"        # what this backend is asked for when the route does not say
 # version = "2023-06-01"           # anthropic-version; the built-in default is current
 # betas = ["context-1m-2025-08-07"]
+# client_betas = true              # send a caller's own anthropic-beta flags beside
+#                                  these, and the request fields they open, under
+#                                  this backend's key; false keeps both back
 # timeout = "60s"                  # how long this backend has to start answering
 # max_retries = 2                  # retries within one attempt, on its own errors
 # allow_client_key = false         # let a caller's own key reach this backend
@@ -50,12 +73,20 @@ api_key_env = "ANTHROPIC_API_KEY"
 id = "gpt"
 kind = "openai"
 api_key_env = "OPENAI_API_KEY"
+# options = { organisation = "org-...", project = "proj_..." }
 
 [[provider]]
 id = "local"
 kind = "ollama"
 base_url = "http://127.0.0.1:11434"
-# prefix = "/v1beta"               # path between base_url and the endpoint, for google-shaped hosts
+# options = { keep_alive = "5m" }  # how long the model stays loaded after a call
+
+# Google's Gemini API, or a host that speaks its shape.
+# [[provider]]
+# id = "gemini"
+# kind = "google"
+# api_key_env = "GEMINI_API_KEY"
+# prefix = "/v1beta"               # path between base_url and the endpoint; this is Google's own
 
 # Azure AI Foundry. Omit api_version for the rolling v1 surface; a dated value
 # selects the deployment-scoped one.
@@ -79,23 +110,35 @@ base_url = "http://127.0.0.1:11434"
 # api_key_env = "OPENROUTER_API_KEY"
 # options = { referer = "https://leelsey.com", title = "goose", providers = "anthropic,google", allow_fallbacks = "false" }
 
-# AWS Bedrock. Credentials: options, environment, shared file, then the runtime
-# role. Set AWS_EC2_METADATA_DISABLED=true off AWS to skip the last.
+# AWS Bedrock. Credentials: options (keys, then profile), the environment (keys,
+# then an IRSA web identity), the shared file (AWS_PROFILE, else default), then
+# the runtime role. Set AWS_EC2_METADATA_DISABLED=true off AWS to skip the last.
+# A named profile or a web identity is used or refused, never passed over for
+# what follows it. Keys can also be given as options.access_key_id,
+# options.secret_access_key and options.session_token, a profile named outright
+# as options.profile, and the shared file read from somewhere other than
+# ~/.aws/credentials as options.credentials_file — a relative path resolved
+# beside this one.
 # [[provider]]
 # id = "bedrock"
 # kind = "bedrock"
 # model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
-# options = { region = "us-east-1", profile = "default" }
+# options = { region = "us-east-1" }
 
 # GCP Vertex. One entry per vendor: the publisher comes from the model name, so
-# either model or options.publisher is required.
+# either model or options.publisher is required. A service-account key can be
+# named as options.credentials_file, a relative path resolved beside this one,
+# in place of GOOGLE_APPLICATION_CREDENTIALS, and a token already minted can be
+# given outright as options.access_token, ahead of either.
 # [[provider]]
 # id = "vertex"
 # kind = "vertex"
 # model = "claude-sonnet-4@20250514"
 # options = { project = "my-project", region = "us-east5" }
 
-# Any server speaking the chat-completions shape. Declare its extensions.
+# Any server speaking the chat-completions shape. Declare its extensions. A
+# gateway that wants its key on a header other than Authorization: Bearer takes
+# options.auth_header, and options.auth_prefix in place of "Bearer" on it.
 # [[provider]]
 # id = "gateway"
 # kind = "compatible"
@@ -104,7 +147,17 @@ base_url = "http://127.0.0.1:11434"
 # dialect = "stream_usage,extensions"
 
 # A local agent CLI on its own subscription login. base_url is the binary path
-# when it is not on PATH.
+# when it is not on PATH. A relative options.dir or options.temp_dir is beside
+# this file, and so is a relative binary path, unless options.dir is set, when
+# it is within that. A call past max_concurrent waits for a slot, within
+# attempt_timeout, while no more than max_concurrent others are waiting; past
+# those it is answered 503 or handed to the route's next link. Left out it is
+# 4, and 0 removes the gate. A key given as api_key or api_key_env is handed to
+# the CLI through the variable named in options.api_key_env_name, which is then
+# required. options.env_allow, a comma-separated list, adds to the environment
+# the process otherwise inherits; options.max_turns, options.sandbox,
+# options.system_mode and options.temp_dir are further settings the CLI itself
+# reads.
 # [[provider]]
 # id = "claude-cli"
 # kind = "claude"
@@ -137,10 +190,16 @@ chain = ["local"]
 # for them. A server the backend dials itself is named by the request instead.
 # [[mcp]]
 # name = "files"
-# command = "mcp-server-filesystem"
+# command = "mcp-server-filesystem" # a bare name is found on PATH; a path, as
+#                                   ./bin/server, is within dir or else beside
+#                                   this file
 # args = ["/srv/data"]
-# dir = "/srv"                      # working directory for the server process
-# env_allow = ["HOME", "PATH"]      # the only environment it inherits
+# dir = "/srv"                      # working directory for the server process;
+#                                   a relative one is beside this file
+# env_allow = ["HOME", "PATH"]      # added to a fixed built-in list (HOME, PATH,
+#                                   USER, the proxy variables and more) that a
+#                                   tool server always inherits; it widens that
+#                                   list rather than replacing it
 # timeout = "30s"                   # how long one of its calls may take
 
 # [[mcp]]
@@ -150,5 +209,5 @@ chain = ["local"]
 # headers = { Authorization = "Bearer ..." }
 
 [usage]
-# log = "usage.jsonl"
+# log = "usage.jsonl"               # a relative path is beside this file
 summary = true

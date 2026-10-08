@@ -41,7 +41,7 @@ func (c *Codec) Routes() []wire.Route {
 }
 
 func (c *Codec) Renders() wire.Renders {
-	return wire.Renders{Thinking: true, ToolCalls: true, Images: true, Candidates: 1}
+	return wire.Renders{Thinking: true, ToolCalls: true, Images: true, Candidates: 1, Raw: []string{Name}}
 }
 
 func (c *Codec) id(id string) string {
@@ -53,22 +53,41 @@ func (c *Codec) id(id string) string {
 	}
 	return c.opts.IDPrefix + "goose"
 }
-func status(stop llm.StopReason, failed bool) (state, incomplete string) {
+
+// status spells a stop as this wire's status, on a stream or in a whole
+// response. clean is false for a stop it has no spelling for, which is
+// reported as completed and must be noted.
+func status(stop llm.StopReason, failed, streamed bool) (state, incomplete string, clean bool) {
 	if failed {
-		return "failed", ""
+		return "failed", "", true
 	}
 	switch stop {
 	case llm.StopError:
-		return "failed", ""
+		return "failed", "", true
 	case llm.StopLength, llm.StopContextOverflow:
-		return "incomplete", "max_output_tokens"
+		return "incomplete", "max_output_tokens", true
 	case llm.StopContentFilter:
-		return "incomplete", "content_filter"
+		return "incomplete", "content_filter", true
 	case llm.StopPause:
-		return "incomplete", "pause"
+		return "incomplete", "pause", true
+	case llm.StopCancelled:
+		// A response object has a status for it, but no stream event ends a
+		// cancelled response, so a stream cannot spell it either.
+		if streamed {
+			return "completed", "", false
+		}
+		return "cancelled", "", true
+	case llm.StopNone, llm.StopEnd, llm.StopSequence, llm.StopToolUse, llm.StopRefusal:
+		return "completed", "", true
 	default:
-		return "completed", ""
+		return "completed", "", false
 	}
+}
+
+func unknownStop(s llm.StopReason) llm.Diagnostic {
+	d := drop(llm.DropUnknownBlock, "stop reason has no spelling on this wire")
+	d.Field = string(s)
+	return d
 }
 
 type wireUsage struct {

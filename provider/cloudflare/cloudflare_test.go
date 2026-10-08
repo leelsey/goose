@@ -44,6 +44,40 @@ func TestAccountScopedURLAndBearer(t *testing.T) {
 	}
 }
 
+// Workers AI refuses a model it does not have with the 400 a malformed request
+// gets. Only a malformed request fails the same on every backend, so the chain
+// walks on past the rest.
+func TestAModelWorkersAIDoesNotHaveIsNotAMalformedRequest(t *testing.T) {
+	for body, want := range map[string]llm.ErrorKind{
+		`{"errors":[{"message":"AiError: AiError: No such model @cf/x/unknown or task","code":5007}],"success":false,"result":{},"messages":[]}`: llm.KindNotFound,
+		`{"errors":[{"message":"Model not found","code":5007}],"success":false}`:                                                                 llm.KindNotFound,
+		`{"errors":[{"message":"AiError: Bad input: Error: oneOf at '/' not met","code":5006}],"success":false}`:                                 llm.KindInvalidRequest,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(body))
+		}))
+		p, err := New(Options{AccountID: "acct", APIKey: "token", BaseURL: srv.URL + "/client/v4/accounts/acct/ai/v1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := &llm.Attempt{
+			Request:  &llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "hi"}}}}},
+			Model:    "@cf/x/unknown",
+			Recorder: llm.NopRecorder{},
+		}
+		_, err = p.Complete(context.Background(), a)
+		if e := llm.AsError(err); e.Kind != want {
+			t.Errorf("unary %s: err = %+v, want %s", body, e, want)
+		}
+		_, err = p.Stream(context.Background(), a)
+		if e := llm.AsError(err); e.Kind != want {
+			t.Errorf("stream %s: err = %+v, want %s", body, e, want)
+		}
+		srv.Close()
+	}
+}
+
 func TestAccountIsRequired(t *testing.T) {
 	if _, err := New(Options{APIKey: "k"}); err == nil {
 		t.Fatal("an account-scoped URL cannot be built without an account")
@@ -114,8 +148,13 @@ func TestARefusalInTheBodyIsStillARefusal(t *testing.T) {
 	if _, err := p.Models(context.Background()); err == nil {
 		t.Fatal("a catalogue that was refused is not an empty catalogue")
 	}
-	if err := p.Probe(context.Background()); err == nil {
+	err = p.Probe(context.Background())
+	if err == nil {
 		t.Fatal("an account that cannot be read is not a ready one")
+	}
+	// The sentence is the host's, and is redacted like a refusal's body.
+	if e := llm.AsError(err); e.Message != "Authentication error" || e.Reason(true) != string(e.Kind) {
+		t.Fatalf("err = %+v", e)
 	}
 }
 

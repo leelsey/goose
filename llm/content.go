@@ -22,13 +22,37 @@ type Part interface {
 	part()
 }
 
+// Family names the vendors whose signatures verify one another's. Anthropic
+// documents its signatures as good on its own API, on Bedrock and on Vertex
+// alike, so Claude on any of them is one family; OpenAI and Azure OpenAI are
+// another, and Gemini on its own API or on Vertex a third. A signature minted
+// by one family is refused by the others, whatever it is attached to.
+type Family string
+
+const (
+	FamilyAnthropic Family = "anthropic"
+	FamilyOpenAI    Family = "openai"
+	FamilyGoogle    Family = "google"
+)
+
 type Text struct {
 	Text string
+	// Signature is Gemini's. It signs the reasoning behind the part it arrived
+	// on, which is text or a call as often as a thought, and a replayed turn
+	// that has lost it is refused. A text part may carry nothing else.
+	Signature string
+	// Signer is the family that minted Signature. Empty says nobody recorded
+	// it, and such a signature is left for the backend to judge.
+	Signer Family
 }
 
 type Thinking struct {
+	// ID is the backend's own name for the block, where it gives one, so a
+	// client on that backend's wire is handed the item it was issued.
+	ID        string
 	Text      string
 	Signature string
+	Signer    Family
 	// Redacted is the block exactly as the backend spelled it. It is opaque and
 	// a client hands it straight back, so nothing re-spells it on the way
 	// through; a backend whose own wire spells it differently converts at its
@@ -37,10 +61,12 @@ type Thinking struct {
 }
 
 type ToolUse struct {
-	ID    string
-	Name  string
-	Args  json.RawMessage
-	Index *int
+	ID        string
+	Name      string
+	Args      json.RawMessage
+	Index     *int
+	Signature string
+	Signer    Family
 }
 
 type ToolResult struct {
@@ -59,6 +85,10 @@ type Image struct {
 	Prompt  string
 	Index   *int
 	Partial bool
+	// Signature is Gemini's, on an image it generated: an edit of that image
+	// on the next turn is refused without it.
+	Signature string
+	Signer    Family
 }
 
 type Refusal struct {

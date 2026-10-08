@@ -4,7 +4,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -53,6 +55,7 @@ type Server struct {
 	MaxPerMinute    int      `toml:"max_per_minute"`
 	AttemptTimeout  string   `toml:"attempt_timeout"`
 	MaxResponseMB   int      `toml:"max_response_mb"`
+	MaxFrameMB      int      `toml:"max_frame_mb"`
 	ForwardedHeader string   `toml:"forwarded_header"`
 	BreakerFailures int      `toml:"breaker_failures"`
 	BreakerCooldown string   `toml:"breaker_cooldown"`
@@ -73,12 +76,17 @@ type Provider struct {
 	APIKeyEnv  string            `toml:"api_key_env"`
 	Version    string            `toml:"version"`
 	Betas      []string          `toml:"betas"`
+	ClientBeta *bool             `toml:"client_betas"`
 	Timeout    string            `toml:"timeout"`
 	MaxRetries int               `toml:"max_retries"`
 	Dialect    string            `toml:"dialect"`
 	ClientKey  bool              `toml:"allow_client_key"`
 	Headers    map[string]string `toml:"headers"`
 	Options    map[string]string `toml:"options"`
+
+	// typed marks the provider -p builds: its base_url is one the operator
+	// typed, not one a file handed over.
+	typed bool
 }
 
 type Route struct {
@@ -125,14 +133,21 @@ func defaults() *Config {
 	}
 }
 
+const noFile = "(defaults)"
+
+// load reads the file named with -c, or else the operator's own. A file in the
+// working directory is read only when named: that directory is whatever
+// checkout the proxy is started in, or whatever project a client has open for
+// goose mcp, and the file would choose the commands goose runs and the hosts
+// the operator's keys go to.
 func load(explicit string) (*Config, string, error) {
 	cfg := defaults()
-	for _, path := range candidates(explicit) {
+	for _, path := range []string{explicit, homeConfig()} {
 		if path == "" {
 			continue
 		}
 		if _, err := os.Stat(path); err != nil {
-			if explicit != "" && path == explicit {
+			if path == explicit {
 				return nil, "", fmt.Errorf("config %s: %w", path, err)
 			}
 			continue
@@ -151,23 +166,112 @@ func load(explicit string) (*Config, string, error) {
 		if len(cfg.Server.Formats) > 0 {
 			cfg.Formats = cfg.Server.Formats
 		}
+		// A file the config names by a relative path — the ledger, a TLS
+		// certificate or key, a service-account or shared-credentials file, a
+		// program it runs and the directory that program runs in — belongs
+		// beside the file that names it, not in whatever directory goose
+		// happens to be started in: goose mcp in particular starts wherever an
+		// MCP client has its own project open, and a program found there is
+		// the project's, not the operator's.
+		dir, err := filepath.Abs(filepath.Dir(path))
+		if err != nil {
+			return nil, "", fmt.Errorf("config %s: %w", path, err)
+		}
+		cfg.Usage.Log = resolveRelative(dir, cfg.Usage.Log)
+		cfg.Server.TLSCert = resolveRelative(dir, cfg.Server.TLSCert)
+		cfg.Server.TLSKey = resolveRelative(dir, cfg.Server.TLSKey)
+		for i := range cfg.MCP {
+			m := &cfg.MCP[i]
+			m.Dir = resolveRelative(dir, m.Dir)
+			m.Command = resolveProgram(dir, m.Dir, m.Command)
+		}
+		for i := range cfg.Providers {
+			p := &cfg.Providers[i]
+			if v := p.Options["credentials_file"]; v != "" {
+				p.Options["credentials_file"] = resolveRelative(dir, v)
+			}
+			if !slices.Contains(agentCLIs, p.Kind) {
+				continue
+			}
+			for _, name := range []string{"dir", "temp_dir"} {
+				if v := p.Options[name]; v != "" {
+					p.Options[name] = resolveRelative(dir, v)
+				}
+			}
+			p.BaseURL = resolveProgram(dir, p.Options["dir"], p.BaseURL)
+		}
 		return cfg, path, nil
 	}
-	return cfg, "(defaults)", nil
+	return cfg, noFile, nil
 }
 
-func candidates(explicit string) []string {
-	out := []string{explicit, dotFile, dirFile}
-	if home, err := os.UserHomeDir(); err == nil {
-		out = append(out, filepath.Join(home, ".config", "goose", "config.toml"))
+// resolveRelative rebases path onto dir when path is relative, the way a
+// shell would resolve a path written beside the file that named it. An
+// absolute path, or no path at all, is returned unchanged.
+func resolveRelative(dir, path string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(dir, path)
+}
+
+// resolveProgram rebases a program written as a relative path the way exec
+// reads one, against the directory it runs in when one is named and beside
+// the file otherwise. A bare name has no directory to rebase: it is looked up
+// on PATH.
+func resolveProgram(dir, workDir, program string) string {
+	if !strings.ContainsRune(program, '/') && !strings.ContainsRune(program, filepath.Separator) {
+		return program
+	}
+	if workDir != "" {
+		return resolveRelative(workDir, program)
+	}
+	return resolveRelative(dir, program)
+}
+
+// unread lists the files in the working directory that goose once read without
+// being told to, so that skipping one is said rather than left to look like a
+// file with nothing in it.
+func unread(explicit string) []string {
+	if explicit != "" {
+		return nil
+	}
+	var out []string
+	for _, name := range []string{dotFile, dirFile} {
+		if _, err := os.Stat(name); err == nil {
+			out = append(out, name)
+		}
 	}
 	return out
 }
 
-func (c *Config) resolveSecrets(getenv func(string) string) {
-	if c.Server.APIKey == "" {
+func homeConfig() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "goose", "config.toml")
+}
+
+// The server's variable named and found empty is refused rather than read as
+// no key, since that would leave the proxy open on loopback. serving is false
+// for goose mcp, which binds no port and so has no use for the proxy's key.
+//
+// A provider's variable found empty is said rather than refused: an MCP client
+// starts goose mcp with little of the operator's environment, and one backend
+// without its key is no reason for every other route to go unserved.
+//
+// A vendor's usual variable holds a key for that vendor, so a provider a file
+// points at another host gets it only by naming it in api_key_env. The notes
+// say where one was kept back, since the backend then answers every call with
+// a refusal and the chain walks on past it.
+func (c *Config) resolveSecrets(getenv func(string) string, serving bool) (notes []string, err error) {
+	if serving && c.Server.APIKey == "" {
 		if c.Server.APIKeyEnv != "" {
 			c.Server.APIKey = getenv(c.Server.APIKeyEnv)
+			if c.Server.APIKey == "" {
+				return nil, fmt.Errorf("server.api_key_env names %s, which is not set", c.Server.APIKeyEnv)
+			}
 		} else {
 			c.Server.APIKey = getenv(envKey)
 		}
@@ -177,17 +281,85 @@ func (c *Config) resolveSecrets(getenv func(string) string) {
 		if p.APIKey != "" {
 			continue
 		}
+		id := p.ID
+		if id == "" {
+			id = p.Kind
+		}
 		if p.APIKeyEnv != "" {
 			p.APIKey = getenv(p.APIKeyEnv)
+			if p.APIKey == "" {
+				notes = append(notes, fmt.Sprintf("provider %q: api_key_env names %s, which is not set, so its calls carry no key until it is", id, p.APIKeyEnv))
+			}
 			continue
 		}
 		for _, name := range defaultKeyEnv(p.Kind) {
-			if v := getenv(name); v != "" {
-				p.APIKey = v
-				break
+			v := getenv(name)
+			if v == "" {
+				continue
 			}
+			if p.typed || vendorHost(p.Kind, p.base()) {
+				p.APIKey = v
+			} else {
+				where := "base_url"
+				if p.BaseURL == "" {
+					where = "options.resource"
+				}
+				notes = append(notes, fmt.Sprintf("provider %q: %s is not sent to %s, which is not %s's own host; name it in api_key_env to send it there", id, name, where, p.Kind))
+			}
+			break
 		}
 	}
+	return notes, nil
+}
+
+// base is where the provider's calls go. Azure builds its host from
+// options.resource when base_url is empty, and that name is spliced in as
+// written, so it is the host the key is judged by.
+func (p Provider) base() string {
+	if p.Kind == "azure" && p.BaseURL == "" && p.Options["resource"] != "" {
+		return "https://" + p.Options["resource"] + ".openai.azure.com"
+	}
+	return p.BaseURL
+}
+
+// vendorHost reports whether base is served by the vendor behind kind: its
+// default when empty, or a host of the vendor's own over TLS. A host this does
+// not know keeps the key back and says so, which is the safe way to be wrong.
+// OpenAI's hosts are the ones provider/openai takes for its own endpoint, a
+// regional one such as eu.api.openai.com included.
+func vendorHost(kind, base string) bool {
+	if base == "" {
+		return true
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	switch kind {
+	case "anthropic":
+		return host == "api.anthropic.com"
+	case "openai":
+		return host == "api.openai.com" || strings.HasSuffix(host, ".api.openai.com")
+	case "google":
+		return host == "generativelanguage.googleapis.com"
+	case "azure":
+		for _, own := range []string{
+			".openai.azure.com", ".cognitiveservices.azure.com", ".services.ai.azure.com",
+			".openai.azure.us", ".cognitiveservices.azure.us",
+			".openai.azure.cn", ".cognitiveservices.azure.cn",
+		} {
+			if strings.HasSuffix(host, own) {
+				return true
+			}
+		}
+		return false
+	case "cloudflare":
+		return host == "api.cloudflare.com"
+	case "openrouter":
+		return host == "openrouter.ai"
+	}
+	return false
 }
 
 func defaultKeyEnv(kind string) []string {
@@ -209,7 +381,9 @@ func defaultKeyEnv(kind string) []string {
 	}
 }
 
-func (c *Config) validate() error {
+// validate checks what a run will use. serving is false for goose mcp, which
+// binds no port, so the files only the listener opens are not asked for.
+func (c *Config) validate(serving bool) error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
 		return fmt.Errorf("server.port %d is out of range", c.Server.Port)
 	}
@@ -221,6 +395,7 @@ func (c *Config) validate() error {
 		{"server.max_concurrent", c.Server.MaxConcurrent},
 		{"server.max_per_minute", c.Server.MaxPerMinute},
 		{"server.max_response_mb", c.Server.MaxResponseMB},
+		{"server.max_frame_mb", c.Server.MaxFrameMB},
 		{"server.breaker_failures", c.Server.BreakerFailures},
 	} {
 		if knob.value < 0 {
@@ -231,22 +406,30 @@ func (c *Config) validate() error {
 		if d.value == "" {
 			continue
 		}
-		if _, err := time.ParseDuration(d.value); err != nil {
+		v, err := time.ParseDuration(d.value)
+		if err != nil {
 			return fmt.Errorf("%s: %q is not a duration (try 30s, 2m, 1h)", d.name, d.value)
 		}
-	}
-	if (c.Server.TLSCert == "") != (c.Server.TLSKey == "") {
-		return fmt.Errorf("server.tls_cert and server.tls_key are set together or not at all")
-	}
-	for _, f := range []struct{ name, path string }{
-		{"server.tls_cert", c.Server.TLSCert},
-		{"server.tls_key", c.Server.TLSKey},
-	} {
-		if f.path == "" {
-			continue
+		// Read past this, a negative one would be swapped for the default
+		// without a word, which is not what anybody who wrote it meant.
+		if v < 0 {
+			return fmt.Errorf("%s is negative: %q", d.name, d.value)
 		}
-		if _, err := os.Stat(f.path); err != nil {
-			return fmt.Errorf("%s: %w", f.name, err)
+	}
+	if serving {
+		if (c.Server.TLSCert == "") != (c.Server.TLSKey == "") {
+			return fmt.Errorf("server.tls_cert and server.tls_key are set together or not at all")
+		}
+		for _, f := range []struct{ name, path string }{
+			{"server.tls_cert", c.Server.TLSCert},
+			{"server.tls_key", c.Server.TLSKey},
+		} {
+			if f.path == "" {
+				continue
+			}
+			if _, err := os.Stat(f.path); err != nil {
+				return fmt.Errorf("%s: %w", f.name, err)
+			}
 		}
 	}
 	if len(c.Providers) == 0 {
@@ -321,6 +504,12 @@ func (c *Config) validate() error {
 		if m.Command == "" && m.URL == "" {
 			return fmt.Errorf("mcp server %q needs a command or a url", m.Name)
 		}
+		// The url is not repeated: a server's token is often carried in it.
+		if m.URL != "" {
+			if err := webAddress(m.URL); err != nil {
+				return fmt.Errorf("mcp server %q: url %v", m.Name, err)
+			}
+		}
 		for name := range m.Headers {
 			if strings.TrimSpace(name) == "" {
 				return fmt.Errorf("mcp server %q: a header with no name is a setting nothing carries", m.Name)
@@ -363,6 +552,10 @@ var kinds = []string{
 	"claude", "codex", "antigravity", "copilot",
 }
 
+// agentCLIs are the kinds that run a local program, whose base_url is that
+// program's path rather than a URL.
+var agentCLIs = []string{"claude", "codex", "antigravity", "copilot"}
+
 func knownKind(k string) bool {
 	for _, x := range kinds {
 		if x == k {
@@ -400,6 +593,30 @@ func optionsFor(kind string) []string {
 
 func checkOptions(id string, p Provider) error {
 	known := optionsFor(p.Kind)
+	// base_url is a URL for every kind but the agent CLIs, where it names a
+	// binary instead. Left without a scheme it parses without complaint and
+	// then fails every call at request time, a 400 that blames the caller for
+	// the file's mistake rather than a refusal at startup that names it.
+	if p.BaseURL != "" && !slices.Contains(agentCLIs, p.Kind) {
+		if err := webAddress(p.BaseURL); err != nil {
+			return fmt.Errorf("provider %q: base_url %q %v", id, p.BaseURL, err)
+		}
+		// Every call's path is written after base_url as it stands, so behind
+		// a query or a fragment that path is no longer a path.
+		if strings.ContainsAny(p.BaseURL, "?#") {
+			return fmt.Errorf("provider %q: base_url %q carries a query or a fragment, which every call's path would land inside", id, p.BaseURL)
+		}
+	}
+	if p.Kind == "bedrock" || p.Kind == "vertex" {
+		if r := p.Options["region"]; r != "" && !regionName(r) {
+			return fmt.Errorf("provider %q: option region is %q, which is not a region's name", id, r)
+		}
+	}
+	if p.Kind == "azure" {
+		if r := p.Options["resource"]; r != "" && strings.Trim(r, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") != "" {
+			return fmt.Errorf("provider %q: option resource is %q, which is not a resource's name", id, r)
+		}
+	}
 	names := make([]string, 0, len(p.Options))
 	for name := range p.Options {
 		names = append(names, name)
@@ -430,6 +647,14 @@ func checkOptions(id string, p Provider) error {
 	if v := p.Options["allow_fallbacks"]; v != "" && v != "true" && v != "false" {
 		return fmt.Errorf("provider %q: option allow_fallbacks is %q; it must be true or false", id, v)
 	}
+	overHTTP := []string{
+		"anthropic", "openai", "compatible", "google", "ollama",
+		"azure", "cloudflare", "openrouter", "bedrock", "vertex",
+	}
+	keyed := []string{
+		"anthropic", "openai", "compatible", "google", "ollama",
+		"azure", "cloudflare", "openrouter", "claude", "codex", "antigravity", "copilot",
+	}
 	for _, only := range []struct {
 		name  string
 		set   bool
@@ -438,19 +663,36 @@ func checkOptions(id string, p Provider) error {
 		{"dialect", p.Dialect != "", []string{"compatible"}},
 		{"version", p.Version != "", []string{"anthropic"}},
 		{"betas", len(p.Betas) > 0, []string{"anthropic"}},
+		{"client_betas", p.ClientBeta != nil, []string{"anthropic"}},
 		{"prefix", p.Prefix != "", []string{"google"}},
 		{"allow_client_key", p.ClientKey, []string{"anthropic", "openai", "compatible", "google", "openrouter"}},
-		{"headers", len(p.Headers) > 0, []string{
-			"anthropic", "openai", "compatible", "google", "ollama",
-			"azure", "cloudflare", "openrouter", "bedrock", "vertex",
-		}},
+		{"headers", len(p.Headers) > 0, overHTTP},
+		{"max_retries", p.MaxRetries != 0, overHTTP},
+		{"api_key", p.APIKey != "", keyed},
+		{"api_key_env", p.APIKeyEnv != "", keyed},
 	} {
 		if only.set && !slices.Contains(only.kinds, p.Kind) {
 			return fmt.Errorf("provider %q: %s is read by kind %s, not %s", id, only.name, strings.Join(only.kinds, ", "), p.Kind)
 		}
 	}
+	if (p.APIKey != "" || p.APIKeyEnv != "") && slices.Contains(known, "api_key_env_name") && p.Options["api_key_env_name"] == "" {
+		return fmt.Errorf("provider %q: kind %s hands its CLI a key only through option api_key_env_name, which is not set", id, p.Kind)
+	}
 	if p.Kind == "vertex" && p.Model == "" && p.Options["publisher"] == "" {
 		return fmt.Errorf("provider %q: vertex serves one publisher per entry, so it needs model or option publisher", id)
+	}
+	return nil
+}
+
+// webAddress says what keeps raw from being an http or https address with a
+// host, as the rest of a sentence naming it, or nil when nothing does.
+func webAddress(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return errors.New("has no http:// or https:// scheme")
+	}
+	if u.Hostname() == "" {
+		return errors.New("names no host")
 	}
 	return nil
 }

@@ -42,7 +42,7 @@ func limitsOf(s Server) llm.Limits {
 	if s.MaxResponseMB > 0 {
 		response = int64(s.MaxResponseMB) << 20
 	}
-	return llm.Limits{Timeout: timeout, MaxResponseBytes: response}
+	return llm.Limits{Timeout: timeout, MaxResponseBytes: response, MaxFrameBytes: s.MaxFrameMB << 20}
 }
 
 // In a config file zero is how an operator asks for no gate at all, which the
@@ -66,6 +66,10 @@ func build(cfg *Config, logger *slog.Logger, sinks []usage.Sink, tools *mcp.Mana
 	opts := []goose.Option{goose.WithLogger(logger)}
 	if tools != nil {
 		opts = append(opts, goose.WithToolSource("mcp", tools.Proxied))
+	} else if len(cfg.MCP) > 0 {
+		// A check starts no tool server, but a route naming the group is still
+		// checked against it.
+		opts = append(opts, goose.WithToolSource("mcp", func() []llm.Tool { return nil }))
 	}
 	if len(sinks) > 0 {
 		opts = append(opts, goose.WithUsage(sinks...))
@@ -87,10 +91,30 @@ func build(cfg *Config, logger *slog.Logger, sinks []usage.Sink, tools *mcp.Mana
 	for _, p := range cfg.Providers {
 		built, err := newProvider(p)
 		if err != nil {
-			return nil, err
+			id := p.ID
+			if id == "" {
+				id = p.Kind
+			}
+			// A library's own error carries the kind an API caller would
+			// branch on, which tells an operator nothing about the file. One
+			// wrapped in what this file adds keeps the whole of it.
+			msg := err.Error()
+			if e, ok := err.(*llm.Error); ok {
+				msg = e.Message
+			}
+			return nil, fmt.Errorf("provider %q: %s", id, msg)
 		}
 		opts = append(opts, goose.WithProvider(built))
 	}
+	rules, err := rulesOf(cfg)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, goose.WithRoutes(rules...))
+	return goose.New(opts...)
+}
+
+func rulesOf(cfg *Config) ([]route.Rule, error) {
 	pinned := map[string]string{}
 	for _, p := range cfg.Providers {
 		id := p.ID
@@ -109,14 +133,15 @@ func build(cfg *Config, logger *slog.Logger, sinks []usage.Sink, tools *mcp.Mana
 		}
 		routes = []Route{{Name: "default", Chain: []string{id}}}
 	}
+	var rules []route.Rule
 	for _, r := range routes {
-		rule, err := newRule(r, pinned)
+		rule, err := newRule(r, pinned, cfg.Server.Strict)
 		if err != nil {
 			return nil, err
 		}
-		opts = append(opts, goose.WithRoutes(rule))
+		rules = append(rules, rule)
 	}
-	return goose.New(opts...)
+	return rules, nil
 }
 
 func headerOf(m map[string]string) http.Header {
@@ -142,7 +167,7 @@ func newProvider(p Provider) (llm.Provider, error) {
 			ID: id, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model,
 			Version: p.Version, Betas: p.Betas, MaxRetries: p.MaxRetries,
 			Timeout: timeout, AllowClientKey: p.ClientKey, Header: headerOf(p.Headers),
-			KeyScheme: llm.SchemeAnthropic,
+			KeyScheme: llm.SchemeAnthropic, NoClientBetas: p.ClientBeta != nil && !*p.ClientBeta,
 		})
 	case "openai":
 		return openai.New(openai.Options{
@@ -166,11 +191,11 @@ func newProvider(p Provider) (llm.Provider, error) {
 				dialect.Responses = true
 			case "":
 			default:
-				return nil, fmt.Errorf("provider %q: unknown dialect feature %q", id, feature)
+				return nil, fmt.Errorf("unknown dialect feature %q", feature)
 			}
 		}
 		if p.BaseURL == "" {
-			return nil, fmt.Errorf("provider %q: a compatible backend needs base_url", id)
+			return nil, fmt.Errorf("a compatible backend needs base_url")
 		}
 		return openai.New(openai.Options{
 			ID: id, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model,
@@ -179,6 +204,9 @@ func newProvider(p Provider) (llm.Provider, error) {
 			AuthHeader: p.Options["auth_header"], AuthPrefix: p.Options["auth_prefix"],
 		})
 	case "azure":
+		if p.Options["resource"] == "" && p.BaseURL == "" {
+			return nil, fmt.Errorf("an azure backend needs options.resource or base_url")
+		}
 		return azure.New(azure.Options{
 			ID: id, Resource: p.Options["resource"], BaseURL: p.BaseURL,
 			Deployment: p.Options["deployment"], Model: p.Model, APIKey: p.APIKey,
@@ -186,6 +214,9 @@ func newProvider(p Provider) (llm.Provider, error) {
 			Header: headerOf(p.Headers),
 		})
 	case "cloudflare":
+		if p.Options["account_id"] == "" && p.BaseURL == "" {
+			return nil, fmt.Errorf("a cloudflare backend needs options.account_id or base_url")
+		}
 		return cloudflare.New(cloudflare.Options{
 			ID: id, AccountID: p.Options["account_id"], BaseURL: p.BaseURL,
 			APIKey: p.APIKey, Model: p.Model, MaxRetries: p.MaxRetries, Timeout: timeout,
@@ -202,6 +233,12 @@ func newProvider(p Provider) (llm.Provider, error) {
 		})
 	case "bedrock":
 		region := firstNonEmpty(p.Options["region"], os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"))
+		if region == "" {
+			return nil, fmt.Errorf("a bedrock backend needs a region: set options.region or AWS_REGION")
+		}
+		if !regionName(region) {
+			return nil, fmt.Errorf("region %q, from options.region, AWS_REGION or AWS_DEFAULT_REGION, is not a region's name", region)
+		}
 		return bedrock.New(bedrock.Options{
 			ID: id, Region: region, Model: p.Model, BaseURL: p.BaseURL,
 			Credentials: awsCredentials(p, os.Getenv),
@@ -210,11 +247,18 @@ func newProvider(p Provider) (llm.Provider, error) {
 	case "vertex":
 		token, keyProject, err := googleToken(p, os.Getenv, os.ReadFile)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("options.credentials_file or GOOGLE_APPLICATION_CREDENTIALS: %w", err)
+		}
+		project := firstNonEmpty(p.Options["project"], os.Getenv("GOOGLE_CLOUD_PROJECT"), os.Getenv("GCP_PROJECT"), keyProject)
+		if project == "" {
+			return nil, fmt.Errorf("a vertex backend needs a project: set options.project or GOOGLE_CLOUD_PROJECT")
+		}
+		region := firstNonEmpty(p.Options["region"], os.Getenv("GOOGLE_CLOUD_LOCATION"))
+		if region != "" && !regionName(region) {
+			return nil, fmt.Errorf("region %q, from options.region or GOOGLE_CLOUD_LOCATION, is not a region's name", region)
 		}
 		return vertex.New(vertex.Options{
-			ID: id, Project: firstNonEmpty(p.Options["project"], os.Getenv("GOOGLE_CLOUD_PROJECT"), os.Getenv("GCP_PROJECT"), keyProject),
-			Region:    firstNonEmpty(p.Options["region"], os.Getenv("GOOGLE_CLOUD_LOCATION")),
+			ID: id, Project: project, Region: region,
 			Model:     p.Model,
 			Publisher: p.Options["publisher"],
 			Token:     token, BaseURL: p.BaseURL,
@@ -252,7 +296,7 @@ func newProvider(p Provider) (llm.Provider, error) {
 			Header: headerOf(p.Headers),
 		})
 	default:
-		return nil, fmt.Errorf("provider %q: unknown kind %q", id, p.Kind)
+		return nil, fmt.Errorf("unknown kind %q", p.Kind)
 	}
 }
 
@@ -278,7 +322,10 @@ func splitList(s string) []string {
 	return out
 }
 
-func newRule(r Route, pinned map[string]string) (route.Rule, error) {
+// newRule builds a route's rule. strict is the server's: a route that leaves
+// its own strict unsaid keeps it, though it names codes to allow or deny,
+// since a rule that names any policy at all is not given the server's.
+func newRule(r Route, pinned map[string]string, strict bool) (route.Rule, error) {
 	var matchers []route.Matcher
 	if len(r.Models) > 0 {
 		var globs []route.Matcher
@@ -298,9 +345,12 @@ func newRule(r Route, pinned map[string]string) (route.Rule, error) {
 	if len(matchers) > 0 {
 		match = route.All(matchers...)
 	}
+	if r.Strict != nil {
+		strict = *r.Strict
+	}
 	rule := route.Rule{
 		Name: r.Name, Match: match, Model: r.Model, Sticky: r.Sticky, Tools: r.Tools,
-		Policy:    llm.LossPolicy{Strict: r.Strict != nil && *r.Strict, Allow: r.Allow, Deny: r.Deny},
+		Policy:    llm.LossPolicy{Strict: strict, Allow: r.Allow, Deny: r.Deny},
 		PolicySet: r.Strict != nil || len(r.Allow) > 0 || len(r.Deny) > 0,
 	}
 	for _, id := range r.Chain {

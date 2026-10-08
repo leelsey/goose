@@ -322,6 +322,43 @@ func TestEncodeStreamIndexesToolCalls(t *testing.T) {
 	}
 }
 
+// Anthropic and Bedrock number a call by its block, which counts the text and
+// thinking ahead of it; this wire numbers a choice's calls from nought.
+func TestEncodeStreamNumbersCallsByTheirPlaceAmongCalls(t *testing.T) {
+	b1, b2 := 1, 2
+	w, _, err := streamOf(t, wire.Options{Stream: true},
+		&llm.Frame{Role: llm.RoleAssistant, Delta: []llm.Part{&llm.Text{Text: "Let me check."}}},
+		&llm.Frame{Delta: []llm.Part{&llm.ToolUse{Index: &b1, ID: "toolu_1", Name: "get_weather"}}},
+		&llm.Frame{Delta: []llm.Part{&llm.ToolUse{Index: &b1, Args: json.RawMessage(`{"city":"Paris"}`)}}},
+		&llm.Frame{Delta: []llm.Part{&llm.ToolUse{Index: &b2, ID: "toolu_2", Name: "get_time"}}},
+		&llm.Frame{Delta: []llm.Part{&llm.ToolUse{Index: &b2, Args: json.RawMessage(`{}`)}}},
+		&llm.Frame{Stop: llm.StopToolUse},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []float64
+	for _, ch := range chunks(t, w.Body.String()) {
+		choices, _ := ch["choices"].([]any)
+		for _, c := range choices {
+			delta, _ := c.(map[string]any)["delta"].(map[string]any)
+			calls, _ := delta["tool_calls"].([]any)
+			for _, tc := range calls {
+				got = append(got, tc.(map[string]any)["index"].(float64))
+			}
+		}
+	}
+	want := []float64{0, 0, 1, 1}
+	if len(got) != len(want) {
+		t.Fatalf("indices = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("indices = %v, want %v: the first call a client sees is call nought", got, want)
+		}
+	}
+}
+
 func TestEncodeStreamReportsUpstreamFailureInBand(t *testing.T) {
 	w, diags, err := streamOf(t, wire.Options{Stream: true},
 		&llm.Frame{Role: llm.RoleAssistant, Delta: []llm.Part{&llm.Text{Text: "half"}}},

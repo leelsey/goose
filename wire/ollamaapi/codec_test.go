@@ -486,3 +486,62 @@ func TestGenerateCarriesFieldsItHasNoPlaceForEitherWay(t *testing.T) {
 		}
 	})
 }
+
+// Neither endpoint has a field for a refusal, so one read as an answer is
+// said once, whole or streamed, on both of them.
+func TestARefusalFlattenedToTextIsReportedOnce(t *testing.T) {
+	resp := &llm.Response{Choices: []llm.Choice{{
+		Message: llm.Message{Content: []llm.Part{&llm.Refusal{Text: "I can't help with that."}}},
+		Stop:    llm.StopEnd,
+	}}}
+	for _, c := range []wire.Codec{NewChat(Options{}), NewGenerate(Options{})} {
+		_, diags, err := c.EncodeResponse(resp, wire.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := len(diags.Find(llm.DropRefusal)); n != 1 {
+			t.Errorf("%s: drop.refusal noted %d times on the whole answer", c.Name(), n)
+		}
+		s := llm.StaticStream(llm.StreamMeta{Model: "m"}, []*llm.Frame{
+			{Delta: []llm.Part{&llm.Refusal{Text: "I can't "}}},
+			{Delta: []llm.Part{&llm.Refusal{Text: "help with that."}}},
+			{Stop: llm.StopEnd},
+		})
+		diags, err = c.EncodeStream(context.Background(), s, wire.Options{Stream: true}, &wire.BufferWriter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := len(diags.Find(llm.DropRefusal)); n != 1 {
+			t.Errorf("%s: drop.refusal noted %d times on the stream", c.Name(), n)
+		}
+	}
+}
+
+func TestArgumentsThatDidNotSurviveAreReported(t *testing.T) {
+	broken := func() *llm.ToolUse {
+		i0 := 0
+		return &llm.ToolUse{Index: &i0, Name: "f", Args: json.RawMessage(`{"a":`)}
+	}
+	resp := &llm.Response{Choices: []llm.Choice{{
+		Message: llm.Message{Content: []llm.Part{broken()}},
+		Stop:    llm.StopToolUse,
+	}}}
+	_, diags, err := NewChat(Options{}).EncodeResponse(resp, wire.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diags.Has(llm.DropToolCall) {
+		t.Fatalf("diagnostics = %+v: a call sent with none of its arguments is a call that changed", diags)
+	}
+	s := llm.StaticStream(llm.StreamMeta{Model: "m"}, []*llm.Frame{
+		{Delta: []llm.Part{broken()}},
+		{Stop: llm.StopToolUse},
+	})
+	diags, err = NewChat(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, &wire.BufferWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diags.Has(llm.DropToolCall) {
+		t.Fatalf("diagnostics = %+v: the stream loses the arguments as surely as the answer does", diags)
+	}
+}

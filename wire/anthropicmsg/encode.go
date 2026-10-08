@@ -47,7 +47,7 @@ func (c *Codec) EncodeResponse(resp *llm.Response, opts wire.Options) (*wire.Out
 			seq := ch.StopSequence
 			body.StopSequence = &seq
 		}
-		blocks, d := EncodeBlocks(ch.Message.Content)
+		blocks, d := encodeBlocks(ch.Message.Content, true)
 		diags = append(diags, d...)
 		body.Content = blocks
 	}
@@ -106,43 +106,66 @@ func imageSource(v *llm.Image) (map[string]any, bool) {
 	}
 }
 
+// EncodeBlocks writes blocks for a backend on this wire, each signature exactly
+// as it was issued.
 func EncodeBlocks(parts []llm.Part) ([]json.RawMessage, llm.Diagnostics) {
+	return encodeBlocks(parts, false)
+}
+
+// encodeBlocks writes blocks for a backend or, with client set, for a client,
+// who is handed another family's signature marked as that family's.
+func encodeBlocks(parts []llm.Part, client bool) ([]json.RawMessage, llm.Diagnostics) {
 	var diags llm.Diagnostics
 	out := []json.RawMessage{}
+	unsigned := 0
 	for _, p := range parts {
+		if sig, _ := wirecore.Signed(p); sig != "" && p.Kind() != llm.KindThinking {
+			unsigned++
+		}
 		switch v := p.(type) {
 		case *llm.Text:
+			// This wire refuses an empty text block, and one arrives from
+			// Gemini carrying nothing but a signature this wire has no field for.
+			if v.Text == "" {
+				continue
+			}
 			out = append(out, mustJSON(map[string]any{"type": "text", "text": v.Text}))
 		case *llm.Refusal:
 			// This wire has no refusal block, and a refusal read as an answer
 			// is an answer the client will act on.
-			diags = append(diags, llm.Diagnostic{
-				Code: llm.DropRefusal, Class: llm.ClassContent, Stage: llm.StageEncode,
-				Severity: llm.SeverityLoss, Format: Name,
-				Detail: "this format has no field for a refusal, so it travelled as ordinary text",
-			})
+			diags = append(diags, refusalAsText())
 			out = append(out, mustJSON(map[string]any{"type": "text", "text": v.Text}))
 		case *llm.Thinking:
 			if len(v.Redacted) > 0 {
 				out = append(out, mustJSON(map[string]any{"type": "redacted_thinking", "data": string(v.Redacted)}))
 				continue
 			}
-			out = append(out, mustJSON(map[string]any{"type": "thinking", "thinking": v.Text, "signature": v.Signature}))
+			sig := v.Signature
+			if client {
+				sig = wirecore.SealSignature(llm.FamilyAnthropic, v.Signer, sig)
+			}
+			out = append(out, mustJSON(map[string]any{"type": "thinking", "thinking": v.Text, "signature": sig}))
 		case *llm.ToolUse:
 			args, broken := wirecore.ObjectArgsBroken(v.Args)
 			if broken {
-				diags = append(diags, llm.Diagnostic{
-					Code: llm.DropToolCall, Class: llm.ClassContent, Stage: llm.StageEncode,
-					Severity: llm.SeverityLoss, Format: Name, Field: v.Name,
-					Detail: "this call's arguments did not survive, so it travelled with none rather than with what was meant",
-				})
+				diags = append(diags, brokenArgs(v.Name))
 			}
 			out = append(out, mustJSON(map[string]any{"type": "tool_use", "id": v.ID, "name": v.Name, "input": args}))
 		case *llm.ToolResult:
-			inner, d := EncodeBlocks(v.Content)
+			inner, d := encodeBlocks(v.Content, client)
 			diags = append(diags, d...)
 			out = append(out, mustJSON(map[string]any{"type": "tool_result", "tool_use_id": v.ID, "content": inner, "is_error": v.IsError}))
 		case *llm.Image:
+			// A request carries images; an answer on this wire has no block for
+			// one, which is what Renders says and what the stream does.
+			if client {
+				diags = append(diags, llm.Diagnostic{
+					Code: llm.DropImage, Class: llm.ClassContent, Stage: llm.StageEncode,
+					Severity: llm.SeverityLoss, Format: Name,
+					Detail: "an assistant image has no block on this wire",
+				})
+				continue
+			}
 			source, ok := imageSource(v)
 			if !ok {
 				diags = append(diags, llm.Diagnostic{
@@ -165,7 +188,37 @@ func EncodeBlocks(parts []llm.Part) ([]json.RawMessage, llm.Diagnostics) {
 			})
 		}
 	}
+	if unsigned > 0 {
+		diags = append(diags, unsignedParts(unsigned))
+	}
 	return out, diags
+}
+
+// unsignedParts says Gemini's signatures on calls, text or images did not
+// travel: this wire signs only a thinking block, and the model's reasoning
+// before those parts is lost to the next turn.
+func unsignedParts(n int) llm.Diagnostic {
+	return llm.Diagnostic{
+		Code: llm.DropSignature, Class: llm.ClassContent, Stage: llm.StageEncode,
+		Severity: llm.SeverityLoss, Format: Name, Count: n,
+		Detail: "this wire signs only a thinking block, so the reasoning signed onto a call, a text or an image did not travel with it",
+	}
+}
+
+func refusalAsText() llm.Diagnostic {
+	return llm.Diagnostic{
+		Code: llm.DropRefusal, Class: llm.ClassContent, Stage: llm.StageEncode,
+		Severity: llm.SeverityLoss, Format: Name,
+		Detail: "this format has no field for a refusal, so it travelled as ordinary text",
+	}
+}
+
+func brokenArgs(name string) llm.Diagnostic {
+	return llm.Diagnostic{
+		Code: llm.DropToolCall, Class: llm.ClassContent, Stage: llm.StageEncode,
+		Severity: llm.SeverityLoss, Format: Name, Field: name,
+		Detail: "this call's arguments did not survive, so it travelled with none rather than with what was meant",
+	}
 }
 
 func (c *Codec) EncodeError(err *llm.Error, _ wire.Options) *wire.Outbound {

@@ -5,13 +5,23 @@
 package openrouter
 
 import (
+	"context"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/leelsey/goose/llm"
 	"github.com/leelsey/goose/provider/openai"
 )
 
 const defaultBaseURL = "https://openrouter.ai/api/v1"
+
+// Provider serves the OpenAI shape from OpenRouter, whose catalogue spans
+// every vendor behind it and so refuses a model id it does not have rather
+// than one that is merely malformed.
+type Provider struct {
+	*openai.Provider
+}
 
 type Options struct {
 	ID        string
@@ -30,7 +40,7 @@ type Options struct {
 	AllowClientKey bool
 }
 
-func New(o Options) (*openai.Provider, error) {
+func New(o Options) (*Provider, error) {
 	if o.ID == "" {
 		o.ID = "openrouter"
 	}
@@ -56,12 +66,16 @@ func New(o Options) (*openai.Provider, error) {
 	if len(body) == 0 {
 		body = nil
 	}
-	return openai.New(openai.Options{
+	inner, err := openai.New(openai.Options{
 		ID: o.ID, BaseURL: o.BaseURL, APIKey: o.APIKey, Model: o.Model,
 		MaxRetries: o.MaxRetries, Timeout: o.Timeout, Header: h,
 		AllowClientKey: o.AllowClientKey, Body: body,
 		Dialect: openai.Dialect{StreamUsage: true, Extensions: true, PerModelCeiling: true},
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &Provider{Provider: inner}, nil
 }
 
 func (o Options) Preferences() map[string]any {
@@ -73,4 +87,29 @@ func (o Options) Preferences() map[string]any {
 		pref["order"] = o.Providers
 	}
 	return pref
+}
+
+func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response, error) {
+	resp, err := p.Provider.Complete(ctx, a)
+	if err != nil {
+		refine(llm.AsError(err))
+	}
+	return resp, err
+}
+
+func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, error) {
+	s, err := p.Provider.Stream(ctx, a)
+	if err != nil {
+		refine(llm.AsError(err))
+	}
+	return s, err
+}
+
+// refine reads what the status does not say. OpenRouter refuses a model id it
+// does not have with the 400 a malformed request gets, and only a malformed
+// request fails the same on every backend.
+func refine(e *llm.Error) {
+	if e.Kind == llm.KindInvalidRequest && strings.Contains(strings.ToLower(e.Message), "is not a valid model id") {
+		e.Kind = llm.KindNotFound
+	}
 }

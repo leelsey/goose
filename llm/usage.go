@@ -11,6 +11,7 @@ type Usage struct {
 	CacheRead    int `json:"cache_read,omitempty"`
 	CacheWrite   int `json:"cache_write,omitempty"`
 	CacheWrite5m int `json:"cache_write_5m,omitempty"`
+	CacheWrite1h int `json:"cache_write_1h,omitempty"`
 	Reasoning    int `json:"reasoning,omitempty"`
 
 	Reported bool `json:"reported"`
@@ -52,6 +53,7 @@ type RawUsage struct {
 	CacheRead    int
 	CacheWrite   int
 	CacheWrite5m int
+	CacheWrite1h int
 	ToolPrompt   int
 
 	CacheOutsidePrompt         bool
@@ -73,6 +75,7 @@ func (r RawUsage) Normalise() Usage {
 		CacheRead:    r.CacheRead,
 		CacheWrite:   r.CacheWrite,
 		CacheWrite5m: r.CacheWrite5m,
+		CacheWrite1h: r.CacheWrite1h,
 		Reported:     r.Reported,
 		Cost:         r.Cost,
 		Tier:         r.Tier,
@@ -94,6 +97,10 @@ func (r RawUsage) Normalise() Usage {
 func (u Usage) settle() Usage {
 	if u.CacheWrite5m > u.CacheWrite {
 		u.CacheWrite5m = u.CacheWrite
+		u = u.WithAnomaly(Anomaly{Code: AnomalyCacheSplit})
+	}
+	if u.CacheWrite1h > u.CacheWrite-u.CacheWrite5m {
+		u.CacheWrite1h = u.CacheWrite - u.CacheWrite5m
 		u = u.WithAnomaly(Anomaly{Code: AnomalyCacheSplit})
 	}
 	if u.Prompt < u.CacheRead+u.CacheWrite {
@@ -205,6 +212,7 @@ func (u Usage) Merge(next Usage) Usage {
 	u.CacheRead = newest(u.CacheRead, next.CacheRead)
 	u.CacheWrite = newest(u.CacheWrite, next.CacheWrite)
 	u.CacheWrite5m = newest(u.CacheWrite5m, next.CacheWrite5m)
+	u.CacheWrite1h = newest(u.CacheWrite1h, next.CacheWrite1h)
 	u.Reasoning = newest(u.Reasoning, next.Reasoning)
 	u.Turns = newest(u.Turns, next.Turns)
 	u.DurationMS = newest64(u.DurationMS, next.DurationMS)
@@ -234,6 +242,7 @@ func (u Usage) Add(next Usage) Usage {
 	u.CacheRead += next.CacheRead
 	u.CacheWrite += next.CacheWrite
 	u.CacheWrite5m += next.CacheWrite5m
+	u.CacheWrite1h += next.CacheWrite1h
 	u.Reasoning += next.Reasoning
 	u.Turns += next.Turns
 	u.DurationMS += next.DurationMS
@@ -267,6 +276,7 @@ func (u Usage) Cover(other Usage) Usage {
 	u.CacheRead = max(u.CacheRead, other.CacheRead)
 	u.CacheWrite = max(u.CacheWrite, other.CacheWrite)
 	u.CacheWrite5m = max(u.CacheWrite5m, other.CacheWrite5m)
+	u.CacheWrite1h = max(u.CacheWrite1h, other.CacheWrite1h)
 	u.Reasoning = max(u.Reasoning, other.Reasoning)
 	u.Turns = max(u.Turns, other.Turns)
 	u.DurationMS = max(u.DurationMS, other.DurationMS)

@@ -94,14 +94,15 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 			carry(req, "reasoning", rest)
 		}
 		var r struct {
-			Effort  string `json:"effort"`
-			Summary string `json:"summary"`
+			Effort string `json:"effort"`
 		}
 		if err := json.Unmarshal(raw, &r); err != nil {
 			return nil, opts, diags, llm.Errorf(llm.KindInvalidRequest, "reasoning: %v", err)
 		}
 		req.Effort = llm.Effort(r.Effort)
-		if r.Effort != "" || r.Summary != "" {
+		// "none" is this wire's word for not reasoning at all. A summary alone
+		// asks how reasoning is reported, not for any to happen.
+		if r.Effort != "" && r.Effort != "none" {
 			req.Thinking = &llm.ThinkingConfig{Enabled: true}
 		}
 	}
@@ -137,9 +138,22 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 	}
 
 	if raw, ok := top["tools"]; ok && string(raw) != "null" {
-		var entries []json.RawMessage
+		var entries, unmodelled []json.RawMessage
 		if err := json.Unmarshal(raw, &entries); err != nil {
 			return nil, opts, diags, llm.Errorf(llm.KindInvalidRequest, "tools: %v", err)
+		}
+		// A backend is sent the functions, then the tool servers, then the tools
+		// carried whole, so a client that interleaved them is told the order it
+		// gave was not kept.
+		const (
+			toolFunction = iota
+			toolServer
+			toolCarried
+		)
+		last, reordered := toolFunction, false
+		kind := func(k int) {
+			reordered = reordered || k < last
+			last = max(last, k)
 		}
 		for _, entry := range entries {
 			var head struct {
@@ -154,6 +168,7 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 					return nil, opts, diags, err
 				}
 				req.MCPServers = append(req.MCPServers, server)
+				kind(toolServer)
 				continue
 			}
 			var t struct {
@@ -169,15 +184,43 @@ func (c *Codec) Decode(in *wire.Inbound) (*llm.Request, wire.Options, llm.Diagno
 			if builtIn[t.Type] {
 				return nil, opts, diags, llm.Errorf(llm.KindUnsupported, "tool type %q exists only on one provider; use a function tool", t.Type)
 			}
+			// A freeform tool, or any other kind this wire does not model, has no
+			// parameters to make a function of, and read as one it would reach the
+			// model taking nothing. It travels as written to a backend on this
+			// wire and is reported as not sent anywhere else.
+			if t.Type != "" && t.Type != "function" {
+				unmodelled = append(unmodelled, entry)
+				kind(toolCarried)
+				continue
+			}
 			req.Tools = append(req.Tools, llm.Tool{
 				Name: t.Name, Description: t.Description, Schema: t.Parameters, Strict: t.Strict,
 			})
+			kind(toolFunction)
+		}
+		if reordered {
+			diags = append(diags, llm.Diagnostic{
+				Code: llm.DropToolDefinition, Class: llm.ClassCapability, Stage: llm.StageDecode,
+				Severity: llm.SeverityInfo, Format: Name, Field: "tools",
+				Detail: "tools travel as functions, then tool servers, then those carried whole, so the order they came in was not kept",
+			})
+		}
+		if len(unmodelled) > 0 {
+			rest, _ := json.Marshal(unmodelled)
+			carry(req, "tools", rest)
 		}
 	}
 	if raw, ok := top["tool_choice"]; ok && string(raw) != "null" {
 		tc, err := decodeToolChoice(raw)
 		if err != nil {
 			return nil, opts, diags, err
+		}
+		// With no function beside the tools that travel as written, a choice
+		// has only those to govern, and read as a mode it would be dropped for
+		// having no tool to name. It travels with them instead.
+		if _, carried := req.Extra["tools"]; tc == nil || (carried && len(req.Tools) == 0) {
+			carry(req, "tool_choice", raw)
+			tc = nil
 		}
 		req.ToolChoice = tc
 	}
@@ -269,6 +312,7 @@ func decodeInput(raw json.RawMessage) ([]llm.Message, llm.Diagnostics, error) {
 			appendTo(llm.RoleTool, &llm.ToolResult{ID: callID, Content: parts})
 		case "reasoning":
 			var r struct {
+				ID      string `json:"id"`
 				Summary []struct {
 					Text string `json:"text"`
 				} `json:"summary"`
@@ -276,7 +320,13 @@ func decodeInput(raw json.RawMessage) ([]llm.Message, llm.Diagnostics, error) {
 			}
 			b, _ := json.Marshal(item)
 			_ = json.Unmarshal(b, &r)
-			th := &llm.Thinking{Signature: r.EncryptedContent}
+			// The id is how a backend that stored the item finds it again; one
+			// goose made up names nothing any backend holds.
+			if strings.HasPrefix(r.ID, mintedReasoning+"_") {
+				r.ID = ""
+			}
+			th := &llm.Thinking{ID: r.ID}
+			th.Signer, th.Signature = wirecore.OpenSignature(llm.FamilyOpenAI, r.EncryptedContent)
 			var sb strings.Builder
 			for _, s := range r.Summary {
 				sb.WriteString(s.Text)
@@ -349,24 +399,36 @@ func decodeContent(raw json.RawMessage) ([]llm.Part, llm.Diagnostics, error) {
 				parts = append(parts, &llm.Refusal{Text: s})
 			}
 		case "input_image":
-			var url, detail string
+			var url, detail, file string
 			_ = field(item, "image_url", &url)
 			_ = field(item, "detail", &detail)
+			_ = field(item, "file_id", &file)
+			// An uploaded file is a name only the backend that holds it can
+			// resolve. As an image it would carry neither bytes nor an address.
+			if url == "" && file != "" {
+				raw, d := verbatim(item, kind)
+				parts, diags = append(parts, raw), append(diags, d)
+				continue
+			}
 			img := &llm.Image{URL: url, Detail: detail}
 			if mime, data, ok := dataURL(url); ok {
 				img.MIME, img.Data, img.URL = mime, data, ""
 			}
 			parts = append(parts, img)
 		default:
-			b, _ := json.Marshal(item)
-			parts = append(parts, &llm.Raw{Vendor: Name, Type: kind, JSON: b})
-			diags = append(diags, llm.Diagnostic{
-				Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageDecode,
-				Severity: llm.SeverityInfo, Format: Name, Field: kind, Detail: "content part carried verbatim",
-			})
+			raw, d := verbatim(item, kind)
+			parts, diags = append(parts, raw), append(diags, d)
 		}
 	}
 	return parts, diags, nil
+}
+
+func verbatim(item map[string]json.RawMessage, kind string) (*llm.Raw, llm.Diagnostic) {
+	b, _ := json.Marshal(item)
+	return &llm.Raw{Vendor: Name, Type: kind, JSON: b}, llm.Diagnostic{
+		Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageDecode,
+		Severity: llm.SeverityInfo, Format: Name, Field: kind, Detail: "content part carried verbatim",
+	}
 }
 
 func decodeToolChoice(raw json.RawMessage) (*llm.ToolChoice, error) {
@@ -390,8 +452,19 @@ func decodeToolChoice(raw json.RawMessage) (*llm.ToolChoice, error) {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, llm.Errorf(llm.KindInvalidRequest, "tool_choice: %v", err)
 	}
-	if builtIn[obj.Type] {
+	// mcp is provider-specific like the rest of builtIn, but goose models a
+	// hosted MCP server portably, and this backend's own shape for choosing
+	// one is exactly what the unmodelled path below already carries as
+	// written; refusing it here would be the only tool_choice this wire
+	// cannot send to the backend it came from.
+	if obj.Type != "mcp" && builtIn[obj.Type] {
 		return nil, llm.Errorf(llm.KindUnsupported, "tool_choice names a provider-specific tool %q", obj.Type)
+	}
+	// A choice of a kind of tool this wire does not model travels as written,
+	// with the tool it names; nil says so. As a function choice it would name
+	// a function the backend was never offered.
+	if obj.Type != "" && obj.Type != "function" {
+		return nil, nil
 	}
 	return &llm.ToolChoice{Mode: llm.ToolSpecific, Name: obj.Name}, nil
 }

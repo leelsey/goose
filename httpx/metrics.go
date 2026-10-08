@@ -273,7 +273,7 @@ var _ usage.Sink = (*Metrics)(nil)
 
 func (s *Server) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if operational(r.URL.Path) {
+		if s.operational(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -286,27 +286,20 @@ func (s *Server) observe(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		s.opts.Metrics.request(s.formatFor(r.URL.Path), status, s.client.Env().Clock().Sub(started))
+		s.opts.Metrics.request(s.formatFor(r), status, s.client.Env().Clock().Sub(started))
 	})
 }
 
-func (s *Server) formatFor(path string) string {
-	if codec := s.codecFor(path); codec != nil {
+func (s *Server) formatFor(r *http.Request) string {
+	if codec := s.codecFor(r); codec != nil {
 		return codec.Name()
 	}
 	return "other"
 }
 
-func (s *Server) codecFor(path string) wire.Codec {
-	if codec, ok := s.byPath[path]; ok {
-		return codec
-	}
-	best := ""
-	var found wire.Codec
-	for prefix, codec := range s.byPrefix {
-		if strings.HasPrefix(path, prefix) && len(prefix) > len(best) {
-			best, found = prefix, codec
-		}
-	}
-	return found
+// codecFor is the codec a request is routed to, read off the route rather than
+// the path: Gemini's POST /v1/models/ begins every path the OpenAI and
+// Anthropic model endpoints answer GET on, and owns none of them.
+func (s *Server) codecFor(r *http.Request) wire.Codec {
+	return s.byRoute[s.served(r)]
 }

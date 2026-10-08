@@ -55,6 +55,32 @@ type outToolCall struct {
 		Name      string `json:"name,omitempty"`
 		Arguments string `json:"arguments,omitempty"`
 	} `json:"function"`
+	ExtraContent *extraContent `json:"extra_content,omitempty"`
+}
+
+// signed puts a call's signature where Google's own spelling of this wire has
+// it. The field is Google's, so a signature another family minted says so.
+func (tc *outToolCall) signed(v *llm.ToolUse) {
+	if v.Signature == "" {
+		return
+	}
+	tc.ExtraContent = &extraContent{}
+	tc.ExtraContent.Google.ThoughtSignature = wirecore.SealSignature(llm.FamilyGoogle, v.Signer, v.Signature)
+}
+
+// unsignedParts says a signature on anything but a call did not travel: this
+// wire has a field for a call's signature alone, and the model's reasoning
+// before those parts is lost to the next turn.
+func unsignedParts(n int) llm.Diagnostic {
+	d := drop(llm.DropSignature, "this wire signs only a tool call, so the signature on a thinking, text or image part did not travel with it")
+	d.Count = n
+	return d
+}
+
+// redactedThinking says a redacted block went undelivered. It has no text, so
+// nothing else here, nor the destination's declared renders, would say so.
+func redactedThinking() llm.Diagnostic {
+	return drop(llm.DropThinking, "redacted thinking has no field on this wire")
 }
 
 type outMessage struct {
@@ -171,7 +197,11 @@ func (c *Codec) message(m llm.Message, resp *llm.Response) (*outMessage, llm.Dia
 		out.Role = "assistant"
 	}
 	var text, thinking string
+	unsigned := 0
 	for _, p := range m.Content {
+		if sig, _ := wirecore.Signed(p); sig != "" && p.Kind() != llm.KindToolUse {
+			unsigned++
+		}
 		switch v := p.(type) {
 		case *llm.Text:
 			text += v.Text
@@ -180,10 +210,14 @@ func (c *Codec) message(m llm.Message, resp *llm.Response) (*outMessage, llm.Dia
 			out.Refusal = &r
 		case *llm.Thinking:
 			thinking += v.Text
+			if len(v.Redacted) > 0 {
+				diags = append(diags, redactedThinking())
+			}
 		case *llm.ToolUse:
 			tc := outToolCall{ID: v.ID, Type: "function"}
 			tc.Function.Name = v.Name
 			tc.Function.Arguments = argsString(v.Args)
+			tc.signed(v)
 			out.ToolCalls = append(out.ToolCalls, tc)
 		case *llm.Image:
 			diags = append(diags, drop(llm.DropImage, "an image has no place in a chat completion message"))
@@ -199,6 +233,9 @@ func (c *Codec) message(m llm.Message, resp *llm.Response) (*outMessage, llm.Dia
 		} else {
 			diags = append(diags, drop(llm.DropThinking, "this wire has no reasoning field; set Options.ReasoningField to carry it"))
 		}
+	}
+	if unsigned > 0 {
+		diags = append(diags, unsignedParts(unsigned))
 	}
 	out.Content = &text
 	if text == "" && (out.Refusal != nil || len(out.ToolCalls) > 0) {
@@ -282,7 +319,9 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 	}
 
 	roleSent := map[int]bool{}
+	calls := callOrder{}
 	var streamErr error
+	checked := 0
 
 	for fr := range s.Frames() {
 		if err := ctx.Err(); err != nil {
@@ -295,6 +334,34 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			streamErr = fr.Err
 			break
 		}
+		// Noted here, before this frame's Check, rather than accumulated for
+		// one diagnostic at the end: a loss the policy will not take must be
+		// caught before what it lost is written, not after.
+		unsigned := 0
+		for _, p := range fr.Delta {
+			if sig, _ := wirecore.Signed(p); sig != "" && p.Kind() != llm.KindToolUse {
+				unsigned++
+			}
+		}
+		if unsigned > 0 {
+			diags = append(diags, unsignedParts(unsigned))
+		}
+		delta, d := c.delta(fr.Delta, calls, idx)
+		reason, clean := finishReason(fr.Stop)
+		if !clean {
+			d = append(d, llm.Diagnostic{
+				Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageEncode,
+				Severity: llm.SeverityLoss, Format: Name, Field: string(fr.Stop),
+				Detail: "stop reason has no spelling on this wire and was reported as stop",
+			})
+		}
+		diags = append(diags, d...)
+		// What a frame loses here is known before any of it is written, so a
+		// loss the stream's policy will not take is refused in its place.
+		if streamErr = s.Check(diags[checked:]); streamErr != nil {
+			break
+		}
+		checked = len(diags)
 		if !roleSent[idx] {
 			roleSent[idx] = true
 			role := string(fr.Role)
@@ -306,8 +373,6 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			}
 			sent = true
 		}
-		delta, d := c.delta(fr.Delta)
-		diags = append(diags, d...)
 		if delta != nil {
 			if err := send(outChoice{Index: idx, Delta: delta}, nil, fr.Extra); err != nil {
 				return diags, err
@@ -315,14 +380,6 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 			sent = true
 		}
 		if fr.Stop != llm.StopNone {
-			reason, clean := finishReason(fr.Stop)
-			if !clean {
-				diags = append(diags, llm.Diagnostic{
-					Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageEncode,
-					Severity: llm.SeverityLoss, Format: Name, Field: string(fr.Stop),
-					Detail: "stop reason has no spelling on this wire and was reported as stop",
-				})
-			}
 			r := reason
 			if err := send(outChoice{Index: idx, Delta: &outMessage{Delta: true}, FinishReason: &r}, nil, fr.Extra); err != nil {
 				return diags, err
@@ -346,6 +403,9 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 
 	if streamErr == nil {
 		streamErr = s.Err()
+	}
+	if streamErr == nil {
+		streamErr = s.Check(diags[checked:])
 	}
 	if streamErr != nil {
 		e := llm.AsError(streamErr)
@@ -372,7 +432,35 @@ func (c *Codec) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Optio
 	return diags, streamErr
 }
 
-func (c *Codec) delta(parts []llm.Part) (*outMessage, llm.Diagnostics) {
+// callOrder numbers each choice's tool calls from nought in the order they
+// open, which is what this wire's index means. An upstream's own index can
+// count the text and thinking blocks ahead of a call as well, so it only tells
+// one call from another and is never written out.
+type callOrder map[int]*choiceCalls
+
+type choiceCalls struct {
+	merger *wirecore.ToolMerger
+	at     map[*llm.ToolUse]int
+}
+
+func (o callOrder) of(choice int, v *llm.ToolUse) int {
+	c := o[choice]
+	if c == nil {
+		c = &choiceCalls{merger: wirecore.NewToolMerger(), at: map[*llm.ToolUse]int{}}
+		o[choice] = c
+	}
+	// Only what identifies the call is handed over: the arguments go straight
+	// out, and the merger would otherwise hold every byte of them.
+	call := c.merger.Merge(&llm.ToolUse{ID: v.ID, Name: v.Name, Index: v.Index}, nil)
+	n, ok := c.at[call]
+	if !ok {
+		n = len(c.at)
+		c.at[call] = n
+	}
+	return n
+}
+
+func (c *Codec) delta(parts []llm.Part, calls callOrder, choice int) (*outMessage, llm.Diagnostics) {
 	if len(parts) == 0 {
 		return nil, nil
 	}
@@ -391,10 +479,15 @@ func (c *Codec) delta(parts []llm.Part) (*outMessage, llm.Diagnostics) {
 			any = true
 		case *llm.Thinking:
 			thinking += v.Text
+			if len(v.Redacted) > 0 {
+				diags = append(diags, redactedThinking())
+			}
 		case *llm.ToolUse:
-			tc := outToolCall{Index: v.Index, ID: v.ID, Type: "function"}
+			at := calls.of(choice, v)
+			tc := outToolCall{Index: &at, ID: v.ID, Type: "function"}
 			tc.Function.Name = v.Name
 			tc.Function.Arguments = string(v.Args)
+			tc.signed(v)
 			out.ToolCalls = append(out.ToolCalls, tc)
 			any = true
 		case *llm.Image:

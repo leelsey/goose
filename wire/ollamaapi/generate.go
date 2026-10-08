@@ -154,6 +154,9 @@ func (g *Generate) render(parts []llm.Part) (text, thinking string, diags llm.Di
 			text += v.Text
 		case *llm.Thinking:
 			thinking += v.Text
+			if len(v.Redacted) > 0 {
+				diags = append(diags, drop(NameGenerate, llm.DropThinking, "redacted thinking has no field on this wire"))
+			}
 		case *llm.Refusal:
 			refusal = v.Text
 		case *llm.ToolUse:
@@ -167,20 +170,31 @@ func (g *Generate) render(parts []llm.Part) (text, thinking string, diags llm.Di
 		}
 	}
 	if refusal != "" {
+		diags = append(diags, refusalAsText(NameGenerate))
 		if text != "" {
 			text += "\n\n"
 		}
 		text += refusal
 	}
 	if tools > 0 {
-		d := drop(NameGenerate, llm.DropToolCall, "this endpoint has no tool_calls field; use /api/chat")
-		d.Count = tools
+		d := droppedCalls(tools)
 		if text == "" {
 			d.Severity = llm.SeverityFatal
 		}
 		diags = append(diags, d)
 	}
+	if n := signed(parts); n > 0 {
+		diags = append(diags, unsignedParts(NameGenerate, n))
+	}
 	return text, thinking, diags
+}
+
+// droppedCalls says the calls an answer made did not reach the client. With
+// no text beside them the answer is gone, and the caller makes it fatal.
+func droppedCalls(n int) llm.Diagnostic {
+	d := drop(NameGenerate, llm.DropToolCall, "this endpoint has no tool_calls field; use /api/chat")
+	d.Count = n
+	return d
 }
 
 func (g *Generate) EncodeResponse(resp *llm.Response, opts wire.Options) (*wire.Outbound, llm.Diagnostics, error) {
@@ -230,9 +244,11 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 	}
 
 	stop := llm.StopNone
-	tools := 0
+	// The calls lost so far, and where the one note counting them sits.
+	tools, toolNote := 0, -1
 	sawText, refusing := false, false
 	var streamErr error
+	checked := 0
 	// An unmodelled field rides the line its own frame produced, or the next
 	// line out where that frame produced none. The unstreamed answer on this
 	// endpoint carries them, so this one does too.
@@ -256,6 +272,12 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 		}
 		frame := generateBody{Model: model, CreatedAt: stamp(g.opts.now())}
 		emit := false
+		// Noted here, before this frame's Check, rather than accumulated for
+		// one diagnostic at the end: a loss the policy will not take must be
+		// caught before what it lost is written, not after.
+		if n := signed(fr.Delta); n > 0 {
+			diags = append(diags, unsignedParts(NameGenerate, n))
+		}
 		for _, p := range fr.Delta {
 			switch v := p.(type) {
 			case *llm.Text:
@@ -267,6 +289,7 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 				// frame boundaries happen to fall.
 				if !refusing {
 					refusing = true
+					diags = append(diags, refusalAsText(NameGenerate))
 					if sawText {
 						frame.Response += "\n\n"
 					}
@@ -276,14 +299,35 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 			case *llm.Thinking:
 				frame.Thinking += v.Text
 				emit = emit || v.Text != ""
+				if len(v.Redacted) > 0 {
+					diags = append(diags, drop(NameGenerate, llm.DropThinking, "redacted thinking has no field on this wire"))
+				}
 			case *llm.ToolUse:
 				tools++
 			case *llm.Image:
 				diags = append(diags, drop(NameGenerate, llm.DropImage, "an assistant image has no field on this wire"))
+			case *llm.ToolResult:
+				diags = append(diags, drop(NameGenerate, llm.DropToolResult, "a tool result has no field on this wire"))
 			case *llm.Raw:
 				diags = append(diags, drop(NameGenerate, llm.DropUnknownBlock, "content block "+v.Type+" has no shape on this wire"))
 			}
 		}
+		// A call is lost in the frame it arrives in, so a policy that will not
+		// take the loss refuses it there, before any text after it goes out.
+		// One note counts them all, as the unstreamed answer's does.
+		if tools > 0 {
+			if toolNote < 0 {
+				toolNote = len(diags)
+				diags = append(diags, droppedCalls(tools))
+			}
+			diags[toolNote].Count = tools
+		}
+		// What a frame loses here is known before any of it is written, so a
+		// loss the stream's policy will not take is refused in its place.
+		if streamErr = s.Check(diags[checked:]); streamErr != nil {
+			break
+		}
+		checked = len(diags)
 		if emit {
 			if err := send(frame, fr.Extra); err != nil {
 				return diags, err
@@ -302,16 +346,16 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 		}
 	}
 
-	if tools > 0 {
-		d := drop(NameGenerate, llm.DropToolCall, "this endpoint has no tool_calls field; use /api/chat")
-		d.Count = tools
-		if !sawText {
-			d.Severity = llm.SeverityFatal
-		}
-		diags = append(diags, d)
-	}
 	if streamErr == nil {
 		streamErr = s.Err()
+	}
+	// Only now is it known that no text came beside the calls, and the note
+	// was checked as a lesser loss when they arrived, so it is checked again.
+	if toolNote >= 0 && !sawText {
+		diags[toolNote].Severity = llm.SeverityFatal
+		if streamErr == nil {
+			streamErr = s.Check(diags[toolNote : toolNote+1])
+		}
 	}
 
 	final := generateBody{Model: model, CreatedAt: stamp(g.opts.now()), Done: true, wireUsage: encodeUsage(s.Usage())}
@@ -325,6 +369,9 @@ func (g *Generate) EncodeStream(ctx context.Context, s *llm.Stream, opts wire.Op
 		})
 	}
 	final.Reason = reason
+	if streamErr == nil {
+		streamErr = s.Check(diags[checked:])
+	}
 	if streamErr != nil {
 		e := llm.AsError(streamErr)
 		final.Reason = "error"

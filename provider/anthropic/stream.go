@@ -6,6 +6,8 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"slices"
+	"strings"
 
 	"github.com/leelsey/goose/internal/httpcore"
 	"github.com/leelsey/goose/internal/wirecore"
@@ -27,7 +29,7 @@ func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, err
 		return nil, err
 	}
 
-	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
+	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxFrameBytes)
 	st := &parser{ctx: ctx, provider: p.ID(), sc: sc, blocks: map[int]*blockState{}, attempt: a}
 	stream := llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Requested: a.Request.Model, Model: a.Model, Created: p.now()},
@@ -42,6 +44,11 @@ type blockState struct {
 	id   string
 	name string
 	idx  int
+
+	// A block goose does not model is held until it stops, because a server
+	// tool's input streams after its start and belongs inside it.
+	raw   json.RawMessage
+	input []byte
 }
 
 type parser struct {
@@ -51,19 +58,32 @@ type parser struct {
 	blocks   map[int]*blockState
 	done     bool
 	attempt  *llm.Attempt
+
+	// last is how the stream ends, kept back while the blocks it ended inside
+	// go out ahead of it.
+	last *ending
+}
+
+type ending struct {
+	frame *llm.Frame
+	err   error
 }
 
 func (p *parser) next() (*llm.Frame, error) {
+	if l := p.last; l != nil {
+		p.last = nil
+		return l.frame, l.err
+	}
 	for {
 		if p.done {
 			return nil, nil
 		}
 		if !p.sc.Scan() {
 			if err := p.sc.Err(); err != nil {
-				return nil, httpcore.ReadError(p.ctx, p.provider, err)
+				return p.ahead(nil, httpcore.ReadError(p.ctx, p.provider, err))
 			}
 			p.done = true
-			return nil, nil
+			return p.ahead(nil, nil)
 		}
 		ev := p.sc.Event()
 		if len(ev.Data) == 0 {
@@ -79,18 +99,57 @@ func (p *parser) next() (*llm.Frame, error) {
 			}
 		}
 		frame, err := p.event(name, ev.Data)
-		if err != nil {
-			return nil, err
-		}
-		if frame != nil {
+		switch {
+		case err != nil:
+			return p.ahead(nil, err)
+		case frame == nil:
+		case frame.Stop != llm.StopNone || frame.TurnEnd || frame.Err != nil:
+			return p.ahead(frame, nil)
+		default:
 			return frame, nil
 		}
 	}
 }
 
+// ahead sends the blocks a stream ended inside before what ended it: the stop
+// that would have released them never came, and what arrived of them is still
+// what was generated.
+func (p *parser) ahead(f *llm.Frame, err error) (*llm.Frame, error) {
+	var held []*blockState
+	for _, st := range p.blocks {
+		if st.raw != nil {
+			held = append(held, st)
+		}
+	}
+	if len(held) == 0 {
+		return f, err
+	}
+	slices.SortFunc(held, func(a, b *blockState) int { return a.idx - b.idx })
+	out := &llm.Frame{}
+	for _, st := range held {
+		r := p.release(st, true)
+		out.Delta = append(out.Delta, r.Delta...)
+		out.Diagnostics = append(out.Diagnostics, r.Diagnostics...)
+	}
+	p.last = &ending{frame: f, err: err}
+	return out, nil
+}
+
 func (p *parser) event(name string, data []byte) (*llm.Frame, error) {
 	switch name {
-	case "ping", "content_block_stop":
+	case "ping":
+		return nil, nil
+
+	case "content_block_stop":
+		var m struct {
+			Index int `json:"index"`
+		}
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, p.malformed(name, err)
+		}
+		if st := p.blocks[m.Index]; st != nil && st.raw != nil {
+			return p.release(st, false), nil
+		}
 		return nil, nil
 
 	case "message_start":
@@ -150,14 +209,7 @@ func (p *parser) event(name string, data []byte) (*llm.Frame, error) {
 			}
 		case "thinking":
 		default:
-			return &llm.Frame{
-				Delta: []llm.Part{&llm.Raw{Vendor: anthropicmsg.Name, Type: b.Type, JSON: m.Block}},
-				Diagnostics: llm.Diagnostics{{
-					Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageResponse,
-					Severity: llm.SeverityInfo, Provider: p.provider, Field: b.Type,
-					Detail: "content block carried verbatim",
-				}},
-			}, nil
+			st.raw = m.Block
 		}
 		return nil, nil
 
@@ -181,9 +233,13 @@ func (p *parser) event(name string, data []byte) (*llm.Frame, error) {
 		case "thinking_delta":
 			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: m.Delta.Thinking}}}, nil
 		case "signature_delta":
-			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Signature: m.Delta.Signature}}}, nil
+			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Signature: m.Delta.Signature, Signer: llm.FamilyAnthropic}}}, nil
 		case "input_json_delta":
 			st := p.blocks[m.Index]
+			if st != nil && st.raw != nil {
+				st.input = append(st.input, m.Delta.Partial...)
+				return nil, nil
+			}
 			idx := 0
 			if st != nil {
 				idx = st.idx
@@ -223,14 +279,55 @@ func (p *parser) event(name string, data []byte) (*llm.Frame, error) {
 		}
 		_ = json.Unmarshal(data, &m)
 		p.done = true
-		return &llm.Frame{Err: &llm.Error{
+		e := &llm.Error{
 			Kind: kindForType(m.Error.Type), Provider: p.provider,
-			Code: m.Error.Type, Message: m.Error.Message, Sent: true,
+			Code: m.Error.Type, Message: m.Error.Message, Sent: true, Body: httpcore.ErrorBody(data),
 			Retryable: m.Error.Type == "overloaded_error" || m.Error.Type == "api_error",
-		}}, nil
+		}
+		refine(e)
+		return &llm.Frame{Err: e}, nil
 
 	default:
 		return nil, nil
+	}
+}
+
+// release delivers a held block whole, in the shape the unary path reads it:
+// its input is what streamed into it, not the empty one it started with. A
+// block the stream was cut inside goes out as far as it arrived.
+func (p *parser) release(st *blockState, cut bool) *llm.Frame {
+	block, input := st.raw, st.input
+	st.raw, st.input = nil, nil
+	diags := llm.Diagnostics{{
+		Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageResponse,
+		Severity: llm.SeverityInfo, Provider: p.provider, Field: st.kind,
+		Detail: "content block carried verbatim",
+	}}
+	var lost string
+	if len(input) > 0 {
+		var obj map[string]json.RawMessage
+		if json.Valid(input) && json.Unmarshal(block, &obj) == nil {
+			obj["input"] = input
+			if b, err := json.Marshal(obj); err == nil {
+				block = b
+			}
+		} else {
+			lost = "the block's input did not arrive whole, so it was carried as it started"
+		}
+	}
+	if cut && lost == "" {
+		lost = "the stream ended before this block did, so it was carried as far as it arrived"
+	}
+	if lost != "" {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageResponse,
+			Severity: llm.SeverityLoss, Provider: p.provider, Field: st.kind,
+			Detail: lost,
+		})
+	}
+	return &llm.Frame{
+		Delta:       []llm.Part{&llm.Raw{Vendor: anthropicmsg.Name, Type: st.kind, JSON: block}},
+		Diagnostics: diags,
 	}
 }
 
@@ -238,6 +335,22 @@ func (p *parser) malformed(event string, err error) error {
 	return &llm.Error{
 		Kind: llm.KindUpstream, Provider: p.provider, Sent: true,
 		Code: llm.WireFrameMalformed, Message: "malformed " + event + " frame: " + err.Error(), Err: err,
+	}
+}
+
+// refine reads what the status and the type do not say. An account out of
+// credit, past the spend cap set on it or disabled is refused as a malformed
+// request, and only a malformed request fails the same on every backend.
+func refine(e *llm.Error) {
+	if e.Kind != llm.KindInvalidRequest {
+		return
+	}
+	said := strings.ToLower(e.Message)
+	for _, account := range []string{"credit balance", "api usage limits", "organization has been disabled"} {
+		if strings.Contains(said, account) {
+			e.Kind = llm.KindPermission
+			return
+		}
 	}
 }
 

@@ -172,6 +172,30 @@ func drop(format, code, detail string) llm.Diagnostic {
 	}
 }
 
+// A refusal read as an answer is an answer the client will act on, and neither
+// endpoint has a field that says otherwise.
+func refusalAsText(format string) llm.Diagnostic {
+	return drop(format, llm.DropRefusal, "this format has no field for a refusal, so it travelled as ordinary text")
+}
+
+// signed counts the signatures parts carry. Neither endpoint has a field for
+// one, so each is reasoning the model will not have on the next turn.
+func signed(parts []llm.Part) int {
+	n := 0
+	for _, p := range parts {
+		if sig, _ := wirecore.Signed(p); sig != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func unsignedParts(format string, n int) llm.Diagnostic {
+	d := drop(format, llm.DropSignature, "this wire has no field for a signature, so the reasoning it stood for did not travel")
+	d.Count = n
+	return d
+}
+
 var _ = wire.Route{}
 
 func decodeThink(raw json.RawMessage) (*llm.ThinkingConfig, llm.Effort, error) {

@@ -37,7 +37,7 @@ type Stream struct {
 	hide    func(*Error) *Error
 	onEnd   []func(*Stream)
 
-	pending   *Frame
+	pending   []*Frame
 	primed    bool
 	done      bool
 	closed    bool
@@ -53,6 +53,8 @@ type Stream struct {
 	ourErr    bool
 	turnStop  bool
 	tolerate  []string
+	policy    *LossPolicy
+	to        Renders
 	exhausted bool
 
 	turn    Usage
@@ -98,70 +100,91 @@ func (s *Stream) Prime() error {
 	next := s.next
 	s.mu.Unlock()
 
-	f, err := next()
-	if err != nil {
-		s.fail(err)
-		return s.Err()
-	}
-	if f == nil {
+	// A backend opens with frames that name the answer and count it before any
+	// of it arrives, and can still fail after them. Those are held with the
+	// first frame of content, so a failure before it is one before anything was
+	// delivered, and the router can still try elsewhere. What the held frames
+	// counted is absorbed, and reported whichever way it goes.
+	var held []*Frame
+	for {
+		f, err := next()
+		if err != nil {
+			s.fail(err)
+			return s.Err()
+		}
 		s.mu.Lock()
-		s.done, s.exhausted = true, true
+		if f == nil {
+			s.done, s.exhausted = true, true
+			s.pending = held
+			s.mu.Unlock()
+			s.finish()
+			return s.Err()
+		}
+		s.absorb(f)
+		if f.Err != nil && len(f.Delta) == 0 {
+			s.done = true
+			s.mu.Unlock()
+			s.finish()
+			return s.Err()
+		}
+		held = append(held, f)
+		if len(f.Delta) > 0 || len(held) == maxHeld {
+			s.pending = held
+			s.mu.Unlock()
+			return nil
+		}
 		s.mu.Unlock()
-		s.finish()
-		return s.Err()
 	}
-	s.mu.Lock()
-	s.absorb(f)
-	s.pending = f
-	s.mu.Unlock()
-	return nil
 }
+
+// maxHeld bounds what Prime holds before content: a backend opens with a frame
+// or two, and one that never gets to the answer is not held without end.
+const maxHeld = 16
 
 func (s *Stream) Frames() iter.Seq[*Frame] {
 	return func(yield func(*Frame) bool) {
-		s.mu.Lock()
-		f, onFrame, hide := s.pending, s.onFrame, s.hide
-		s.pending = nil
-		if f != nil {
-			s.committed = true
-		}
-		s.mu.Unlock()
-
-		if f != nil {
-			f = s.shown(hide, f)
-			if onFrame != nil {
-				onFrame(f)
-			}
-			if !yield(f) {
-				_ = s.Close()
-				return
-			}
-		}
 		for {
 			s.mu.Lock()
 			next, onFrame, hide := s.next, s.onFrame, s.hide
-			stop := s.done || next == nil
+			var f *Frame
+			held := len(s.pending) > 0
+			if held {
+				f, s.pending = s.pending[0], s.pending[1:]
+			}
+			stop := !held && (s.done || next == nil)
 			s.mu.Unlock()
 			if stop {
 				return
 			}
 
-			f, err := next()
-			if err != nil {
-				s.fail(err)
-				return
+			if !held {
+				var err error
+				f, err = next()
+				if err != nil {
+					s.fail(err)
+					return
+				}
+				if f == nil {
+					s.mu.Lock()
+					s.done, s.exhausted = true, true
+					s.mu.Unlock()
+					s.finish()
+					return
+				}
 			}
-			if f == nil {
-				s.mu.Lock()
-				s.done, s.exhausted = true, true
-				s.mu.Unlock()
+			s.mu.Lock()
+			if !held {
+				s.absorb(f)
+			}
+			refused := s.refuse(f.Diagnostics, f.Delta)
+			if !refused {
+				s.committed = true
+			}
+			s.mu.Unlock()
+			if refused {
 				s.finish()
 				return
 			}
-			s.mu.Lock()
-			s.absorb(f)
-			s.committed = true
-			s.mu.Unlock()
 
 			f = s.shown(hide, f)
 			if onFrame != nil {
@@ -288,6 +311,82 @@ func (s *Stream) Tolerate(codes ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tolerate = append(s.tolerate, codes...)
+}
+
+// Enforce holds a stream to a loss policy on its way to a destination that
+// renders what to declares: what it has recorded by then, and every frame still
+// to be delivered, including any part the destination has no field for. A loss
+// the policy makes fatal ends the stream with a KindLoss failure from Err,
+// which is the refusal an unstreamed answer gets, and the frame carrying it is
+// not delivered. Frames already delivered cannot be recalled, so a stream
+// refused part way has handed over everything before the loss. Notes added
+// after it are not held to it. A zero Renders takes every part as it is.
+func (s *Stream) Enforce(p LossPolicy, to Renders) {
+	s.mu.Lock()
+	s.policy, s.to = &p, to
+	var held []Part
+	for _, f := range s.pending {
+		held = append(held, f.Delta...)
+	}
+	refused := s.refuse(s.diags, held)
+	s.mu.Unlock()
+	if refused {
+		s.finish()
+	}
+}
+
+// Check holds what an encoder lost in writing the stream out to the policy the
+// stream was enforced with: a loss the destination's Renders could not name
+// beforehand, met only in the writing. A loss the policy will not take ends the
+// stream as Enforce would and is returned, for the encoder to write as its
+// failure in place of what it lost and of everything after it. A stream that
+// was never enforced refuses nothing.
+func (s *Stream) Check(ds Diagnostics) error {
+	if len(ds) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	refused := s.refuse(ds, nil)
+	s.mu.Unlock()
+	if !refused {
+		return nil
+	}
+	s.finish()
+	return s.Err()
+}
+
+// refuse ends the stream on a loss the policy will not take, in what was noted
+// or in parts the destination cannot write out, and runs under the mutex.
+func (s *Stream) refuse(ds Diagnostics, parts []Part) bool {
+	if s.policy == nil {
+		return false
+	}
+	lost := s.to.unrendered(parts)
+	if len(lost) > 0 {
+		ds = append(append(Diagnostics{}, ds...), lost...)
+	}
+	err := s.policy.Check(ds)
+	if err == nil {
+		return false
+	}
+	// What the destination could not write out is refused before any encoder
+	// sees it, so nothing else will ever note it: said here, it still reaches
+	// the diagnostics header and the ledger row rather than only the message.
+	for _, d := range lost {
+		s.diags = append(s.diags, s.policy.Apply(d))
+	}
+	s.pending, s.done = nil, true
+	if s.err == nil {
+		// A stream is the answer to a request that went, so its refusal is of
+		// something sent, whatever the policy's own error assumes. It also
+		// names the backend and model the caller was already told in the
+		// stream's own metadata, so the refusal does not read as anonymous.
+		e := AsError(err)
+		e.Sent = true
+		e.Provider, e.Model = s.meta.Provider, s.meta.Model
+		s.err, s.ourErr = e, true
+	}
+	return true
 }
 
 // The candidate index is the upstream's to choose, and every distinct one costs
@@ -518,7 +617,8 @@ func (s *Stream) Close() error {
 func sameColumns(a, b Usage) bool {
 	return a.Prompt == b.Prompt && a.Completion == b.Completion &&
 		a.CacheRead == b.CacheRead && a.CacheWrite == b.CacheWrite &&
-		a.CacheWrite5m == b.CacheWrite5m && a.Reasoning == b.Reasoning
+		a.CacheWrite5m == b.CacheWrite5m && a.CacheWrite1h == b.CacheWrite1h &&
+		a.Reasoning == b.Reasoning
 }
 
 func StaticStream(meta StreamMeta, frames []*Frame) *Stream {

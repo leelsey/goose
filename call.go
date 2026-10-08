@@ -24,6 +24,7 @@ type callConfig struct {
 	credential llm.Credential
 	policy     *llm.LossPolicy
 	limits     *llm.Limits
+	noted      llm.Diagnostics
 	stream     bool
 }
 
@@ -65,6 +66,14 @@ func WithCallLimits(l llm.Limits) CallOption {
 	return func(c *callConfig) { c.limits = &l }
 }
 
+// WithDiagnostics hands the call what was noted of the request before it
+// reached the client, such as a proxy's decoding of its caller's wire. They
+// are held to the call's policy before any link is tried, and travel on every
+// attempt's row and on the answer.
+func WithDiagnostics(ds llm.Diagnostics) CallOption {
+	return func(c *callConfig) { c.noted = append(c.noted, ds...) }
+}
+
 func (c *Client) config(stream bool, opts []CallOption) callConfig {
 	cc := callConfig{stream: stream, header: http.Header{}}
 	for _, o := range opts {
@@ -89,7 +98,18 @@ func (c *Client) plan(req *llm.Request, cc callConfig) (route.Decision, error) {
 		Model: req.Model, Format: cc.format, Path: cc.path, Header: cc.header,
 		Stream: cc.stream, Session: cc.session, Provider: cc.provider,
 	}
-	return c.table.Route(call)
+	dec, err := c.table.Route(call)
+	if err != nil {
+		return dec, err
+	}
+	// What was noted before the call is about the request itself, so a loss
+	// there is one no link could avoid, and it is refused before any is tried.
+	if err := c.policyFor(dec, cc).Check(cc.noted); err != nil {
+		e := llm.AsError(err)
+		e.Route = dec.Rule
+		return dec, e
+	}
+	return dec, nil
 }
 
 func renderable(renders llm.Renders, req *llm.Request) error {
@@ -151,7 +171,7 @@ func fillLimits(over, under llm.Limits) llm.Limits {
 	return over
 }
 
-func (c *Client) attemptFor(dec route.Decision, target route.Target, index int, req *llm.Request, cc callConfig, rec llm.Recorder) *llm.Attempt {
+func (c *Client) attemptFor(dec route.Decision, target route.Target, index int, req *llm.Request, group []llm.Tool, cc callConfig, rec llm.Recorder) *llm.Attempt {
 	a := &llm.Attempt{
 		Request:    req.Clone(),
 		Provider:   target.Provider,
@@ -182,6 +202,15 @@ func (c *Client) attemptFor(dec route.Decision, target route.Target, index int, 
 			Detail: "the conversation handle was issued by " + cc.provider + ", so this attempt starts a new one",
 		})
 	}
+	a.Tools = mergeTools(a.Request.Tools, group, rec, target.Provider)
+	a.Request.Tools = a.Tools
+	return a
+}
+
+// groupTools is what the route's tool groups add to a call. It is read once
+// for the whole chain, so which links the call goes to first is decided on the
+// same tools every link is then offered.
+func (c *Client) groupTools(dec route.Decision) []llm.Tool {
 	var group []llm.Tool
 	for _, name := range dec.Tools {
 		group = append(group, c.tools[name]...)
@@ -189,9 +218,7 @@ func (c *Client) attemptFor(dec route.Decision, target route.Target, index int, 
 			group = append(group, src()...)
 		}
 	}
-	a.Tools = mergeTools(a.Request.Tools, group, rec, target.Provider)
-	a.Request.Tools = a.Tools
-	return a
+	return group
 }
 
 func mergeTools(own, group []llm.Tool, rec llm.Recorder, provider string) []llm.Tool {
@@ -226,12 +253,21 @@ func mergeTools(own, group []llm.Tool, rec llm.Recorder, provider string) []llm.
 	return out
 }
 
-func (c *Client) acquire(ctx context.Context, p llm.Provider) (func(), error) {
+// acquire waits for a slot at the provider's gate. The wait is part of the
+// attempt, so it is held to the attempt's deadline as well as the caller's. It
+// says whether the slot had to be waited for: a free one is handed over at
+// once, and a busy one frees only when the call holding it ends, which no
+// backend does inside a millisecond.
+func (c *Client) acquire(ctx context.Context, p llm.Provider, due time.Time) (release func(), waited bool, err error) {
 	gated, ok := p.(llm.Gated)
 	if !ok {
-		return func() {}, nil
+		return func() {}, false, nil
 	}
-	return gated.Acquire(ctx)
+	ctx, cancel := deadline(ctx, due)
+	defer cancel()
+	asked := time.Now()
+	release, err = gated.Acquire(ctx)
+	return release, time.Since(asked) >= time.Millisecond, err
 }
 
 func (c *Client) book(ctx context.Context, rec llm.Attempted, cc callConfig, rec2 llm.Recorder) {
@@ -248,13 +284,20 @@ func (c *Client) book(ctx context.Context, rec llm.Attempted, cc callConfig, rec
 	}
 }
 
+// OutcomeFor is the ledger outcome a failure is booked under. A call that
+// never reached its own send, such as passthrough forwarding one straight to
+// a backend, books what came back the same way a routed one does: a caller
+// gone or a wait that ran out is cancelled, not blamed on the backend as an
+// upstream error.
+func OutcomeFor(e *llm.Error) llm.Outcome { return outcomeFor(e) }
+
 func outcomeFor(e *llm.Error) llm.Outcome {
 	switch {
 	case e == nil:
 		return llm.OutcomeOK
 	case e.Kind == llm.KindCancelled, e.Kind == llm.KindTimeout:
 		return llm.OutcomeCancelled
-	case e.Kind == llm.KindSaturated:
+	case e.Kind == llm.KindSaturated, e.Kind == llm.KindLoss && !e.Sent:
 		return llm.OutcomeRejected
 	default:
 		return llm.OutcomeError
@@ -268,24 +311,34 @@ func elapsed(since time.Time, now time.Time) int64 {
 	return now.Sub(since).Milliseconds()
 }
 
-func deadline(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+// wall is when an attempt given d must end, or zero where it has no limit. It
+// is fixed before the attempt waits for a slot, so the wait and the send share
+// the one budget rather than each being given the whole of it.
+func wall(d time.Duration) time.Time {
 	if d <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(d)
+}
+
+func deadline(ctx context.Context, due time.Time) (context.Context, context.CancelFunc) {
+	if due.IsZero() {
 		return context.WithCancel(ctx)
 	}
-	return context.WithTimeout(ctx, d)
+	return context.WithDeadline(ctx, due)
 }
 
 // untilPrimed walls an attempt until its stream is primed, after which the body
 // takes as long as it takes. The wall cancels rather than expires, so it names
 // its own cause: a deadline we set is not the caller hanging up, and a client
 // still on the line is owed 504 rather than 499.
-func untilPrimed(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc, func()) {
+func untilPrimed(ctx context.Context, due time.Time) (context.Context, context.CancelFunc, func()) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	stop := func() { cancel(context.Canceled) }
-	if d <= 0 {
+	if due.IsZero() {
 		return ctx, stop, func() {}
 	}
-	timer := time.AfterFunc(d, func() { cancel(context.DeadlineExceeded) })
+	timer := time.AfterFunc(time.Until(due), func() { cancel(context.DeadlineExceeded) })
 	return ctx, stop, func() { timer.Stop() }
 }
 

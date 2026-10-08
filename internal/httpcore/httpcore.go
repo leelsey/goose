@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,10 @@ type Caller struct {
 	MaxRetries int
 	Backoff    time.Duration
 	OnDiscard  Attempted
+	// Refine reads a refusal's body for what its status does not say, for a
+	// vendor that answers a bad key or an account it will not serve with the
+	// status it gives a malformed request.
+	Refine func(e *llm.Error)
 }
 
 type Request struct {
@@ -129,6 +134,14 @@ func (c *Caller) once(ctx context.Context, req Request) (*http.Response, *llm.Er
 	}
 	if req.Sign != nil {
 		if err := req.Sign(ctx, r, req.Body); err != nil {
+			// A credential still being fetched when the time ran out is the wall
+			// or the caller leaving, as it is anywhere else, not a key the backend
+			// refused. Nothing has left the process either way.
+			if ctx.Err() != nil {
+				e := cancelled(why(ctx), c.Provider)
+				e.Sent = false
+				return nil, e
+			}
 			return nil, &llm.Error{Kind: llm.KindAuth, Provider: c.Provider, Message: err.Error(), Err: err}
 		}
 	}
@@ -155,6 +168,9 @@ func (c *Caller) once(ctx context.Context, req Request) (*http.Response, *llm.Er
 	}
 	e := StatusError(c.Provider, resp)
 	resp.Body.Close()
+	if c.Refine != nil {
+		c.Refine(e)
+	}
 	return nil, e
 }
 
@@ -231,6 +247,16 @@ func StatusError(provider string, resp *http.Response) *llm.Error {
 		}
 	}
 	return e
+}
+
+// ErrorBody is what an error keeps of a body that reported a failure inside a
+// 200, or of a stream's error frame: as much as is read of a refusal's body, so
+// an upstream's words are held, and redacted, the same wherever they came from.
+func ErrorBody(b []byte) string {
+	if len(b) > errBodyCap {
+		b = b[:errBodyCap]
+	}
+	return string(b)
 }
 
 const maxBackoff = 30 * time.Second
@@ -334,13 +360,61 @@ func HopByHop(header http.Header, key string) bool {
 	return false
 }
 
+// The last three choose whom a key bills rather than proving anything, and are
+// no more a caller's to choose for the operator's key than the key is.
 var credentials = []string{
-	"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Api-Key",
-	"X-Goog-User-Project", "Cookie",
+	"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Api-Key", "Cookie",
+	"X-Goog-User-Project", "OpenAI-Organization", "OpenAI-Project",
 }
 
 func ForwardPassthrough(dst, src http.Header) {
 	ForwardHeader(dst, src, append([]string{"Host", "Content-Length"}, credentials...)...)
+}
+
+// Overlay lays the headers configured for a backend over those a caller sent.
+// One a gateway in front of the backend relies on is the operator's to set,
+// and a caller naming the same header does not replace it.
+func Overlay(dst, configured http.Header) {
+	for k := range configured {
+		dst.Del(k)
+	}
+	for k, vs := range configured {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+// credentialParams are the query parameters a key can travel in. The proxy's
+// gate takes one there, and a backend handed it keeps it in its logs along
+// with the rest of the address.
+var credentialParams = []string{"key", "api-key", "api_key", "access_token"}
+
+// PassQuery is a caller's query with every credential taken out of it. A query
+// that cannot be read is refused rather than sent on, since nobody can say what
+// it carries.
+func PassQuery(provider, raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	q, err := url.ParseQuery(raw)
+	if err != nil {
+		return "", &llm.Error{Kind: llm.KindInvalidRequest, Provider: provider,
+			Message: "the query string could not be read: " + err.Error(), Err: err}
+	}
+	dropped := false
+	for name := range q {
+		for _, c := range credentialParams {
+			if strings.EqualFold(name, c) {
+				delete(q, name)
+				dropped = true
+			}
+		}
+	}
+	if !dropped {
+		return raw, nil
+	}
+	return q.Encode(), nil
 }
 
 func ForwardHeader(dst, src http.Header, drop ...string) {

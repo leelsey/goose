@@ -78,6 +78,34 @@ func (p *Provider) Bind(env llm.Env) error {
 	return p.Provider.Bind(env)
 }
 
+func (p *Provider) Complete(ctx context.Context, a *llm.Attempt) (*llm.Response, error) {
+	resp, err := p.Provider.Complete(ctx, a)
+	if err != nil {
+		refine(llm.AsError(err))
+	}
+	return resp, err
+}
+
+func (p *Provider) Stream(ctx context.Context, a *llm.Attempt) (*llm.Stream, error) {
+	s, err := p.Provider.Stream(ctx, a)
+	if err != nil {
+		refine(llm.AsError(err))
+	}
+	return s, err
+}
+
+// refine reads what the status does not say. Workers AI refuses a model it does
+// not have with the 400 a malformed request gets, and only a malformed request
+// fails the same on every backend.
+func refine(e *llm.Error) {
+	if e.Kind == llm.KindInvalidRequest && (e.Code == noSuchModel || strings.Contains(strings.ToLower(e.Message), "no such model")) {
+		e.Kind = llm.KindNotFound
+	}
+}
+
+// noSuchModel is Workers AI's own code for a model it does not have.
+const noSuchModel = "5007"
+
 func (p *Provider) catalogue() http.Header {
 	h := http.Header{}
 	for k, vs := range p.header {
@@ -116,14 +144,15 @@ func (e *envelope) err(provider string) error {
 	if e.Success {
 		return nil
 	}
-	message := "the account refused the request"
-	if len(e.Errors) > 0 && e.Errors[0].Message != "" {
-		message = e.Errors[0].Message
-	}
-	return &llm.Error{
+	refused := &llm.Error{
 		Kind: llm.KindUpstream, Provider: provider, Sent: true, Status: http.StatusOK,
-		Message: message,
+		Message: "the account refused the request",
 	}
+	if len(e.Errors) > 0 && e.Errors[0].Message != "" {
+		said, _ := json.Marshal(e.Errors)
+		refused.Message, refused.Body = e.Errors[0].Message, httpcore.ErrorBody(said)
+	}
+	return refused
 }
 
 func (p *Provider) page(ctx context.Context, n int) (*envelope, error) {

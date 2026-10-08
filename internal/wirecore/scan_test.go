@@ -273,3 +273,17 @@ func TestAnOverlongLineIsRefusedWithoutHoldingItAll(t *testing.T) {
 		t.Fatalf("read %d bytes for a %d-byte ceiling", r.n, 1<<10)
 	}
 }
+
+// A streamed image arrives as one line of several megabytes, which the event
+// ceiling allows and a line ceiling below it would not.
+func TestADefaultLineHoldsWhatAnEventMay(t *testing.T) {
+	line := strings.Repeat("A", 3<<20)
+	sc := NewScanner(strings.NewReader("data: "+line+"\n\n"), 0, 0)
+	if !sc.Scan() || len(sc.Event().Data) != len(line) {
+		t.Fatalf("err = %v: a line the event ceiling allows was refused", sc.Err())
+	}
+	l := NewLines(strings.NewReader(line+"\n"), 0)
+	if !l.Scan() || len(l.Bytes()) != len(line) {
+		t.Fatalf("err = %v", l.Err())
+	}
+}

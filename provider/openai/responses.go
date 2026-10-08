@@ -28,7 +28,7 @@ func (p *Provider) responsesBody(a *llm.Attempt, stream bool) ([]byte, llm.Diagn
 		diags = append(diags, llm.Flattened(system, p.ID(),
 			"this endpoint takes instructions as text, so what was not text did not travel")...)
 	}
-	input, d := responsesInput(msgs, p.ID())
+	input, d := responsesInput(msgs, p.ID(), p.Capabilities().Takes(openairesp.Name))
 	diags = append(diags, d...)
 	if len(input) == 0 && body["instructions"] == nil {
 		return nil, diags, llm.Errorf(llm.KindInvalidRequest, "no input survived translation")
@@ -123,6 +123,23 @@ func (p *Provider) responsesBody(a *llm.Attempt, stream bool) ([]byte, llm.Diagn
 		}
 		body["tools"] = append(bodyTools(body), openairesp.EncodeMCPTool(server))
 	}
+	// A tool the client's wire carried whole joins the ones built above:
+	// extend writes a carried field only where the body has none. Each value
+	// stays in the bytes it came in, since read as a number it could not be
+	// written back the same.
+	if raw, ok := req.Extra["tools"]; ok && p.Capabilities().Takes(req.ExtraFrom) {
+		var carried []map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &carried); err != nil {
+			return nil, diags, llm.Errorf(llm.KindInvalidRequest, "tools: %v", err)
+		}
+		for _, c := range carried {
+			tool := make(map[string]any, len(c))
+			for k, v := range c {
+				tool[k] = v
+			}
+			body["tools"] = append(bodyTools(body), tool)
+		}
+	}
 	if req.ToolChoice != nil {
 		if tc := responsesToolChoice(req.ToolChoice); tc != nil {
 			body["tool_choice"] = tc
@@ -142,6 +159,9 @@ func (p *Provider) responsesBody(a *llm.Attempt, stream bool) ([]byte, llm.Diagn
 		llm.FieldTemperature, llm.FieldTopP, llm.FieldMaxOutputTokens)...)
 	for _, x := range diags {
 		a.Note(x)
+	}
+	if err := a.Check(); err != nil {
+		return nil, diags, err
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -175,9 +195,10 @@ func bodyTools(body map[string]any) []map[string]any {
 	return nil
 }
 
-func responsesInput(msgs []llm.Message, provider string) ([]map[string]any, llm.Diagnostics) {
+func responsesInput(msgs []llm.Message, provider string, verbatim bool) ([]any, llm.Diagnostics) {
 	var diags llm.Diagnostics
-	var out []map[string]any
+	var out []any
+	unresolved := 0
 	for _, m := range msgs {
 		role := string(m.Role)
 		if m.Name != "" {
@@ -188,7 +209,7 @@ func responsesInput(msgs []llm.Message, provider string) ([]map[string]any, llm.
 			})
 		}
 		before := len(out)
-		var content []map[string]any
+		var content []any
 		for _, part := range m.Content {
 			switch v := part.(type) {
 			case *llm.Text:
@@ -223,11 +244,23 @@ func responsesInput(msgs []llm.Message, provider string) ([]map[string]any, llm.
 				out = append(out, map[string]any{"type": "function_call_output", "call_id": v.ID, "output": llm.TextOf(v.Content)})
 				diags = append(diags, llm.Flattened(v.Content, provider, toolResultText)...)
 			case *llm.Thinking:
+				// A reasoning item is found by its id or rebuilt from its
+				// encrypted content, and one with neither is refused, which
+				// is what thinking another backend produced comes to here.
+				if v.ID == "" && v.Signature == "" {
+					unresolved++
+					continue
+				}
 				if len(content) > 0 {
 					out = append(out, map[string]any{"type": "message", "role": role, "content": content})
 					content = nil
 				}
 				item := map[string]any{"type": "reasoning", "summary": []map[string]any{}}
+				// The id is what the backend issued, and a reasoning item it stored
+				// is found again by nothing else.
+				if v.ID != "" {
+					item["id"] = v.ID
+				}
 				if v.Text != "" {
 					item["summary"] = []map[string]any{{"type": "summary_text", "text": v.Text}}
 				}
@@ -236,6 +269,18 @@ func responsesInput(msgs []llm.Message, provider string) ([]map[string]any, llm.
 				}
 				out = append(out, item)
 			case *llm.Raw:
+				if verbatim && v.Vendor == openairesp.Name && json.Valid(v.JSON) {
+					if contentPart(v.Type) {
+						content = append(content, v.JSON)
+						continue
+					}
+					if len(content) > 0 {
+						out = append(out, map[string]any{"type": "message", "role": role, "content": content})
+						content = nil
+					}
+					out = append(out, v.JSON)
+					continue
+				}
 				diags = append(diags, llm.Diagnostic{
 					Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageRequest,
 					Severity: llm.SeverityLoss, Field: v.Type, Detail: "content block has no shape on this endpoint",
@@ -250,7 +295,22 @@ func responsesInput(msgs []llm.Message, provider string) ([]map[string]any, llm.
 				"this turn reached no item on this endpoint, so the conversation arrives a turn shorter"))
 		}
 	}
+	if unresolved > 0 {
+		diags = append(diags, llm.Diagnostic{
+			Code: llm.DropThinking, Class: llm.ClassContent, Stage: llm.StageRequest,
+			Severity: llm.SeverityInfo, Provider: provider, Count: unresolved,
+			Detail: "thinking with neither the id nor the encrypted content of a reasoning item cannot be replayed to this backend",
+		})
+	}
 	return out, diags
+}
+
+// contentPart tells a part that belongs inside a message from an item that
+// stands beside one. The wire carries both whole in the same turn and only the
+// name tells them apart: the parts it leaves unmodelled are input_ or output_
+// ones, and no item is.
+func contentPart(kind string) bool {
+	return strings.HasPrefix(kind, "input_") || strings.HasPrefix(kind, "output_")
 }
 
 type responsesUsage struct {
@@ -345,8 +405,8 @@ type responsesBodyOut struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
 	Error *struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
+		Code    httpcore.Code `json:"code"`
+		Message string        `json:"message"`
 	} `json:"error"`
 }
 
@@ -356,7 +416,7 @@ func itemParts(items []responsesItem, toolIndex *int) []llm.Part {
 	for _, it := range items {
 		switch it.Type {
 		case "reasoning":
-			th := &llm.Thinking{Signature: it.EncryptedContent}
+			th := &llm.Thinking{ID: it.ID, Signature: it.EncryptedContent, Signer: llm.FamilyOpenAI}
 			for _, s := range it.Summary {
 				th.Text += s.Text
 			}
@@ -438,7 +498,10 @@ func (p *Provider) completeResponses(ctx context.Context, a *llm.Attempt) (*llm.
 		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Message: "malformed response: " + err.Error(), Err: err}
 	}
 	if out.Error != nil {
-		return nil, &llm.Error{Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200, Code: out.Error.Code, Message: out.Error.Message}
+		return nil, &llm.Error{
+			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200,
+			Code: string(out.Error.Code), Message: out.Error.Message, Body: out.failure(),
+		}
 	}
 	idx := 0
 	parts := itemParts(out.Output, &idx)
@@ -477,7 +540,7 @@ func (p *Provider) streamResponses(ctx context.Context, a *llm.Attempt) (*llm.St
 	if err != nil {
 		return nil, err
 	}
-	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
+	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxFrameBytes)
 	st := &responsesParser{ctx: ctx, provider: p.ID(), sc: sc, attempt: a}
 	return llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: p.model(a), Requested: a.Request.Model, Created: p.now()},
@@ -496,6 +559,11 @@ type responsesParser struct {
 	attempt     *llm.Attempt
 	textSent    int
 	refusalSent int
+	callOpen    bool
+	argsSent    int
+	// summarised is the reasoning item whose summary has streamed, so its
+	// closing item adds nothing unless it brings a signature.
+	summarised string
 }
 
 func (r *responsesParser) tail(it responsesItem) *llm.Frame {
@@ -522,6 +590,25 @@ func (r *responsesParser) tail(it responsesItem) *llm.Frame {
 	return &llm.Frame{Delta: parts}
 }
 
+// closeCall delivers what the item closing a function call holds that its
+// deltas did not: a gateway that buffers sends the arguments there alone, and
+// one that never announced the call sends the whole of it there.
+func (r *responsesParser) closeCall(it responsesItem) *llm.Frame {
+	if !r.callOpen {
+		idx := r.toolIdx
+		r.toolIdx++
+		return &llm.Frame{Delta: []llm.Part{&llm.ToolUse{
+			ID: it.CallID, Name: it.Name, Args: json.RawMessage(it.Arguments), Index: &idx,
+		}}}
+	}
+	r.callOpen = false
+	if len(it.Arguments) <= r.argsSent {
+		return nil
+	}
+	idx := r.toolIdx - 1
+	return &llm.Frame{Delta: []llm.Part{&llm.ToolUse{Index: &idx, Args: json.RawMessage(it.Arguments[r.argsSent:])}}}
+}
+
 func (r *responsesParser) next() (*llm.Frame, error) {
 	for {
 		if r.done {
@@ -545,7 +632,7 @@ func (r *responsesParser) next() (*llm.Frame, error) {
 			ItemID       string          `json:"item_id"`
 			Item         *responsesItem  `json:"item"`
 			Response     json.RawMessage `json:"response"`
-			Code         string          `json:"code"`
+			Code         httpcore.Code   `json:"code"`
 			Message      string          `json:"message"`
 			PartialImage string          `json:"partial_image_b64"`
 			PartialIndex int             `json:"partial_image_index"`
@@ -581,7 +668,8 @@ func (r *responsesParser) next() (*llm.Frame, error) {
 			r.refusalSent += len(env.Delta)
 			return &llm.Frame{Delta: []llm.Part{&llm.Refusal{Text: env.Delta}}}, nil
 		case "response.reasoning_summary_text.delta":
-			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: env.Delta}}}, nil
+			r.summarised = env.ItemID
+			return &llm.Frame{Delta: []llm.Part{&llm.Thinking{ID: env.ItemID, Text: env.Delta}}}, nil
 		case "response.output_item.added":
 			if env.Item != nil && env.Item.Type == "message" {
 				r.textSent, r.refusalSent = 0, 0
@@ -589,6 +677,7 @@ func (r *responsesParser) next() (*llm.Frame, error) {
 			if env.Item != nil && env.Item.Type == "function_call" {
 				idx := r.toolIdx
 				r.toolIdx++
+				r.callOpen, r.argsSent = true, 0
 				return &llm.Frame{Delta: []llm.Part{&llm.ToolUse{ID: env.Item.CallID, Name: env.Item.Name, Index: &idx}}}, nil
 			}
 		case "response.image_generation_call.partial_image":
@@ -611,16 +700,22 @@ func (r *responsesParser) next() (*llm.Frame, error) {
 					return &llm.Frame{Delta: []llm.Part{img}}, nil
 				}
 			case "reasoning":
-				if env.Item.EncryptedContent != "" {
-					return &llm.Frame{Delta: []llm.Part{
-						&llm.Thinking{Signature: env.Item.EncryptedContent},
-					}}, nil
+				// An item with neither a summary nor a signature is still one the
+				// backend stored, and a client that never saw it cannot hand it
+				// back; the unstreamed answer carries it too.
+				if env.Item.EncryptedContent != "" || env.Item.ID != r.summarised {
+					return &llm.Frame{Delta: []llm.Part{&llm.Thinking{
+						ID: env.Item.ID, Signature: env.Item.EncryptedContent, Signer: llm.FamilyOpenAI,
+					}}}, nil
 				}
 			case "message":
 				if f := r.tail(*env.Item); f != nil {
 					return f, nil
 				}
 			case "function_call":
+				if f := r.closeCall(*env.Item); f != nil {
+					return f, nil
+				}
 			default:
 				if len(env.Item.raw) > 0 {
 					return &llm.Frame{Delta: []llm.Part{&llm.Raw{
@@ -633,6 +728,7 @@ func (r *responsesParser) next() (*llm.Frame, error) {
 			if idx < 0 {
 				idx = 0
 			}
+			r.argsSent += len(env.Delta)
 			return &llm.Frame{Delta: []llm.Part{&llm.ToolUse{Index: &idx, Args: json.RawMessage(env.Delta)}}}, nil
 		case "response.completed", "response.incomplete", "response.failed":
 			var out responsesBodyOut
@@ -655,15 +751,26 @@ func (r *responsesParser) next() (*llm.Frame, error) {
 				frame.Usage = &u
 			}
 			if name == "response.failed" && out.Error != nil {
-				frame.Err = &llm.Error{Kind: llm.KindUpstream, Provider: r.provider, Sent: true, Code: out.Error.Code, Message: out.Error.Message}
+				frame.Err = &llm.Error{
+					Kind: llm.KindUpstream, Provider: r.provider, Sent: true,
+					Code: string(out.Error.Code), Message: out.Error.Message, Body: out.failure(),
+				}
 			}
 			return frame, nil
 		case "error":
 			r.done = true
 			return &llm.Frame{Err: &llm.Error{
 				Kind: llm.KindUpstream, Provider: r.provider, Sent: true,
-				Code: env.Code, Message: env.Message,
+				Code: string(env.Code), Message: env.Message, Body: httpcore.ErrorBody(data),
 			}}, nil
 		}
 	}
+}
+
+// failure is what a response said of its own failure and nothing more of it:
+// the rest carries the caller's instructions and whatever was generated before
+// it failed.
+func (o *responsesBodyOut) failure() string {
+	said, _ := json.Marshal(o.Error)
+	return httpcore.ErrorBody(said)
 }

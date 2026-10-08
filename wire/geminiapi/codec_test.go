@@ -248,3 +248,130 @@ func TestRepeatedCallsOfOneNamePairWithTheirOwnResults(t *testing.T) {
 		t.Fatalf("both calls minted %q: two calls are not one", calls[0].ID)
 	}
 }
+
+func TestAThoughtSignatureOnACallOrTextTravelsBothWays(t *testing.T) {
+	body := `{"contents":[
+		{"role":"user","parts":[{"text":"weather?"}]},
+		{"role":"model","parts":[
+			{"text":"Let me look.","thoughtSignature":"SIG-text"},
+			{"functionCall":{"name":"get_weather","args":{"city":"Paris"}},"thoughtSignature":"SIG-call"},
+			{"text":"","thoughtSignature":"SIG-alone"}]}
+	]}`
+	r, _, diags, err := New(Options{}).Decode(&wire.Inbound{Path: "/v1beta/models/g:generateContent", Body: []byte(body)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %+v: a signed part is an ordinary part on this wire", diags)
+	}
+	parts := r.Messages[1].Content
+	if tx, ok := parts[0].(*llm.Text); !ok || tx.Signature != "SIG-text" {
+		t.Fatalf("text = %+v", parts[0])
+	}
+	if tu, ok := parts[1].(*llm.ToolUse); !ok || tu.Signature != "SIG-call" {
+		t.Fatalf("call = %+v: the backend refuses a replayed call that has lost its signature", parts[1])
+	}
+	if tx, ok := parts[2].(*llm.Text); !ok || tx.Text != "" || tx.Signature != "SIG-alone" {
+		t.Fatalf("signature-only part = %+v", parts[2])
+	}
+
+	out, diags := EncodeParts(parts)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %+v", diags)
+	}
+	want := []string{
+		`{"text":"Let me look.","thoughtSignature":"SIG-text"}`,
+		`{"functionCall":{"args":{"city":"Paris"},"name":"get_weather"},"thoughtSignature":"SIG-call"}`,
+		`{"text":"","thoughtSignature":"SIG-alone"}`,
+	}
+	for i, w := range want {
+		if string(out[i]) != w {
+			t.Fatalf("part %d = %s, want %s", i, out[i], w)
+		}
+	}
+
+	i0 := 0
+	s := llm.StaticStream(llm.StreamMeta{}, []*llm.Frame{
+		{Delta: []llm.Part{&llm.ToolUse{Index: &i0, Name: "get_weather", Args: json.RawMessage(`{"city":`), Signature: "SIG-call"}}},
+		{Delta: []llm.Part{&llm.ToolUse{Index: &i0, Args: json.RawMessage(`"Paris"}`)}}},
+		{Delta: []llm.Part{&llm.Text{Signature: "SIG-alone"}}, Stop: llm.StopToolUse},
+	})
+	w := &wire.BufferWriter{}
+	if _, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, w); err != nil {
+		t.Fatal(err)
+	}
+	streamed := w.Body.String()
+	for _, sig := range []string{"SIG-call", "SIG-alone"} {
+		if !strings.Contains(streamed, `"thoughtSignature":"`+sig+`"`) {
+			t.Fatalf("stream = %s: %s did not reach the client", streamed, sig)
+		}
+	}
+}
+
+// Only what the client said travels beside the neutral request: a field it
+// never sent, carried to another backend, would be reported as one it lost.
+func TestThinkingLevelAndHiddenThoughtsTravelToThisWire(t *testing.T) {
+	cases := []struct {
+		config  string
+		carried string
+		hidden  bool
+	}{
+		{`{"thinkingLevel":"low"}`, `{"thinkingConfig":{"thinkingLevel":"low"}}`, true},
+		{`{"thinkingBudget":1024}`, ``, true},
+		{`{"thinkingBudget":1024,"includeThoughts":false}`, ``, true},
+		{`{"thinkingLevel":"high","includeThoughts":true}`, `{"thinkingConfig":{"thinkingLevel":"high"}}`, false},
+		{`{"thinkingBudget":1024,"includeThoughts":true}`, ``, false},
+		{`{"thinkingBudget":0}`, ``, false},
+	}
+	for _, c := range cases {
+		body := `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":` + c.config + `}}`
+		r, _, _, err := New(Options{}).Decode(&wire.Inbound{Path: "/v1beta/models/g:generateContent", Body: []byte(body)})
+		if err != nil {
+			t.Fatalf("%s: %v", c.config, err)
+		}
+		if r.Thinking == nil {
+			t.Fatalf("%s: thinking was not read", c.config)
+		}
+		if got := string(r.Extra["generationConfig"]); got != c.carried {
+			t.Errorf("%s: carried = %s, want %s", c.config, got, c.carried)
+		}
+		if r.Thinking.Hidden != c.hidden {
+			t.Errorf("%s: hidden = %v, want %v: this wire hands thoughts back only when asked", c.config, r.Thinking.Hidden, c.hidden)
+		}
+	}
+}
+
+func TestArgumentsThatDidNotSurviveAreReported(t *testing.T) {
+	broken := &llm.ToolUse{Name: "f", Args: json.RawMessage(`{"a":`)}
+	if _, diags := EncodeParts([]llm.Part{broken}); !diags.Has(llm.DropToolCall) {
+		t.Fatalf("diagnostics = %+v: a call sent with none of its arguments is a call that changed", diags)
+	}
+	i0 := 0
+	s := llm.StaticStream(llm.StreamMeta{}, []*llm.Frame{
+		{Delta: []llm.Part{&llm.ToolUse{Index: &i0, Name: "f", Args: json.RawMessage(`{"a":`)}}, Stop: llm.StopToolUse},
+	})
+	diags, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, &wire.BufferWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diags.Has(llm.DropToolCall) {
+		t.Fatalf("diagnostics = %+v: the stream loses the arguments as surely as the answer does", diags)
+	}
+}
+
+func TestARefusalFlattenedToTextIsReportedOnce(t *testing.T) {
+	if _, diags := EncodeParts([]llm.Part{&llm.Refusal{Text: "I can't help with that."}}); !diags.Has(llm.DropRefusal) {
+		t.Fatalf("diagnostics = %+v: a refusal read as an answer is an answer the client will act on", diags)
+	}
+	s := llm.StaticStream(llm.StreamMeta{}, []*llm.Frame{
+		{Delta: []llm.Part{&llm.Refusal{Text: "I can't "}}},
+		{Delta: []llm.Part{&llm.Refusal{Text: "help with that."}}, Stop: llm.StopEnd},
+	})
+	diags, err := New(Options{}).EncodeStream(context.Background(), s, wire.Options{Stream: true}, &wire.BufferWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(diags.Find(llm.DropRefusal)); n != 1 {
+		t.Fatalf("drop.refusal noted %d times: one refusal in two deltas is one refusal", n)
+	}
+}

@@ -327,12 +327,12 @@ func TestReadinessAnswers(t *testing.T) {
 			configured(name)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
-			health, ok := c.Ready(ctx)
+			health, ok := c.Ready(ctx, false)
 			if !ok {
 				t.Fatalf("not ready: %+v", health)
 			}
 			exercised(name, "ready")
-			models, diags := c.Models(ctx)
+			models, diags := c.Models(ctx, false)
 			if len(models) == 0 {
 				t.Logf("%s lists no models: %v", name, diags.Codes())
 				return

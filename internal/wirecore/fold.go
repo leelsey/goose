@@ -4,6 +4,7 @@
 package wirecore
 
 import (
+	"cmp"
 	"encoding/json"
 	"sort"
 
@@ -98,12 +99,17 @@ func NewFolder(opts FoldOptions) *Folder {
 	return &Folder{max: opts.MaxBufferBytes, recorder: opts.Recorder, choices: map[int]*choice{}}
 }
 
+// note keeps what the folder found itself in one place: the recorder it was
+// handed, which holds everything else noted of the attempt, or failing one the
+// answer. A caller reads the two together, so a note kept in both was read
+// twice.
 func (f *Folder) note(d llm.Diagnostic) {
-	f.diags = append(f.diags, d)
-	f.own = append(f.own, d)
 	if f.recorder != nil {
 		f.recorder.Note(d)
+		return
 	}
+	f.diags = append(f.diags, d)
+	f.own = append(f.own, d)
 }
 
 func (f *Folder) Add(fr *llm.Frame) {
@@ -250,10 +256,11 @@ func (f *Folder) mergeThinking(c *choice, v *llm.Thinking) {
 		if !f.grow(c, len(v.Text), "thinking") {
 			return
 		}
-		if last, ok := lastOf[*llm.Thinking](c.parts); ok && last.Signature == "" && len(last.Redacted) == 0 {
+		if last, ok := lastOf[*llm.Thinking](c.parts); ok && last.Signature == "" && len(last.Redacted) == 0 && sameItem(last, v) {
+			last.ID = cmp.Or(last.ID, v.ID)
 			c.appendTo(last, v.Text)
 		} else {
-			c.parts = append(c.parts, &llm.Thinking{Text: v.Text})
+			c.parts = append(c.parts, &llm.Thinking{ID: v.ID, Text: v.Text})
 		}
 	}
 	if v.Signature == "" {
@@ -261,11 +268,22 @@ func (f *Folder) mergeThinking(c *choice, v *llm.Thinking) {
 	}
 	for i := len(c.parts) - 1; i >= 0; i-- {
 		if t, ok := c.parts[i].(*llm.Thinking); ok && t.Signature == "" && len(t.Redacted) == 0 {
-			t.Signature = v.Signature
+			if !sameItem(t, v) {
+				break
+			}
+			t.ID = cmp.Or(t.ID, v.ID)
+			t.Signature, t.Signer = v.Signature, v.Signer
 			return
 		}
 	}
-	c.parts = append(c.parts, &llm.Thinking{Signature: v.Signature})
+	c.parts = append(c.parts, &llm.Thinking{ID: v.ID, Signature: v.Signature, Signer: v.Signer})
+}
+
+// sameItem says whether a delta continues a thinking part. A backend that names
+// its reasoning items names each delta's, and one that does not leaves it to
+// the order they arrive in.
+func sameItem(t, v *llm.Thinking) bool {
+	return t.ID == "" || v.ID == "" || t.ID == v.ID
 }
 
 func (f *Folder) mergeTool(c *choice, v *llm.ToolUse) {

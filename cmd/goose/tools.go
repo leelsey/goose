@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"time"
 
@@ -39,9 +38,10 @@ func connectTools(ctx context.Context, cfg *Config) (*mcp.Manager, error) {
 			Headers:   entry.Headers,
 			Timeout:   toolTimeout(entry.Timeout),
 		}
+		// Add names the server in its error already.
 		if err := m.Add(ctx, server, nil); err != nil {
 			_ = m.Close()
-			return nil, fmt.Errorf("mcp %s: %w", entry.Name, err)
+			return nil, err
 		}
 	}
 	return m, nil

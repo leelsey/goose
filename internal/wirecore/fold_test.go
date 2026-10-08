@@ -83,6 +83,34 @@ func TestFoldKeepsPerBlockSignatures(t *testing.T) {
 	}
 }
 
+// Who minted a signature decides which backend it may be replayed to, so the
+// folded answer says so as the deltas did, and a reasoning item keeps the name
+// its backend gave it and stays apart from the next one.
+func TestFoldKeepsWhoSignedAThought(t *testing.T) {
+	r := fold(t,
+		&llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: "plan"}}},
+		&llm.Frame{Delta: []llm.Part{&llm.Thinking{Signature: "EqQB", Signer: llm.FamilyAnthropic}}},
+		&llm.Frame{Delta: []llm.Part{&llm.Thinking{ID: "rs_a", Text: "why"}}},
+		&llm.Frame{Delta: []llm.Part{&llm.Thinking{ID: "rs_b", Text: "how"}}},
+		&llm.Frame{Delta: []llm.Part{&llm.Thinking{ID: "rs_b", Signature: "enc", Signer: llm.FamilyOpenAI}}},
+		&llm.Frame{Stop: llm.StopEnd},
+	)
+	got := parts(r)
+	if len(got) != 3 {
+		t.Fatalf("parts = %+v", got)
+	}
+	for i, want := range []llm.Thinking{
+		{Text: "plan", Signature: "EqQB", Signer: llm.FamilyAnthropic},
+		{ID: "rs_a", Text: "why"},
+		{ID: "rs_b", Text: "how", Signature: "enc", Signer: llm.FamilyOpenAI},
+	} {
+		th, ok := got[i].(*llm.Thinking)
+		if !ok || th.ID != want.ID || th.Text != want.Text || th.Signature != want.Signature || th.Signer != want.Signer {
+			t.Fatalf("part %d = %+v, want %+v", i, got[i], want)
+		}
+	}
+}
+
 func TestFoldAttachesLateSignatureToClosedBlock(t *testing.T) {
 	r := fold(t,
 		&llm.Frame{Delta: []llm.Part{&llm.Thinking{Text: "reasoned"}}},
@@ -394,5 +422,31 @@ func TestAFolderOnItsOwnKeepsWhatItsFramesSaid(t *testing.T) {
 	resp := f.Response(llm.StreamMeta{Provider: "stub"}, llm.Usage{})
 	if !hasCode(resp.Diagnostics, llm.WireFrameMalformed) {
 		t.Error("a frame's note was lost by a folder used on its own")
+	}
+}
+
+// What the folder found itself goes to the recorder it was handed, where the
+// attempt's other notes are, or failing one onto the answer. A caller reads
+// both, so a note kept in each was read twice.
+func TestWhatTheFolderFindsItselfIsKeptInOnePlace(t *testing.T) {
+	frames := func() *llm.Stream {
+		return llm.StaticStream(llm.StreamMeta{Provider: "stub"}, []*llm.Frame{
+			{Choice: idx(0), Delta: []llm.Part{&llm.Text{Text: strings.Repeat("x", 64)}}},
+			{Choice: idx(0), Stop: llm.StopEnd},
+		})
+	}
+	var noted llm.Diagnostics
+	resp, err := Fold(frames(), FoldOptions{MaxBufferBytes: 8, Recorder: &noted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, m := len(noted.Find(llm.WireBufferFull)), len(resp.Diagnostics.Find(llm.WireBufferFull)); n+m != 1 || n != 1 {
+		t.Fatalf("recorded %d times and on the answer %d: said other than once, or not where the attempt's notes are", n, m)
+	}
+	if resp, err = Fold(frames(), FoldOptions{MaxBufferBytes: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(resp.Diagnostics.Find(llm.WireBufferFull)); n != 1 {
+		t.Fatalf("on the answer %d times with nowhere else to say it", n)
 	}
 }

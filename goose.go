@@ -195,6 +195,15 @@ func New(opts ...Option) (*Client, error) {
 				return nil, llm.Errorf(llm.KindInvalidRequest, "route %d names unregistered provider %q", i, t.Provider)
 			}
 		}
+		// A group nobody registered contributes nothing at call time and says
+		// nothing about it, so every call on the route would reach its backend
+		// short of the tools it was configured with.
+		if name, ok := c.unknownGroup(r.Tools); ok {
+			return nil, llm.Errorf(llm.KindInvalidRequest, "route %d names unregistered tool group %q", i, name)
+		}
+	}
+	if name, ok := c.unknownGroup(c.table.Defaults.Tools); ok {
+		return nil, llm.Errorf(llm.KindInvalidRequest, "the default tools name unregistered tool group %q", name)
 	}
 	if c.breakerPolicy != nil {
 		c.breaker = newBreakers(*c.breakerPolicy, c.env.Now)
@@ -207,6 +216,17 @@ func New(opts ...Option) (*Client, error) {
 		}
 	}
 	return c, nil
+}
+
+func (c *Client) unknownGroup(groups []string) (string, bool) {
+	for _, name := range groups {
+		_, listed := c.tools[name]
+		_, sourced := c.sources[name]
+		if !listed && !sourced {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 func (c *Client) Provider(id string) (llm.Provider, bool) {
@@ -230,14 +250,31 @@ func panicked(provider string, p any) error {
 	return llm.Errorf(llm.KindInternal, "%s panicked: %v", provider, p)
 }
 
-func listFailure(err error) string {
-	if e := llm.AsError(err); e != nil {
+// upstreamFailure is what a failed model listing or readiness probe may be
+// blamed on. It reached a backend rather than being refused before goose sent
+// anything, so its words are usually the vendor's — its body, or, dialling one
+// that never answered, its own address — and redact withholds them here the
+// same way the listener does wherever else a call reaches an upstream.
+func upstreamFailure(err error, redact bool) string {
+	e := llm.AsError(err)
+	if !redact || refusal(e) {
 		return e.Message
 	}
-	return err.Error()
+	return string(e.Kind)
 }
 
-func (c *Client) Models(ctx context.Context) ([]llm.Model, llm.Diagnostics) {
+// refusal says a failure is goose's own rather than an upstream's: a known
+// code goose itself raises, no vendor body, and either refused before being
+// sent or a loss the policy would not take. It is the rule httpx's listener
+// uses to tell the two apart.
+func refusal(e *llm.Error) bool {
+	if e.Body != "" || !llm.KnownCode(e.Code) {
+		return false
+	}
+	return !e.Sent || e.Kind == llm.KindLoss
+}
+
+func (c *Client) Models(ctx context.Context, redact bool) ([]llm.Model, llm.Diagnostics) {
 	// Every backend is asked at once, but they are read back in the configured
 	// order, so which one a shared model id belongs to does not depend on
 	// whichever answered first.
@@ -281,7 +318,7 @@ func (c *Client) Models(ctx context.Context) ([]llm.Model, llm.Diagnostics) {
 			diags = append(diags, llm.Diagnostic{
 				Code: llm.CapNoModelList, Class: llm.ClassCapability, Stage: llm.StageResponse,
 				Severity: llm.SeverityLoss, Provider: id,
-				Detail: "the model list could not be read: " + listFailure(got[i].err),
+				Detail: "the model list could not be read: " + upstreamFailure(got[i].err, redact),
 			})
 			continue
 		}
@@ -303,7 +340,7 @@ type Health struct {
 	Err      string `json:"error,omitempty"`
 }
 
-func (c *Client) Ready(ctx context.Context) ([]Health, bool) {
+func (c *Client) Ready(ctx context.Context, redact bool) ([]Health, bool) {
 	// One slow backend must not add its wait to every backend after it.
 	out := make([]Health, len(c.order))
 	var wg sync.WaitGroup
@@ -319,11 +356,11 @@ func (c *Client) Ready(ctx context.Context) ([]Health, bool) {
 			defer wg.Done()
 			defer func() {
 				if p := recover(); p != nil {
-					out[i].Ready, out[i].Err = false, panicked(id, p).Error()
+					out[i].Ready, out[i].Err = false, upstreamFailure(panicked(id, p), redact)
 				}
 			}()
 			if err := prober.Probe(ctx); err != nil {
-				out[i].Ready, out[i].Err = false, llm.AsError(err).Message
+				out[i].Ready, out[i].Err = false, upstreamFailure(err, redact)
 			}
 		}()
 	}

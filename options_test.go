@@ -93,6 +93,29 @@ func TestWithToolSourceRefusesNil(t *testing.T) {
 	}
 }
 
+// A group nobody registered contributes nothing at call time and says nothing
+// about it, so a route naming one is refused when the client is built.
+func TestAnUnregisteredToolGroupIsRefused(t *testing.T) {
+	p := &capped{id: "one", caps: full()}
+	source := WithToolSource("search", func() []llm.Tool { return nil })
+	named := func(group string) Option {
+		return WithRoutes(route.Rule{
+			Name: "r", Match: route.Always(), Tools: []string{group},
+			Chain: []route.Target{{Provider: "one"}},
+		})
+	}
+	if _, err := New(WithProvider(p), source, named("Search")); err == nil {
+		t.Fatal("a route naming a group that was never registered was accepted")
+	}
+	if _, err := New(WithProvider(p), source, WithDefaultTools("Search")); err == nil {
+		t.Fatal("default tools naming a group that was never registered were accepted")
+	}
+	if _, err := New(WithProvider(p), source, named("search"),
+		WithTools("fixed", nil), WithDefaultTools("fixed")); err != nil {
+		t.Fatalf("registered groups were refused: %v", err)
+	}
+}
+
 func TestWithHTTPClientReachesTheProviders(t *testing.T) {
 	mine := &http.Client{Timeout: 17 * time.Second}
 	p := &binding{capped: capped{id: "one", caps: full()}}

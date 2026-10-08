@@ -17,6 +17,9 @@ import (
 
 const defaultBaseURL = "https://api.openai.com/v1"
 
+// Dialect is what a backend understands beyond the shape every OpenAI-speaking
+// backend shares. Left zero in Options it is the OpenAI dialect for OpenAI's
+// own endpoint, named or not, and the compatible one for any other.
 type Dialect struct {
 	StreamUsage     bool
 	Extensions      bool
@@ -73,10 +76,44 @@ func New(o Options) (*Provider, error) {
 	if o.BaseURL == "" {
 		o.BaseURL = defaultBaseURL
 		o.Dialect = OpenAIDialect()
+	} else if o.Dialect == (Dialect{}) && official(o.BaseURL) {
+		o.Dialect = OpenAIDialect()
 	}
 	p := &Provider{opts: o}
-	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout)}
+	p.call = &httpcore.Caller{Provider: o.ID, MaxRetries: o.MaxRetries, HTTP: httpcore.NewClient(o.Timeout), Refine: refine}
 	return p, nil
+}
+
+// refine reads what the status does not say. OpenAI refuses to verify an
+// organisation for one model or feature at a time — streaming o3, say, or
+// gpt-image-1 — and serves every other model on the same key, so the refusal
+// is the model's, not the account's: it must not open the shared breaker for
+// every model behind this key, and another model, or the same one once
+// verified, may still be worth trying.
+func refine(e *llm.Error) {
+	if e.Kind == llm.KindInvalidRequest && strings.Contains(strings.ToLower(e.Message), "organization must be verified") {
+		e.Kind = llm.KindUnsupported
+	}
+}
+
+// official says whether a base is OpenAI's own endpoint, a regional one
+// included, which speaks the OpenAI dialect however it came to be named.
+func official(base string) bool {
+	u, err := neturl.Parse(base)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	if host := strings.ToLower(u.Hostname()); host != "api.openai.com" && !strings.HasSuffix(host, ".api.openai.com") {
+		return false
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return false
+	}
+	switch strings.TrimSuffix(u.Path, "/") {
+	case "", "/v1":
+		return true
+	}
+	return false
 }
 
 func (p *Provider) ID() string { return p.opts.ID }
@@ -92,6 +129,7 @@ func (p *Provider) Bind(env llm.Env) error {
 func (p *Provider) Capabilities() llm.Capabilities {
 	return llm.Capabilities{
 		KeyScheme: p.opts.KeyScheme,
+		ClientKey: p.opts.AllowClientKey && p.opts.APIKey == "" && p.opts.Sign == nil,
 		Streaming: true,
 		Usage: llm.UsageShape{
 			StreamUsage:      p.opts.Dialect.StreamUsage,
@@ -105,6 +143,7 @@ func (p *Provider) Capabilities() llm.Capabilities {
 		ImageIn:            true,
 		Thinking:           p.opts.Dialect.Responses,
 		ThinkingSignatures: p.opts.Dialect.Responses,
+		Signer:             llm.FamilyOpenAI,
 		Effort:             true,
 		ResponseFormat:     true,
 		Sessions:           p.opts.Dialect.Responses,
@@ -186,18 +225,23 @@ func (p *Provider) header(a *llm.Attempt) http.Header {
 		}
 	}
 	p.authorise(h, p.key(a))
-	if p.opts.Organisation != "" {
-		h.Set("OpenAI-Organization", p.opts.Organisation)
-	}
-	if p.opts.Project != "" {
-		h.Set("OpenAI-Project", p.opts.Project)
-	}
+	p.bill(h)
 	if a != nil && p.opts.AllowClientKey {
 		for k, v := range a.Credential.Headers {
 			h.Set(k, v)
 		}
 	}
 	return h
+}
+
+// bill names the organisation and project the operator configured.
+func (p *Provider) bill(h http.Header) {
+	if p.opts.Organisation != "" {
+		h.Set("OpenAI-Organization", p.opts.Organisation)
+	}
+	if p.opts.Project != "" {
+		h.Set("OpenAI-Project", p.opts.Project)
+	}
 }
 
 // authorise names the credential the way this backend expects it. A signed
@@ -276,8 +320,12 @@ func (p *Provider) passKey(r *llm.PassRequest) string {
 }
 
 func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassResponse, error) {
-	u := httpcore.JoinURL(p.opts.BaseURL, r.Path)
-	q, err := mergeQuery(p.opts.Query, r.Query)
+	u := passURL(p.opts.BaseURL, r.Path)
+	q, err := httpcore.PassQuery(p.ID(), r.Query)
+	if err != nil {
+		return nil, err
+	}
+	q, err = mergeQuery(p.opts.Query, q)
 	if err != nil {
 		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(),
 			Message: "the query string could not be read: " + err.Error(), Err: err}
@@ -290,7 +338,22 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 		return nil, &llm.Error{Kind: llm.KindInvalidRequest, Provider: p.ID(), Message: rerr.Error()}
 	}
 	httpcore.ForwardPassthrough(req.Header, r.Header)
-	p.authorise(req.Header, p.passKey(r))
+	httpcore.Overlay(req.Header, p.opts.Header)
+	key := p.passKey(r)
+	p.authorise(req.Header, key)
+	p.bill(req.Header)
+	if key != "" && key == r.Key && p.opts.APIKey == "" && p.opts.Sign == nil {
+		// The caller's own key bills the caller, whose organisation and
+		// project these are to name.
+		for _, name := range []string{"OpenAI-Organization", "OpenAI-Project"} {
+			if vs := r.Header.Values(name); len(vs) > 0 {
+				req.Header.Del(name)
+				for _, v := range vs {
+					req.Header.Add(name, v)
+				}
+			}
+		}
+	}
 	if p.opts.Sign != nil {
 		// The body is a stream here, so a signer that covers it cannot be used
 		// for passthrough; the token minters this reaches do not read it.
@@ -307,6 +370,29 @@ func (p *Provider) Pass(ctx context.Context, r *llm.PassRequest) (*llm.PassRespo
 		return nil, httpcore.ReadError(ctx, p.ID(), err)
 	}
 	return &llm.PassResponse{Status: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
+}
+
+// passURL addresses a passthrough call. An OpenAI-shaped base already ends in
+// its version, and a client puts that version in front of every path it asks
+// for, so what the base already says is not said twice.
+func passURL(base, path string) string {
+	u, err := neturl.Parse(base)
+	if err != nil {
+		return httpcore.JoinURL(base, path)
+	}
+	want := strings.TrimLeft(path, "/")
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := range segs {
+		tail := strings.Join(segs[i:], "/")
+		if tail == "" {
+			break
+		}
+		if want == tail || strings.HasPrefix(want, tail+"/") {
+			want = strings.TrimPrefix(want, tail)
+			break
+		}
+	}
+	return httpcore.JoinURL(base, want)
 }
 
 // mergeQuery keeps every parameter the caller sent and adds the configured ones

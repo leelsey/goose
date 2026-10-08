@@ -30,7 +30,7 @@ func awkwardResponse() *llm.Response {
 }
 
 func awkwardStream() *llm.Stream {
-	return wirecore.Synthesise(awkwardResponse())
+	return wirecore.Synthesise(awkwardResponse(), llm.Renders{})
 }
 
 func TestFourPermutationsKeepEverything(t *testing.T) {
@@ -59,7 +59,7 @@ func TestFourPermutationsKeepEverything(t *testing.T) {
 
 	t.Run("streaming client, unary upstream", func(t *testing.T) {
 		w := &wire.BufferWriter{}
-		if _, err := c.EncodeStream(ctx, wirecore.Synthesise(awkwardResponse()), wire.Options{Stream: true, StreamUsage: true}, w); err != nil {
+		if _, err := c.EncodeStream(ctx, wirecore.Synthesise(awkwardResponse(), llm.Renders{}), wire.Options{Stream: true, StreamUsage: true}, w); err != nil {
 			t.Fatal(err)
 		}
 		assertStream(t, w.Body.String())

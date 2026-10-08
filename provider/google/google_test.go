@@ -14,6 +14,8 @@ import (
 
 	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
+	"github.com/leelsey/goose/wire"
+	"github.com/leelsey/goose/wire/geminiapi"
 )
 
 func serve(t *testing.T, h http.HandlerFunc) (*Provider, *[]string, *[]string) {
@@ -201,6 +203,53 @@ func TestADynamicThinkingBudgetTravels(t *testing.T) {
 		if got := (*bodies)[0]; !strings.Contains(got, tc.want) {
 			t.Errorf("body is missing %s:\n%s", tc.want, got)
 		}
+	}
+}
+
+func TestWhatACallerOnThisWireSaidAboutThinkingIsSentAsSaid(t *testing.T) {
+	for _, c := range []struct{ said, sent string }{
+		{`{"thinkingLevel":"low"}`, `{"thinkingLevel":"low"}`},
+		{`{"thinkingBudget":1024}`, `{"thinkingBudget":1024}`},
+		{`{"thinkingBudget":1024,"includeThoughts":true}`, `{"includeThoughts":true,"thinkingBudget":1024}`},
+	} {
+		req, _, _, err := geminiapi.New(geminiapi.Options{}).Decode(&wire.Inbound{
+			Path: "/v1beta/models/g:generateContent",
+			Body: []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":` + c.said + `}}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, bodies, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(answered))
+		})
+		if _, err := p.Complete(context.Background(), attempt(req)); err != nil {
+			t.Fatal(err)
+		}
+		var sent struct {
+			GenerationConfig struct {
+				ThinkingConfig json.RawMessage `json:"thinkingConfig"`
+			} `json:"generationConfig"`
+		}
+		if err := json.Unmarshal([]byte((*bodies)[0]), &sent); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(sent.GenerationConfig.ThinkingConfig); got != c.sent {
+			t.Errorf("said %s, sent %s, want %s", c.said, got, c.sent)
+		}
+	}
+}
+
+func TestThinkingAskedForOnAnotherWireComesBack(t *testing.T) {
+	p, bodies, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(answered))
+	})
+	req := hello()
+	req.Thinking = &llm.ThinkingConfig{Enabled: true, Budget: 2048}
+	if _, err := p.Complete(context.Background(), attempt(req)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains((*bodies)[0], `"includeThoughts":true`) {
+		t.Fatalf("body = %s: thinking asked for elsewhere is thinking shown", (*bodies)[0])
 	}
 }
 

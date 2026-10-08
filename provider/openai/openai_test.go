@@ -67,6 +67,38 @@ func TestCeilingSpellingFollowsTheModelFamily(t *testing.T) {
 	}
 }
 
+// OpenAI's own endpoint, a regional one included, speaks the OpenAI dialect
+// whether the embedder named it or left it to the default; only a dialect it
+// chose itself stands.
+func TestTheOfficialEndpointSpeaksTheOpenAIDialect(t *testing.T) {
+	dialect := func(base string, d Dialect) llm.Capabilities {
+		p, err := New(Options{APIKey: "k", BaseURL: base, Dialect: d})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.Capabilities()
+	}
+	for _, base := range []string{
+		"https://api.openai.com", "https://api.openai.com/", "https://api.openai.com/v1",
+		"https://api.openai.com/v1/", "HTTPS://API.OpenAI.com:443/v1", "https://eu.api.openai.com/v1",
+	} {
+		if caps := dialect(base, Dialect{}); caps.Ceiling != llm.CeilingPerModel || !caps.Usage.StreamUsage || !caps.Sessions {
+			t.Errorf("%s: ceiling %q, stream usage %v: gpt-5 refuses max_tokens", base, caps.Ceiling, caps.Usage.StreamUsage)
+		}
+	}
+	for _, base := range []string{
+		"https://gateway.test/v1", "http://api.openai.com/v1", "https://api.openai.com.gateway.test/v1",
+		"https://api.openai.com/proxy/v1", "https://api.openai.com:8443/v1", "https://eu-api.openai.com.gateway.test/v1",
+	} {
+		if caps := dialect(base, Dialect{}); caps.Ceiling != llm.CeilingMaxTokens {
+			t.Errorf("%s: ceiling %q, want the compatible dialect", base, caps.Ceiling)
+		}
+	}
+	if caps := dialect("https://api.openai.com/v1", Dialect{StreamUsage: true}); caps.Sessions {
+		t.Error("a dialect the embedder chose was replaced")
+	}
+}
+
 func TestStreamAsksForUsageOnlyWhereItExists(t *testing.T) {
 	for _, tc := range []struct {
 		dialect Dialect
@@ -548,5 +580,49 @@ func TestFieldsBesideTheAnswerAreSaidOnceAStream(t *testing.T) {
 	}
 	if said != 1 {
 		t.Errorf("the backend's decoration was reported %d times for one stream", said)
+	}
+}
+
+// The Anthropic and Gemini wires carry a tool result inside a user turn, and
+// this endpoint takes one as a tool message of its own. A turn that held
+// nothing else must not follow it empty, read as the user saying nothing, and
+// one that held more still follows with the rest. Regression test for
+// r4-seam-4.
+func TestAToolResultInAUserTurnLeavesNoEmptyTurnBehind(t *testing.T) {
+	p, bodies, _ := serve(t, Options{Dialect: OpenAIDialect()}, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"c","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	})
+	result := &llm.ToolResult{ID: "c1", Content: []llm.Part{&llm.Text{Text: "20C"}}}
+	for name, c := range map[string]struct {
+		last  []llm.Part
+		roles []string
+	}{
+		"alone":                        {[]llm.Part{result}, []string{"user", "assistant", "tool"}},
+		"beside the user's next words": {[]llm.Part{result, &llm.Text{Text: "and tomorrow?"}}, []string{"user", "assistant", "tool", "user"}},
+	} {
+		req := &llm.Request{Messages: []llm.Message{
+			{Role: llm.RoleUser, Content: []llm.Part{&llm.Text{Text: "weather?"}}},
+			{Role: llm.RoleAssistant, Content: []llm.Part{&llm.ToolUse{ID: "c1", Name: "get_weather", Args: json.RawMessage(`{}`)}}},
+			{Role: llm.RoleUser, Content: c.last},
+		}}
+		if _, err := p.Complete(context.Background(), attempt("m", req)); err != nil {
+			t.Fatal(err)
+		}
+		body := (*bodies)[len(*bodies)-1]
+		var sent struct {
+			Messages []struct {
+				Role string `json:"role"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(body), &sent); err != nil {
+			t.Fatal(err)
+		}
+		var roles []string
+		for _, m := range sent.Messages {
+			roles = append(roles, m.Role)
+		}
+		if strings.Join(roles, ",") != strings.Join(c.roles, ",") {
+			t.Errorf("%s: body = %s: roles %v, want %v", name, body, roles, c.roles)
+		}
 	}
 }

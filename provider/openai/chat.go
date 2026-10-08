@@ -38,7 +38,7 @@ func (p *Provider) chatBody(a *llm.Attempt, stream bool) ([]byte, llm.Diagnostic
 	body := map[string]any{"model": model}
 
 	sentParallel := false
-	msgs, d := chatMessages(req, p.ID())
+	msgs, d := chatMessages(req, p.ID(), p.Capabilities().Takes(openaichat.Name))
 	diags = append(diags, d...)
 	if len(msgs) == 0 {
 		return nil, diags, llm.Errorf(llm.KindInvalidRequest, "no messages survived translation")
@@ -159,6 +159,9 @@ func (p *Provider) chatBody(a *llm.Attempt, stream bool) ([]byte, llm.Diagnostic
 	for _, x := range diags {
 		a.Note(x)
 	}
+	if err := a.Check(); err != nil {
+		return nil, diags, err
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, diags, llm.Errorf(llm.KindInternal, "encode request: %v", err)
@@ -227,7 +230,7 @@ func (p *Provider) extend(body map[string]any, req *llm.Request) llm.Diagnostics
 
 const toolResultText = "this endpoint takes a tool result as text, so what was not text did not travel"
 
-func chatMessages(req *llm.Request, provider string) ([]map[string]any, llm.Diagnostics) {
+func chatMessages(req *llm.Request, provider string, verbatim bool) ([]map[string]any, llm.Diagnostics) {
 	var diags llm.Diagnostics
 	var out []map[string]any
 	system, msgs := req.SystemAndMessages()
@@ -256,9 +259,10 @@ func chatMessages(req *llm.Request, provider string) ([]map[string]any, llm.Diag
 		if m.Name != "" {
 			msg["name"] = m.Name
 		}
-		var content []map[string]any
+		var content []any
 		var text strings.Builder
 		var toolCalls []map[string]any
+		listed, results := false, false
 		for _, p := range m.Content {
 			switch v := p.(type) {
 			case *llm.Text:
@@ -276,6 +280,7 @@ func chatMessages(req *llm.Request, provider string) ([]map[string]any, llm.Diag
 					img["detail"] = v.Detail
 				}
 				content = append(content, map[string]any{"type": "image_url", "image_url": img})
+				listed = true
 			case *llm.ToolUse:
 				args := string(v.Args)
 				if args == "" {
@@ -291,28 +296,34 @@ func chatMessages(req *llm.Request, provider string) ([]map[string]any, llm.Diag
 					Severity: llm.SeverityInfo, Detail: "this endpoint has no field to replay thinking",
 				})
 			case *llm.ToolResult:
+				results = true
 				out = append(out, map[string]any{"role": "tool", "tool_call_id": v.ID, "content": llm.TextOf(v.Content)})
 				diags = append(diags, llm.Flattened(v.Content, provider, toolResultText)...)
 			case *llm.Raw:
+				if verbatim && v.Vendor == openaichat.Name && json.Valid(v.JSON) {
+					content = append(content, v.JSON)
+					listed = true
+					continue
+				}
 				diags = append(diags, llm.Diagnostic{
 					Code: llm.DropUnknownBlock, Class: llm.ClassContent, Stage: llm.StageRequest,
 					Severity: llm.SeverityLoss, Field: v.Type, Detail: "content block has no shape on this endpoint",
 				})
 			}
 		}
-		hasImage := false
-		for _, c := range content {
-			if c["type"] == "image_url" {
-				hasImage = true
-			}
-		}
 		switch {
-		case hasImage:
+		case listed:
 			msg["content"] = content
 		case text.Len() > 0:
 			msg["content"] = text.String()
 		case len(toolCalls) > 0 || msg["refusal"] != nil:
 			msg["content"] = nil
+		case results:
+			// The wires that carry tool results inside a user turn leave that
+			// turn empty once they are sent as tool messages, and an empty
+			// turn after them is one the model reads as the user saying
+			// nothing.
+			continue
 		default:
 			msg["content"] = ""
 		}
@@ -450,9 +461,9 @@ type chatResponse struct {
 	Usage       *chatUsage   `json:"usage"`
 	ServiceTier string       `json:"service_tier"`
 	Error       *struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    string `json:"code"`
+		Message string        `json:"message"`
+		Type    httpcore.Code `json:"type"`
+		Code    httpcore.Code `json:"code"`
 	} `json:"error"`
 }
 
@@ -481,14 +492,20 @@ func (p *Provider) completeChat(ctx context.Context, a *llm.Attempt) (*llm.Respo
 		if len(out.Choices) == 0 {
 			return nil, &llm.Error{
 				Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Status: 200,
-				Code: out.Error.Code, Message: out.Error.Message,
+				Code: string(out.Error.Code), Message: out.Error.Message, Body: httpcore.ErrorBody(raw),
 			}
 		}
 		// Some gateways fail partway and answer with both. The answer stands,
-		// but the caller is told it is not the whole one.
+		// but the caller is told it is not the whole one. The note goes to the
+		// ledger too, which may have been asked to hold none of the upstream's
+		// words.
+		detail := out.Error.Message
+		if a.Redact {
+			detail = "the backend reported an error beside its answer"
+		}
 		diags = append(diags, llm.Diagnostic{
 			Code: llm.WireErrorInBody, Class: llm.ClassTransport, Stage: llm.StageResponse,
-			Severity: llm.SeverityLoss, Provider: p.ID(), Detail: out.Error.Message,
+			Severity: llm.SeverityLoss, Provider: p.ID(), Detail: detail,
 		})
 	}
 
@@ -547,7 +564,7 @@ func (p *Provider) streamChat(ctx context.Context, a *llm.Attempt) (*llm.Stream,
 	if err != nil {
 		return nil, err
 	}
-	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxBufferBytes)
+	sc := wirecore.NewScanner(resp.Body, a.Limits.MaxFrameBytes, a.Limits.MaxFrameBytes)
 	st := &chatParser{ctx: ctx, provider: p.ID(), sc: sc, attempt: a}
 	return llm.NewStream(
 		llm.StreamMeta{Provider: p.ID(), Model: p.model(a), Requested: a.Request.Model, Created: p.now()},
@@ -628,7 +645,7 @@ func (c *chatParser) next() (*llm.Frame, error) {
 			c.done = true
 			return &llm.Frame{Err: &llm.Error{
 				Kind: llm.KindUpstream, Provider: c.provider, Sent: true, Status: 200,
-				Code: chunk.Error.Code, Message: chunk.Error.Message,
+				Code: string(chunk.Error.Code), Message: chunk.Error.Message, Body: httpcore.ErrorBody(data),
 			}}, nil
 		}
 		var frames []*llm.Frame

@@ -6,6 +6,7 @@ package agentcli
 import (
 	"encoding/json"
 
+	"github.com/leelsey/goose/internal/httpcore"
 	"github.com/leelsey/goose/internal/wirecore"
 	"github.com/leelsey/goose/llm"
 )
@@ -114,7 +115,7 @@ func codexParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 		case "error":
 			return []*llm.Frame{{Err: &llm.Error{
 				Kind: llm.KindUpstream, Provider: p.ID(), Sent: true,
-				Message: firstNonEmpty(evt.Item.Message, "the item failed"),
+				Message: firstNonEmpty(evt.Item.Message, "the item failed"), Body: httpcore.ErrorBody([]byte(evt.Item.Message)),
 			}}}, nil
 		}
 		if codexToolItem[evt.Item.Type] {
@@ -142,9 +143,10 @@ func codexParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 		return []*llm.Frame{f}, nil
 
 	case "turn.failed", "error":
+		said := firstNonEmpty(evt.Message, evt.Error.Message)
 		return []*llm.Frame{{Err: &llm.Error{
 			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Retryable: true,
-			Message: firstNonEmpty(evt.Message, evt.Error.Message, "the turn failed"),
+			Message: firstNonEmpty(said, "the turn failed"), Body: httpcore.ErrorBody([]byte(said)),
 		}}}, nil
 	}
 	return nil, nil
@@ -206,9 +208,10 @@ func antigravityParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error)
 		return []*llm.Frame{f}, nil
 
 	case "error":
+		said := firstNonEmpty(evt.Error, evt.Message)
 		return []*llm.Frame{{Err: &llm.Error{
 			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Retryable: true,
-			Message: firstNonEmpty(evt.Error, evt.Message, "the invocation failed"),
+			Message: firstNonEmpty(said, "the invocation failed"), Body: httpcore.ErrorBody([]byte(said)),
 		}}}, nil
 	}
 	return nil, nil
@@ -277,9 +280,10 @@ func copilotParse(p *Provider, line []byte, st *state) ([]*llm.Frame, error) {
 		return []*llm.Frame{f}, nil
 
 	case "error", "failed":
+		said := firstNonEmpty(evt.Error.Message, evt.Message)
 		return []*llm.Frame{{Err: &llm.Error{
 			Kind: llm.KindUpstream, Provider: p.ID(), Sent: true, Retryable: true,
-			Message: firstNonEmpty(evt.Error.Message, evt.Message, "the invocation failed"),
+			Message: firstNonEmpty(said, "the invocation failed"), Body: httpcore.ErrorBody([]byte(said)),
 		}}}, nil
 	}
 	return nil, nil
